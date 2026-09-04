@@ -1,0 +1,25 @@
+{
+  "name": "verdictvaut",
+  "private": true,
+  "version": "0.1.0",
+  "description": "VerdictVaut — premium global markets platform (monorepo root)",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w packages/shared-types && npm run build -w apps/api && npm run build -w apps/web",
+    "dev:api": "npm run dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "test": "npm run test -w apps/api",
+    "test:cov": "npm run test:cov -w apps/api",
+    "lint": "npm run lint -w apps/api && npm run lint -w apps/web",
+    "typecheck": "npm run typecheck -w apps/api && npm run typecheck -w apps/web && npm run typecheck -w packages/shared-types",
+    "prisma:generate": "npm run prisma:generate -w apps/api",
+    "prisma:migrate": "npm run prisma:migrate -w apps/api",
+    "prisma:migrate:diff": "npm run prisma:migrate:diff -w apps/api"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

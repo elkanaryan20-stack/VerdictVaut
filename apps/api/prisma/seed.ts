@@ -1,0 +1,90 @@
+import { PrismaClient, AssetClass, NetworkFamily, NetworkEnvironment } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+/**
+ * Reference-data seed only: assets, networks, and the asset<->network join.
+ * This never inserts balances, deposits, withdrawals, or transactions —
+ * those only ever come from real ledger/chain activity.
+ */
+async function main() {
+  const assets = await Promise.all(
+    [
+      { symbol: "BTC", name: "Bitcoin", decimals: 8, assetClass: AssetClass.NATIVE, isSettlementCurrency: false },
+      { symbol: "ETH", name: "Ethereum", decimals: 18, assetClass: AssetClass.NATIVE, isSettlementCurrency: false },
+      { symbol: "SOL", name: "Solana", decimals: 9, assetClass: AssetClass.NATIVE, isSettlementCurrency: false },
+      { symbol: "USDC", name: "USD Coin", decimals: 6, assetClass: AssetClass.TOKEN, isSettlementCurrency: true },
+      { symbol: "USDT", name: "Tether", decimals: 6, assetClass: AssetClass.TOKEN, isSettlementCurrency: false },
+      { symbol: "XRP", name: "XRP", decimals: 6, assetClass: AssetClass.NATIVE, isSettlementCurrency: false },
+    ].map((a) =>
+      prisma.asset.upsert({ where: { symbol: a.symbol }, create: a, update: a }),
+    ),
+  );
+  const assetBySymbol = Object.fromEntries(assets.map((a) => [a.symbol, a]));
+
+  const networks = await Promise.all(
+    [
+      { code: "bitcoin-testnet", family: NetworkFamily.BITCOIN, environment: NetworkEnvironment.SANDBOX, name: "Bitcoin Testnet" },
+      { code: "ethereum-sepolia", family: NetworkFamily.EVM, environment: NetworkEnvironment.SANDBOX, name: "Ethereum Sepolia" },
+      { code: "base-sepolia", family: NetworkFamily.EVM, environment: NetworkEnvironment.SANDBOX, name: "Base Sepolia" },
+      { code: "solana-devnet", family: NetworkFamily.SOLANA, environment: NetworkEnvironment.SANDBOX, name: "Solana Devnet" },
+      { code: "xrpl-testnet", family: NetworkFamily.XRPL, environment: NetworkEnvironment.SANDBOX, name: "XRPL Testnet" },
+      { code: "bitcoin-mainnet", family: NetworkFamily.BITCOIN, environment: NetworkEnvironment.PRODUCTION, name: "Bitcoin Mainnet" },
+      { code: "ethereum-mainnet", family: NetworkFamily.EVM, environment: NetworkEnvironment.PRODUCTION, name: "Ethereum Mainnet" },
+      { code: "base-mainnet", family: NetworkFamily.EVM, environment: NetworkEnvironment.PRODUCTION, name: "Base Mainnet" },
+      { code: "solana-mainnet", family: NetworkFamily.SOLANA, environment: NetworkEnvironment.PRODUCTION, name: "Solana Mainnet" },
+      { code: "xrpl-mainnet", family: NetworkFamily.XRPL, environment: NetworkEnvironment.PRODUCTION, name: "XRPL Mainnet" },
+    ].map((n) => prisma.network.upsert({ where: { code: n.code }, create: n, update: n })),
+  );
+  const networkByCode = Object.fromEntries(networks.map((n) => [n.code, n]));
+
+  const assetNetworks: Array<{
+    assetSymbol: string;
+    networkCode: string;
+    isNative: boolean;
+    contractAddress?: string;
+    memoRequired?: boolean;
+    minConfirmations: number;
+  }> = [
+    { assetSymbol: "BTC", networkCode: "bitcoin-testnet", isNative: true, minConfirmations: 2 },
+    { assetSymbol: "ETH", networkCode: "ethereum-sepolia", isNative: true, minConfirmations: 12 },
+    { assetSymbol: "SOL", networkCode: "solana-devnet", isNative: true, minConfirmations: 32 },
+    { assetSymbol: "XRP", networkCode: "xrpl-testnet", isNative: true, memoRequired: true, minConfirmations: 1 },
+    { assetSymbol: "USDC", networkCode: "ethereum-sepolia", isNative: false, minConfirmations: 12 },
+    { assetSymbol: "USDC", networkCode: "base-sepolia", isNative: false, minConfirmations: 12 },
+    { assetSymbol: "USDT", networkCode: "ethereum-sepolia", isNative: false, minConfirmations: 12 },
+  ];
+
+  for (const an of assetNetworks) {
+    const asset = assetBySymbol[an.assetSymbol];
+    const network = networkByCode[an.networkCode];
+    await prisma.assetNetwork.upsert({
+      where: { assetId_networkId: { assetId: asset.id, networkId: network.id } },
+      create: {
+        assetId: asset.id,
+        networkId: network.id,
+        isNative: an.isNative,
+        contractAddress: an.contractAddress,
+        memoRequired: an.memoRequired ?? false,
+        minConfirmations: an.minConfirmations,
+      },
+      update: {
+        isNative: an.isNative,
+        contractAddress: an.contractAddress,
+        memoRequired: an.memoRequired ?? false,
+        minConfirmations: an.minConfirmations,
+      },
+    });
+  }
+
+  console.log("Seed complete: assets, networks, and asset-network pairs upserted.");
+}
+
+main()
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
