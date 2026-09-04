@@ -10,7 +10,7 @@ import { DepositsService } from "../wallet/deposits/deposits.service";
 import { ReconciliationService } from "../wallet/reconciliation/reconciliation.service";
 import { WithdrawalsService } from "../wallet/withdrawals/withdrawals.service";
 import { BroadcastWithdrawalDto } from "../wallet/withdrawals/dto/broadcast-withdrawal.dto";
-import { AuditLogService } from "./audit-log.service";
+import { AuditLogService } from "../audit/audit-log.service";
 import { CreateAssetNetworkDto, ProvisionAddressDto, RejectWithdrawalDto, SetActiveDto } from "./dto/admin.dto";
 
 @Controller("admin")
@@ -35,7 +35,17 @@ export class AdminController {
       action: "asset_network.create",
       resourceType: "AssetNetwork",
       resourceId: created.id,
-      after: created,
+      after: {
+        assetId: created.assetId,
+        networkId: created.networkId,
+        isNative: created.isNative,
+        contractAddress: created.contractAddress,
+        memoRequired: created.memoRequired,
+        minConfirmations: created.minConfirmations,
+        depositMinAmount: created.depositMinAmount.toString(),
+        withdrawalMinAmount: created.withdrawalMinAmount.toString(),
+        isActive: created.isActive,
+      },
     });
     return created;
   }
@@ -52,7 +62,7 @@ export class AdminController {
       action: "asset_network.set_active",
       resourceType: "AssetNetwork",
       resourceId: id,
-      after: dto,
+      after: { isActive: dto.isActive },
     });
     return updated;
   }
@@ -65,7 +75,7 @@ export class AdminController {
       action: "asset.set_active",
       resourceType: "Asset",
       resourceId: id,
-      after: dto,
+      after: { isActive: dto.isActive },
     });
     return updated;
   }
@@ -78,7 +88,7 @@ export class AdminController {
       action: "network.set_active",
       resourceType: "Network",
       resourceId: id,
-      after: dto,
+      after: { isActive: dto.isActive },
     });
     return updated;
   }
@@ -111,13 +121,16 @@ export class AdminController {
 
   @Post("withdrawals/:id/approve")
   async approveWithdrawal(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    const before = await this.withdrawalsService.getById(id);
     const updated = await this.withdrawalsService.approve(id);
     await this.auditLogService.record({
       actorId: admin.id,
       action: "withdrawal.approve",
       resourceType: "Withdrawal",
       resourceId: id,
+      before: { status: before.status },
       after: { status: updated.status },
+      idempotencyKey: id,
     });
     return updated;
   }
@@ -128,13 +141,17 @@ export class AdminController {
     @Param("id") id: string,
     @Body() dto: RejectWithdrawalDto,
   ) {
+    const before = await this.withdrawalsService.getById(id);
     const updated = await this.withdrawalsService.reject(id, dto.reason);
     await this.auditLogService.record({
       actorId: admin.id,
       action: "withdrawal.reject",
       resourceType: "Withdrawal",
       resourceId: id,
-      after: { status: updated.status, reason: dto.reason },
+      before: { status: before.status },
+      after: { status: updated.status },
+      reason: dto.reason,
+      idempotencyKey: id,
     });
     return updated;
   }
@@ -145,13 +162,16 @@ export class AdminController {
     @Param("id") id: string,
     @Body() dto: BroadcastWithdrawalDto,
   ) {
+    const before = await this.withdrawalsService.getById(id);
     const updated = await this.withdrawalsService.recordManualBroadcast(id, admin.id, dto.txHash);
     await this.auditLogService.record({
       actorId: admin.id,
       action: "withdrawal.manual_broadcast",
       resourceType: "Withdrawal",
       resourceId: id,
+      before: { status: before.status },
       after: { status: updated.status, txHash: dto.txHash },
+      idempotencyKey: id,
     });
     return updated;
   }

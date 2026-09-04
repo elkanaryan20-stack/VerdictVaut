@@ -1,8 +1,12 @@
-import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
-import { LedgerEntryType, Prisma, WithdrawalStatus } from "@prisma/client";
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
+import { Prisma, UserStatus, Withdrawal, WithdrawalStatus } from "@prisma/client";
+import { AuditLogService } from "../../audit/audit-log.service";
 import { LedgerService } from "../../ledger/ledger.service";
+import { ReservationService } from "../../ledger/reservation.service";
 import { PrismaService } from "../../prisma/prisma.service";
+import { SerializableTransactionRunner } from "../../prisma/serializable-transaction-runner";
 import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
+import { assertValidDestinationAddress } from "./destination-address.validator";
 import { RequestWithdrawalDto } from "./dto/request-withdrawal.dto";
 
 /**
@@ -12,23 +16,40 @@ import { RequestWithdrawalDto } from "./dto/request-withdrawal.dto";
  *     -> PENDING_MANUAL_BROADCAST -> BROADCAST   (sandbox / ManualBroadcastExecutor)
  *     -> BROADCASTING             -> BROADCAST   (production / ProductionCustodyExecutor)
  *   BROADCAST -> CONFIRMING -> CONFIRMED -> CREDITED
- *   (any stage) -> REJECTED | FAILED  — releases the balance hold
+ *   (any stage) -> REJECTED | FAILED  — releases the reservation
  *
- * The balance is reserved with a WITHDRAWAL_HOLD ledger entry at request
- * time (funds leave "available" immediately) and only ever released back
- * via WITHDRAWAL_RELEASE on rejection/failure. Confirmation does not move
- * money again — it just finalizes the record — because the hold already
- * did.
+ * Funds are RESERVED (not moved) at request time via FundReservation —
+ * this immediately reduces what's available without touching total
+ * balance, because nothing has actually left the system yet. The
+ * reservation is only ever released (reject/fail) or captured
+ * (confirmed — at which point a real LedgerTransaction finally moves the
+ * total balance to the EXTERNAL_CHAIN house account, because that's the
+ * point real funds left).
+ *
+ * Every state transition below is a guarded compare-and-swap: the DB
+ * update's WHERE clause requires the row to still be in the expected
+ * prior status, and a 0-row result means a concurrent call already
+ * transitioned it — so two concurrent (or double-clicked/retried) calls
+ * to approve/reject/fail/broadcast can never both succeed, and a
+ * reservation can never be released or captured twice.
  */
 @Injectable()
 export class WithdrawalsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ledger: LedgerService,
+    private readonly reservations: ReservationService,
     private readonly executorFactory: WithdrawalExecutorFactory,
+    private readonly txRunner: SerializableTransactionRunner,
+    private readonly auditLog: AuditLogService,
   ) {}
 
   async request(userId: string, dto: RequestWithdrawalDto) {
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+    if (user.status !== UserStatus.ACTIVE) {
+      throw new ForbiddenException("Account must be verified (ACTIVE) before withdrawing funds");
+    }
+
     const asset = await this.prisma.asset.findUnique({ where: { symbol: dto.assetSymbol } });
     const network = await this.prisma.network.findUnique({ where: { code: dto.networkCode } });
     if (!asset || !network) {
@@ -51,8 +72,10 @@ export class WithdrawalsService {
       throw new BadRequestException(`${dto.networkCode} requires a destination tag/memo`);
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      const withdrawal = await tx.withdrawal.create({
+    assertValidDestinationAddress(network.family, dto.destinationAddress);
+
+    const withdrawal = await this.txRunner.run(async (tx) => {
+      const created = await tx.withdrawal.create({
         data: {
           userId,
           assetNetworkId: assetNetwork.id,
@@ -63,33 +86,48 @@ export class WithdrawalsService {
         },
       });
 
-      // Reserve funds immediately so they cannot be double-spent by a
-      // concurrent withdrawal or trade while this one is under review.
-      await this.ledger.postEntry(
-        {
-          userId,
-          assetSymbol: asset.symbol,
-          amount: amount.negated(),
-          type: LedgerEntryType.WITHDRAWAL_HOLD,
-          referenceType: "Withdrawal",
-          referenceId: withdrawal.id,
-        },
-        tx,
-      );
+      // Earmarks the funds (reservedBalance) — total balance is untouched
+      // until the withdrawal is actually confirmed on-chain.
+      await this.reservations.reserve(tx, {
+        userId,
+        assetSymbol: asset.symbol,
+        amount,
+        referenceType: "Withdrawal",
+        referenceId: created.id,
+        idempotencyKey: `withdrawal-reserve:${created.id}`,
+      });
 
-      return tx.withdrawal.update({ where: { id: withdrawal.id }, data: { status: WithdrawalStatus.RISK_REVIEW } });
+      return tx.withdrawal.update({ where: { id: created.id }, data: { status: WithdrawalStatus.RISK_REVIEW } });
     });
+
+    await this.auditLog.record({
+      actorId: userId,
+      actorType: "USER",
+      action: "withdrawal.request",
+      resourceType: "Withdrawal",
+      resourceId: withdrawal.id,
+      after: { status: withdrawal.status, amount: withdrawal.amount.toString(), assetSymbol: asset.symbol, networkCode: network.code },
+      idempotencyKey: withdrawal.id,
+    });
+
+    return withdrawal;
+  }
+
+  async getById(withdrawalId: string) {
+    return this.getOrThrow(withdrawalId);
   }
 
   async approve(withdrawalId: string) {
+    await this.txRunner.run((tx) =>
+      this.casTransition(tx, withdrawalId, [WithdrawalStatus.RISK_REVIEW], { status: WithdrawalStatus.APPROVED }),
+    );
+
+    // The executor call happens outside the DB transaction (it may be a
+    // slow external call once a real custody provider exists) — that's
+    // safe because the CAS above already gave exactly one caller
+    // exclusive ownership of this transition; a concurrent approve() call
+    // would have failed the CAS and never reached here.
     const withdrawal = await this.getOrThrow(withdrawalId);
-    this.assertStatus(withdrawal.status, [WithdrawalStatus.RISK_REVIEW]);
-
-    await this.prisma.withdrawal.update({
-      where: { id: withdrawalId },
-      data: { status: WithdrawalStatus.APPROVED },
-    });
-
     const executor = await this.executorFactory.resolve(withdrawal.assetNetworkId);
     const result = await executor.execute({
       withdrawalId: withdrawal.id,
@@ -97,74 +135,122 @@ export class WithdrawalsService {
       destinationAddress: withdrawal.destinationAddress,
       destinationTag: withdrawal.destinationTag,
       amount: withdrawal.amount.toString(),
+      idempotencyKey: withdrawal.id,
     });
 
     if (result.status === "broadcast") {
-      return this.prisma.withdrawal.update({
-        where: { id: withdrawalId },
-        data: { status: WithdrawalStatus.BROADCAST, txHash: result.txHash, broadcastAt: new Date() },
-      });
+      return this.txRunner.run((tx) =>
+        this.casTransition(tx, withdrawalId, [WithdrawalStatus.APPROVED], {
+          status: WithdrawalStatus.BROADCAST,
+          txHash: result.txHash,
+          broadcastAt: new Date(),
+        }),
+      );
     }
 
-    return this.prisma.withdrawal.update({
-      where: { id: withdrawalId },
-      data: { status: WithdrawalStatus.PENDING_MANUAL_BROADCAST },
-    });
+    return this.txRunner.run((tx) =>
+      this.casTransition(tx, withdrawalId, [WithdrawalStatus.APPROVED], {
+        status: WithdrawalStatus.PENDING_MANUAL_BROADCAST,
+      }),
+    );
   }
 
   /** Admin submits the tx hash after broadcasting a sandbox withdrawal themselves. */
   async recordManualBroadcast(withdrawalId: string, adminId: string, txHash: string) {
-    const withdrawal = await this.getOrThrow(withdrawalId);
-    this.assertStatus(withdrawal.status, [WithdrawalStatus.PENDING_MANUAL_BROADCAST]);
-
-    return this.prisma.withdrawal.update({
-      where: { id: withdrawalId },
-      data: {
+    return this.txRunner.run((tx) =>
+      this.casTransition(tx, withdrawalId, [WithdrawalStatus.PENDING_MANUAL_BROADCAST], {
         status: WithdrawalStatus.BROADCAST,
         txHash,
         broadcastByAdminId: adminId,
         broadcastAt: new Date(),
-      },
-    });
+      }),
+    );
   }
 
-  /** Called by the (future) confirmation watcher with real on-chain confirmation counts. */
+  /**
+   * Called by the (future) confirmation watcher with real on-chain
+   * confirmation counts. Safe to call repeatedly with the same or stale
+   * data — insufficient confirmations just re-affirms CONFIRMING, and a
+   * withdrawal that's already CONFIRMED/CREDITED is left untouched rather
+   * than erroring, since watchers naturally re-poll and redeliver.
+   */
   async recordConfirmation(withdrawalId: string, confirmations: number, requiredConfirmations: number) {
-    const withdrawal = await this.getOrThrow(withdrawalId);
-    this.assertStatus(withdrawal.status, [WithdrawalStatus.BROADCAST, WithdrawalStatus.CONFIRMING]);
-
     if (confirmations < requiredConfirmations) {
-      return this.prisma.withdrawal.update({
-        where: { id: withdrawalId },
-        data: { status: WithdrawalStatus.CONFIRMING },
+      return this.txRunner.run(async (tx) => {
+        const result = await tx.withdrawal.updateMany({
+          where: { id: withdrawalId, status: { in: [WithdrawalStatus.BROADCAST, WithdrawalStatus.CONFIRMING] } },
+          data: { status: WithdrawalStatus.CONFIRMING },
+        });
+        if (result.count === 0) {
+          return this.getOrThrow(withdrawalId, tx);
+        }
+        return tx.withdrawal.findUniqueOrThrow({ where: { id: withdrawalId } });
       });
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      await this.ledger.postEntry(
-        {
-          userId: withdrawal.userId,
-          assetSymbol: (await tx.assetNetwork.findUniqueOrThrow({
-            where: { id: withdrawal.assetNetworkId },
-            include: { asset: true },
-          })).asset.symbol,
-          amount: 0,
-          type: LedgerEntryType.WITHDRAWAL,
-          referenceType: "Withdrawal",
-          referenceId: withdrawal.id,
-        },
-        tx,
-      );
-
-      return tx.withdrawal.update({
-        where: { id: withdrawalId },
-        data: { status: WithdrawalStatus.CREDITED, confirmedAt: new Date() },
+    const { withdrawal: settled, justCredited } = await this.txRunner.run(async (tx) => {
+      const result = await tx.withdrawal.updateMany({
+        where: { id: withdrawalId, status: { in: [WithdrawalStatus.BROADCAST, WithdrawalStatus.CONFIRMING] } },
+        data: { status: WithdrawalStatus.CONFIRMED, confirmedAt: new Date() },
       });
+
+      if (result.count === 0) {
+        // Already confirmed/credited by an earlier or concurrent call —
+        // idempotent no-op, not an error.
+        return { withdrawal: await tx.withdrawal.findUniqueOrThrow({ where: { id: withdrawalId } }), justCredited: false };
+      }
+
+      const withdrawal = await tx.withdrawal.findUniqueOrThrow({ where: { id: withdrawalId } });
+      const assetNetwork = await tx.assetNetwork.findUniqueOrThrow({
+        where: { id: withdrawal.assetNetworkId },
+        include: { asset: true },
+      });
+
+      const reservation = await this.reservations.findActiveByReference(tx, "Withdrawal", withdrawalId);
+      if (reservation) {
+        await this.reservations.capture(tx, reservation.id);
+      }
+
+      // The real, total-balance-moving posting — this is the point actual
+      // funds left the platform, so it's the point the ledger moves money,
+      // not the earlier reservation.
+      await this.ledger.postTransaction(tx, {
+        assetSymbol: assetNetwork.asset.symbol,
+        type: "WITHDRAWAL",
+        referenceType: "Withdrawal",
+        referenceId: withdrawalId,
+        idempotencyKey: `withdrawal-capture:${withdrawalId}`,
+        postings: [
+          { account: { type: "USER", userId: withdrawal.userId }, amount: withdrawal.amount.negated() },
+          { account: { type: "HOUSE", key: "EXTERNAL_CHAIN" }, amount: withdrawal.amount },
+        ],
+      });
+
+      const credited = await tx.withdrawal.update({
+        where: { id: withdrawalId },
+        data: { status: WithdrawalStatus.CREDITED },
+      });
+
+      return { withdrawal: credited, justCredited: true };
     });
+
+    if (justCredited) {
+      await this.auditLog.record({
+        actorType: "SYSTEM",
+        action: "withdrawal.confirmed",
+        resourceType: "Withdrawal",
+        resourceId: settled.id,
+        before: { status: "BROADCAST_OR_CONFIRMING" },
+        after: { status: settled.status },
+        idempotencyKey: `withdrawal-capture:${settled.id}`,
+      });
+    }
+
+    return settled;
   }
 
   async reject(withdrawalId: string, reason: string) {
-    return this.releaseHold(withdrawalId, reason, WithdrawalStatus.REJECTED, [
+    return this.releaseReservation(withdrawalId, reason, WithdrawalStatus.REJECTED, [
       WithdrawalStatus.REQUESTED,
       WithdrawalStatus.RISK_REVIEW,
       WithdrawalStatus.APPROVED,
@@ -172,7 +258,7 @@ export class WithdrawalsService {
   }
 
   async fail(withdrawalId: string, reason: string) {
-    return this.releaseHold(withdrawalId, reason, WithdrawalStatus.FAILED, [
+    return this.releaseReservation(withdrawalId, reason, WithdrawalStatus.FAILED, [
       WithdrawalStatus.APPROVED,
       WithdrawalStatus.PENDING_MANUAL_BROADCAST,
       WithdrawalStatus.BROADCASTING,
@@ -181,37 +267,24 @@ export class WithdrawalsService {
     ]);
   }
 
-  private async releaseHold(
+  private async releaseReservation(
     withdrawalId: string,
     reason: string,
     terminalStatus: WithdrawalStatus,
     allowedFrom: WithdrawalStatus[],
   ) {
-    const withdrawal = await this.getOrThrow(withdrawalId);
-    this.assertStatus(withdrawal.status, allowedFrom);
-
-    return this.prisma.$transaction(async (tx) => {
-      const assetNetwork = await tx.assetNetwork.findUniqueOrThrow({
-        where: { id: withdrawal.assetNetworkId },
-        include: { asset: true },
+    return this.txRunner.run(async (tx) => {
+      const withdrawal = await this.casTransition(tx, withdrawalId, allowedFrom, {
+        status: terminalStatus,
+        failureReason: reason,
       });
 
-      await this.ledger.postEntry(
-        {
-          userId: withdrawal.userId,
-          assetSymbol: assetNetwork.asset.symbol,
-          amount: withdrawal.amount,
-          type: LedgerEntryType.WITHDRAWAL_RELEASE,
-          referenceType: "Withdrawal",
-          referenceId: withdrawal.id,
-        },
-        tx,
-      );
+      const reservation = await this.reservations.findActiveByReference(tx, "Withdrawal", withdrawalId);
+      if (reservation) {
+        await this.reservations.release(tx, reservation.id);
+      }
 
-      return tx.withdrawal.update({
-        where: { id: withdrawalId },
-        data: { status: terminalStatus, failureReason: reason },
-      });
+      return withdrawal;
     });
   }
 
@@ -226,17 +299,41 @@ export class WithdrawalsService {
     });
   }
 
-  private async getOrThrow(withdrawalId: string) {
-    const withdrawal = await this.prisma.withdrawal.findUnique({ where: { id: withdrawalId } });
+  private async getOrThrow(withdrawalId: string, client: Prisma.TransactionClient | PrismaService = this.prisma) {
+    const withdrawal = await client.withdrawal.findUnique({ where: { id: withdrawalId } });
     if (!withdrawal) {
       throw new NotFoundException("Withdrawal not found");
     }
     return withdrawal;
   }
 
-  private assertStatus(current: WithdrawalStatus, allowed: WithdrawalStatus[]) {
-    if (!allowed.includes(current)) {
-      throw new BadRequestException(`Withdrawal is in status ${current}, expected one of: ${allowed.join(", ")}`);
+  /**
+   * Atomic compare-and-swap: only succeeds if the row is currently in one
+   * of `allowedFrom`. Throws ConflictException (409) on a 0-row result —
+   * the caller was not first, whether because of a genuine race or a
+   * double-click/retry.
+   */
+  private async casTransition(
+    tx: Prisma.TransactionClient,
+    withdrawalId: string,
+    allowedFrom: WithdrawalStatus[],
+    data: Prisma.WithdrawalUpdateManyMutationInput,
+  ): Promise<Withdrawal> {
+    const result = await tx.withdrawal.updateMany({
+      where: { id: withdrawalId, status: { in: allowedFrom } },
+      data,
+    });
+
+    if (result.count === 0) {
+      const current = await tx.withdrawal.findUnique({ where: { id: withdrawalId } });
+      if (!current) {
+        throw new NotFoundException("Withdrawal not found");
+      }
+      throw new ConflictException(
+        `Withdrawal ${withdrawalId} is in status ${current.status}, expected one of: ${allowedFrom.join(", ")}`,
+      );
     }
+
+    return tx.withdrawal.findUniqueOrThrow({ where: { id: withdrawalId } });
   }
 }

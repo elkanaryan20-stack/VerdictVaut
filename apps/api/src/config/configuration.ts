@@ -10,6 +10,7 @@ export interface AppConfig {
     refreshTtl: string;
   };
   devFundingToolsEnabled: boolean;
+  corsAllowedOrigins: string[];
 }
 
 export default (): AppConfig => ({
@@ -27,4 +28,10 @@ export default (): AppConfig => ({
   // controllers also assert NODE_ENV !== 'production' at call time.
   devFundingToolsEnabled:
     process.env.ENABLE_DEV_FUNDING_TOOLS === "true" && process.env.NODE_ENV !== "production",
+  // Empty outside development unless explicitly configured — CORS fails
+  // closed by default rather than open.
+  corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
 });

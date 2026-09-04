@@ -50,15 +50,35 @@ enum OrderStatus {
   REJECTED
 }
 
-enum LedgerEntryType {
+enum LedgerTransactionType {
   DEPOSIT
-  WITHDRAWAL_HOLD
-  WITHDRAWAL_RELEASE
   WITHDRAWAL
   TRADE
   FEE
   SETTLEMENT
   ADJUSTMENT
+  REVERSAL
+}
+
+enum LedgerAccountOwnerType {
+  USER
+  HOUSE
+}
+
+// House/omnibus counterparties. EXTERNAL_CHAIN is the mirror of the outside
+// blockchain world — it is credited/debited opposite every deposit and
+// withdrawal so those transactions balance, and it is explicitly exempt
+// from the non-negative-balance rule (see the DB CHECK constraint): its
+// balance is a running net-inflow figure, not real platform funds.
+enum HouseAccountKey {
+  EXTERNAL_CHAIN
+  FEE_REVENUE
+}
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+  CAPTURED
 }
 
 enum AssetClass {
@@ -150,15 +170,15 @@ model User {
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
-  refreshTokens              RefreshToken[]
-  orders                     Order[]
-  positions                  Position[]
-  ledgerAccounts             LedgerAccount[]
-  depositAddressAssignments  DepositAddressAssignment[]
-  deposits                   Deposit[]
-  withdrawals                Withdrawal[]
-  riskLimit                  RiskLimit?
-  createdMarkets             Market[]                    @relation("MarketCreatedBy")
+  refreshTokens             RefreshToken[]
+  orders                    Order[]
+  positions                 Position[]
+  ledgerAccounts            LedgerAccount[]
+  depositAddressAssignments DepositAddressAssignment[]
+  deposits                  Deposit[]
+  withdrawals               Withdrawal[]
+  riskLimit                 RiskLimit?
+  createdMarkets            Market[]                   @relation("MarketCreatedBy")
 
   @@map("users")
 }
@@ -230,24 +250,24 @@ model MarketOutcome {
 }
 
 model Order {
-  id              String      @id @default(uuid())
-  userId          String
-  marketId        String
-  outcomeId       String
-  side            OrderSide
-  type            OrderType
-  price           Decimal?    @db.Decimal(18, 6)
-  quantity        Decimal     @db.Decimal(36, 18)
-  filledQuantity  Decimal     @default(0) @db.Decimal(36, 18)
-  status          OrderStatus @default(OPEN)
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
+  id             String      @id @default(uuid())
+  userId         String
+  marketId       String
+  outcomeId      String
+  side           OrderSide
+  type           OrderType
+  price          Decimal?    @db.Decimal(18, 6)
+  quantity       Decimal     @db.Decimal(36, 18)
+  filledQuantity Decimal     @default(0) @db.Decimal(36, 18)
+  status         OrderStatus @default(OPEN)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
 
-  user      User          @relation(fields: [userId], references: [id])
-  market    Market        @relation(fields: [marketId], references: [id])
-  outcome   MarketOutcome @relation(fields: [outcomeId], references: [id])
-  makerFills Fill[] @relation("MakerOrder")
-  takerFills Fill[] @relation("TakerOrder")
+  user       User          @relation(fields: [userId], references: [id])
+  market     Market        @relation(fields: [marketId], references: [id])
+  outcome    MarketOutcome @relation(fields: [outcomeId], references: [id])
+  makerFills Fill[]        @relation("MakerOrder")
+  takerFills Fill[]        @relation("TakerOrder")
 
   @@index([marketId, outcomeId, status])
   @@index([userId])
@@ -255,15 +275,15 @@ model Order {
 }
 
 model Fill {
-  id            String   @id @default(uuid())
-  makerOrderId  String
-  takerOrderId  String
-  marketId      String
-  outcomeId     String
-  price         Decimal  @db.Decimal(18, 6)
-  quantity      Decimal  @db.Decimal(36, 18)
-  fee           Decimal  @default(0) @db.Decimal(36, 18)
-  createdAt     DateTime @default(now())
+  id           String   @id @default(uuid())
+  makerOrderId String
+  takerOrderId String
+  marketId     String
+  outcomeId    String
+  price        Decimal  @db.Decimal(18, 6)
+  quantity     Decimal  @db.Decimal(36, 18)
+  fee          Decimal  @default(0) @db.Decimal(36, 18)
+  createdAt    DateTime @default(now())
 
   makerOrder Order @relation("MakerOrder", fields: [makerOrderId], references: [id])
   takerOrder Order @relation("TakerOrder", fields: [takerOrderId], references: [id])
@@ -290,13 +310,13 @@ model Position {
 }
 
 model Settlement {
-  id             String   @id @default(uuid())
+  id             String    @id @default(uuid())
   marketId       String
   outcomeId      String
-  payoutPerShare Decimal  @db.Decimal(18, 6)
-  status         String   @default("PENDING")
+  payoutPerShare Decimal   @db.Decimal(18, 6)
+  status         String    @default("PENDING")
   processedAt    DateTime?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime  @default(now())
 
   market  Market        @relation(fields: [marketId], references: [id])
   outcome MarketOutcome @relation(fields: [outcomeId], references: [id])
@@ -306,39 +326,99 @@ model Settlement {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Ledger (authoritative accounting — append-only entries)
+// Ledger — true double-entry accounting.
+//
+// LedgerTransaction is the journal entry: it carries the business meaning
+// (type + reference) and an idempotency key that is the single source of
+// truth for "has this financial event already been posted" — every
+// crediting/debiting path (deposit crediting, withdrawal capture, trade,
+// fee, settlement, adjustment, reversal) creates exactly one, and a repeat
+// attempt (retry, duplicate webhook, double-click) hits the unique
+// constraint on idempotencyKey and is a safe no-op, never a second credit.
+//
+// LedgerEntry is a posting within a transaction — one row per account
+// touched. A transaction's postings must sum to zero for its asset, so
+// every credit has a matching debit; there is always a counterparty
+// (a user account, or a HOUSE account such as EXTERNAL_CHAIN standing in
+// for the outside blockchain, or FEE_REVENUE). This is enforced in
+// LedgerService before any row is written, not just by convention.
+//
+// FundReservation is a *same-account* earmark (available vs reserved
+// funds) — reserving funds for an order or a pending withdrawal does not
+// move money between accounts, so it is not itself a LedgerTransaction;
+// it only adjusts LedgerAccount.reservedBalance, guarded by its own
+// idempotency key and status transitions (ACTIVE -> RELEASED|CAPTURED).
 // ────────────────────────────────────────────────────────────────────────
 
 model LedgerAccount {
-  id            String   @id @default(uuid())
-  userId        String
-  assetId       String
-  cachedBalance Decimal  @default(0) @db.Decimal(36, 18)
-  updatedAt     DateTime @updatedAt
+  id              String                 @id @default(uuid())
+  ownerType       LedgerAccountOwnerType @default(USER)
+  userId          String?
+  houseAccountKey HouseAccountKey?
+  assetId         String
+  cachedBalance   Decimal                @default(0) @db.Decimal(36, 18)
+  reservedBalance Decimal                @default(0) @db.Decimal(36, 18)
+  updatedAt       DateTime               @updatedAt
 
-  user    User          @relation(fields: [userId], references: [id])
-  asset   Asset         @relation(fields: [assetId], references: [id])
-  entries LedgerEntry[]
+  user         User?             @relation(fields: [userId], references: [id])
+  asset        Asset             @relation(fields: [assetId], references: [id])
+  entries      LedgerEntry[]
+  reservations FundReservation[]
 
   @@unique([userId, assetId])
+  @@unique([houseAccountKey, assetId])
   @@map("ledger_accounts")
 }
 
+model LedgerTransaction {
+  id             String                @id @default(uuid())
+  assetId        String
+  type           LedgerTransactionType
+  referenceType  String
+  referenceId    String
+  idempotencyKey String                @unique
+  createdAt      DateTime              @default(now())
+
+  asset   Asset         @relation(fields: [assetId], references: [id])
+  entries LedgerEntry[]
+
+  @@index([referenceType, referenceId])
+  @@map("ledger_transactions")
+}
+
 model LedgerEntry {
-  id            String          @id @default(uuid())
+  id            String   @id @default(uuid())
+  transactionId String
   accountId     String
-  amount        Decimal         @db.Decimal(36, 18)
-  type          LedgerEntryType
-  referenceType String
-  referenceId   String
-  balanceAfter  Decimal         @db.Decimal(36, 18)
-  createdAt     DateTime        @default(now())
+  amount        Decimal  @db.Decimal(36, 18)
+  balanceAfter  Decimal  @db.Decimal(36, 18)
+  createdAt     DateTime @default(now())
+
+  transaction LedgerTransaction @relation(fields: [transactionId], references: [id])
+  account     LedgerAccount     @relation(fields: [accountId], references: [id])
+
+  @@index([accountId, createdAt])
+  @@index([transactionId])
+  @@map("ledger_entries")
+}
+
+model FundReservation {
+  id             String            @id @default(uuid())
+  accountId      String
+  amount         Decimal           @db.Decimal(36, 18)
+  status         ReservationStatus @default(ACTIVE)
+  referenceType  String
+  referenceId    String
+  idempotencyKey String            @unique
+  createdAt      DateTime          @default(now())
+  releasedAt     DateTime?
+  capturedAt     DateTime?
 
   account LedgerAccount @relation(fields: [accountId], references: [id])
 
-  @@index([accountId, createdAt])
+  @@index([accountId, status])
   @@index([referenceType, referenceId])
-  @@map("ledger_entries")
+  @@map("fund_reservations")
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -354,10 +434,11 @@ model Asset {
   isSettlementCurrency Boolean    @default(false)
   isActive             Boolean    @default(true)
 
-  assetNetworks              AssetNetwork[]
-  ledgerAccounts              LedgerAccount[]
-  depositAddressAssignments  DepositAddressAssignment[]
-  deposits                    Deposit[]
+  assetNetworks             AssetNetwork[]
+  ledgerAccounts            LedgerAccount[]
+  ledgerTransactions        LedgerTransaction[]
+  depositAddressAssignments DepositAddressAssignment[]
+  deposits                  Deposit[]
 
   @@map("assets")
 }
@@ -382,23 +463,23 @@ model AssetNetwork {
   networkId           String
   isNative            Boolean  @default(false)
   contractAddress     String?
-  memoRequired         Boolean  @default(false)
-  minConfirmations     Int      @default(1)
-  depositMinAmount     Decimal  @default(0) @db.Decimal(36, 18)
-  withdrawalMinAmount  Decimal  @default(0) @db.Decimal(36, 18)
-  isActive             Boolean  @default(true)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  memoRequired        Boolean  @default(false)
+  minConfirmations    Int      @default(1)
+  depositMinAmount    Decimal  @default(0) @db.Decimal(36, 18)
+  withdrawalMinAmount Decimal  @default(0) @db.Decimal(36, 18)
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
   asset   Asset   @relation(fields: [assetId], references: [id])
   network Network @relation(fields: [networkId], references: [id])
 
-  walletAddresses            WalletAddress[]
-  deposits                   Deposit[]
-  withdrawals                Withdrawal[]
-  executionConfig            WithdrawalExecutionConfig?
-  watchCursor                BlockchainWatchCursor?
-  reconciliationRuns         ReconciliationRun[]
+  walletAddresses    WalletAddress[]
+  deposits           Deposit[]
+  withdrawals        Withdrawal[]
+  executionConfig    WithdrawalExecutionConfig?
+  watchCursor        BlockchainWatchCursor?
+  reconciliationRuns ReconciliationRun[]
 
   @@unique([assetId, networkId])
   @@map("asset_networks")
@@ -410,20 +491,20 @@ model AssetNetwork {
 // ────────────────────────────────────────────────────────────────────────
 
 model WalletAddress {
-  id              String              @id @default(uuid())
-  assetNetworkId  String
-  address         String
-  destinationTag  String?
-  role            WalletAddressRole   @default(DEPOSIT_POOL)
-  environment     NetworkEnvironment
-  status          WalletAddressStatus @default(AVAILABLE)
-  metadata        Json?
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
+  id             String              @id @default(uuid())
+  assetNetworkId String
+  address        String
+  destinationTag String?
+  role           WalletAddressRole   @default(DEPOSIT_POOL)
+  environment    NetworkEnvironment
+  status         WalletAddressStatus @default(AVAILABLE)
+  metadata       Json?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
 
-  assetNetwork AssetNetwork @relation(fields: [assetNetworkId], references: [id])
-  assignment   DepositAddressAssignment?
-  deposits     Deposit[]
+  assetNetwork        AssetNetwork              @relation(fields: [assetNetworkId], references: [id])
+  assignment          DepositAddressAssignment?
+  deposits            Deposit[]
   withdrawalsAsSource Withdrawal[]
 
   @@unique([assetNetworkId, address])
@@ -464,6 +545,13 @@ model Deposit {
   assetNetworkId        String
   walletAddressId       String
   txHash                String
+  // Disambiguates multiple deposit events within one transaction (e.g. an
+  // EVM token transfer's log index, or a batched transaction crediting
+  // several recipients) — txHash alone is not a strong enough identity for
+  // token transfers. Chains where a transaction maps to exactly one event
+  // (native BTC/XRP transfers) just use the default 0. Combined with
+  // txHash + assetNetworkId, this is the canonical deposit-event identity.
+  eventIndex            Int           @default(0)
   amount                Decimal       @db.Decimal(36, 18)
   confirmations         Int           @default(0)
   requiredConfirmations Int
@@ -473,36 +561,36 @@ model Deposit {
   confirmedAt           DateTime?
   creditedAt            DateTime?
 
-  user          User         @relation(fields: [userId], references: [id])
-  asset         Asset        @relation(fields: [assetId], references: [id])
-  assetNetwork  AssetNetwork @relation(fields: [assetNetworkId], references: [id])
+  user          User          @relation(fields: [userId], references: [id])
+  asset         Asset         @relation(fields: [assetId], references: [id])
+  assetNetwork  AssetNetwork  @relation(fields: [assetNetworkId], references: [id])
   walletAddress WalletAddress @relation(fields: [walletAddressId], references: [id])
 
-  @@unique([assetNetworkId, txHash])
+  @@unique([assetNetworkId, txHash, eventIndex])
   @@index([userId, status])
   @@map("deposits")
 }
 
 model Withdrawal {
-  id                  String           @id @default(uuid())
-  userId              String
-  assetNetworkId      String
+  id                    String           @id @default(uuid())
+  userId                String
+  assetNetworkId        String
   sourceWalletAddressId String?
-  destinationAddress  String
-  destinationTag      String?
-  amount              Decimal          @db.Decimal(36, 18)
-  fee                 Decimal          @default(0) @db.Decimal(36, 18)
-  status              WithdrawalStatus @default(REQUESTED)
-  txHash              String?
-  broadcastByAdminId  String?
-  broadcastAt         DateTime?
-  confirmedAt         DateTime?
-  failureReason       String?
-  createdAt           DateTime         @default(now())
-  updatedAt           DateTime         @updatedAt
+  destinationAddress    String
+  destinationTag        String?
+  amount                Decimal          @db.Decimal(36, 18)
+  fee                   Decimal          @default(0) @db.Decimal(36, 18)
+  status                WithdrawalStatus @default(REQUESTED)
+  txHash                String?
+  broadcastByAdminId    String?
+  broadcastAt           DateTime?
+  confirmedAt           DateTime?
+  failureReason         String?
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
 
-  user             User          @relation(fields: [userId], references: [id])
-  assetNetwork     AssetNetwork  @relation(fields: [assetNetworkId], references: [id])
+  user                User           @relation(fields: [userId], references: [id])
+  assetNetwork        AssetNetwork   @relation(fields: [assetNetworkId], references: [id])
   sourceWalletAddress WalletAddress? @relation(fields: [sourceWalletAddressId], references: [id])
 
   @@index([userId, status])
@@ -572,18 +660,21 @@ model RiskLimit {
 }
 
 model AuditLog {
-  id           String         @id @default(uuid())
-  actorId      String?
-  actorType    AuditActorType
-  action       String
-  resourceType String
-  resourceId   String?
-  before       Json?
-  after        Json?
-  ip           String?
-  createdAt    DateTime       @default(now())
+  id             String         @id @default(uuid())
+  actorId        String?
+  actorType      AuditActorType
+  action         String
+  resourceType   String
+  resourceId     String?
+  before         Json?
+  after          Json?
+  reason         String?
+  idempotencyKey String?
+  ip             String?
+  createdAt      DateTime       @default(now())
 
   @@index([resourceType, resourceId])
   @@index([actorId, createdAt])
+  @@index([idempotencyKey])
   @@map("audit_logs")
 }

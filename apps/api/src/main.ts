@@ -17,10 +17,16 @@ async function bootstrap() {
     }),
   );
   app.useGlobalFilters(new AllExceptionsFilter());
-  app.enableCors();
 
   const config = app.get(ConfigService<AppConfig, true>);
   const port = config.get("port", { infer: true });
+  const nodeEnv = config.get("nodeEnv", { infer: true });
+  const corsAllowedOrigins = config.get("corsAllowedOrigins", { infer: true });
+
+  // Wide-open CORS only in local development; everywhere else this fails
+  // closed to an explicit allowlist (empty by default — set
+  // CORS_ALLOWED_ORIGINS to enable specific origins).
+  app.enableCors(nodeEnv === "development" ? {} : { origin: corsAllowedOrigins, credentials: true });
 
   await app.listen(port);
   // eslint-disable-next-line no-console

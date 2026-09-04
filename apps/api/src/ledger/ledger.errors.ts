@@ -6,3 +6,17 @@ export class InsufficientBalanceError extends Error {
     this.name = "InsufficientBalanceError";
   }
 }
+
+export class UnbalancedTransactionError extends Error {
+  constructor(assetId: string, sum: string) {
+    super(`Ledger transaction postings for asset ${assetId} do not sum to zero (got ${sum})`);
+    this.name = "UnbalancedTransactionError";
+  }
+}
+
+export class InvalidReservationAmountError extends Error {
+  constructor(amount: string) {
+    super(`Reservation amount must be positive, got ${amount}`);
+    this.name = "InvalidReservationAmountError";
+  }
+}

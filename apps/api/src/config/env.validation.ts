@@ -1,5 +1,5 @@
 import { plainToInstance } from "class-transformer";
-import { IsIn, IsInt, IsOptional, IsString, Max, Min, validateSync } from "class-validator";
+import { IsIn, IsInt, IsOptional, IsString, Max, Min, MinLength, validateSync } from "class-validator";
 
 class EnvironmentVariables {
   @IsIn(["development", "test", "production"])
@@ -17,9 +17,11 @@ class EnvironmentVariables {
   DATABASE_URL!: string;
 
   @IsString()
+  @MinLength(32, { message: "JWT_ACCESS_SECRET must be at least 32 characters" })
   JWT_ACCESS_SECRET!: string;
 
   @IsString()
+  @MinLength(32, { message: "JWT_REFRESH_SECRET must be at least 32 characters" })
   JWT_REFRESH_SECRET!: string;
 
   @IsString()
@@ -32,6 +34,10 @@ class EnvironmentVariables {
 
   @IsOptional()
   ENABLE_DEV_FUNDING_TOOLS: string = "false";
+
+  @IsString()
+  @IsOptional()
+  CORS_ALLOWED_ORIGINS: string = "";
 }
 
 export function validateEnv(config: Record<string, unknown>) {

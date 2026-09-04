@@ -33,5 +33,9 @@ Thumbs.db
 # prisma
 apps/api/prisma/*.db
 
+# embedded postgres (used for local Postgres integration tests)
+apps/api/.integration-pgdata/
+apps/api/.devpg/
+
 # misc
 .turbo/

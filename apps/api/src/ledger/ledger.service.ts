@@ -1,88 +1,133 @@
 import { Injectable } from "@nestjs/common";
-import { LedgerEntryType, Prisma, PrismaClient } from "@prisma/client";
+import { HouseAccountKey, LedgerAccount, LedgerTransactionType, Prisma } from "@prisma/client";
+import { createIdempotent } from "../prisma/idempotent-create.util";
 import { PrismaService } from "../prisma/prisma.service";
-import { computeBalanceAfter, isNegative } from "./balance.util";
-import { InsufficientBalanceError } from "./ledger.errors";
+import { computeAvailableBalance, computeBalanceAfter, isNegative, sumAmounts } from "./balance.util";
+import { InsufficientBalanceError, UnbalancedTransactionError } from "./ledger.errors";
 
-export interface PostLedgerEntryInput {
-  userId: string;
+export type AccountRef = { type: "USER"; userId: string } | { type: "HOUSE"; key: HouseAccountKey };
+
+export interface PostTransactionInput {
   assetSymbol: string;
-  /** Signed amount — positive credits the account, negative debits it. */
-  amount: Prisma.Decimal.Value;
-  type: LedgerEntryType;
+  type: LedgerTransactionType;
   referenceType: string;
   referenceId: string;
+  /** Globally unique — this, not application control flow, is what guarantees "posted at most once". */
+  idempotencyKey: string;
+  /** Must sum to zero. At least two legs — every credit needs a counterparty debit. */
+  postings: Array<{ account: AccountRef; amount: Prisma.Decimal.Value }>;
+}
+
+export interface PostTransactionResult {
+  transactionId: string;
+  alreadyPosted: boolean;
 }
 
 /**
- * The single authoritative path for mutating a user's balance. Every
- * financial mutation in the system (deposits, withdrawals, trades, fees,
- * settlements) must go through postEntry — there is no other write path
- * to LedgerAccount.cachedBalance, and callers never write it directly.
+ * True double-entry ledger. Every financial mutation is a
+ * LedgerTransaction whose postings (LedgerEntry rows) sum to zero for its
+ * asset — a user account is always debited/credited against a
+ * counterparty (another user, or a HOUSE account such as EXTERNAL_CHAIN
+ * standing in for the outside blockchain, or FEE_REVENUE).
+ *
+ * `postTransaction` takes the caller's own transaction client rather than
+ * opening one itself — every caller must obtain that client from
+ * SerializableTransactionRunner, so there is exactly one way to reach this
+ * method and it is always SERIALIZABLE. Idempotency is enforced by the
+ * unique constraint on `idempotencyKey`: a repeat call with the same key
+ * (retry, duplicate webhook, double-click) is detected and returned as
+ * `alreadyPosted: true` rather than posting a second time.
  */
 @Injectable()
 export class LedgerService {
   constructor(private readonly prisma: PrismaService) {}
 
   async getBalance(userId: string, assetSymbol: string): Promise<Prisma.Decimal> {
-    const asset = await this.prisma.asset.findUniqueOrThrow({ where: { symbol: assetSymbol } });
-    const account = await this.prisma.ledgerAccount.findUnique({
-      where: { userId_assetId: { userId, assetId: asset.id } },
-    });
+    const account = await this.findUserAccount(userId, assetSymbol);
     return account?.cachedBalance ?? new Prisma.Decimal(0);
   }
 
-  /**
-   * Posts a single signed ledger entry and updates the account's cached
-   * balance atomically. Throws InsufficientBalanceError rather than letting
-   * a balance go negative. Runs at SERIALIZABLE isolation so concurrent
-   * mutations to the same account cannot race; callers should be prepared
-   * to retry on a serialization failure.
-   */
-  async postEntry(input: PostLedgerEntryInput, client: PrismaTransactionClient = this.prisma) {
-    const amount = new Prisma.Decimal(input.amount);
-    const asset = await client.asset.findUniqueOrThrow({ where: { symbol: input.assetSymbol } });
+  async getAvailableBalance(userId: string, assetSymbol: string): Promise<Prisma.Decimal> {
+    const account = await this.findUserAccount(userId, assetSymbol);
+    if (!account) return new Prisma.Decimal(0);
+    return computeAvailableBalance(account.cachedBalance, account.reservedBalance);
+  }
 
-    const run = async (tx: PrismaTransactionClient) => {
-      const account = await tx.ledgerAccount.upsert({
-        where: { userId_assetId: { userId: input.userId, assetId: asset.id } },
-        create: { userId: input.userId, assetId: asset.id, cachedBalance: 0 },
-        update: {},
-      });
+  private async findUserAccount(userId: string, assetSymbol: string) {
+    const asset = await this.prisma.asset.findUniqueOrThrow({ where: { symbol: assetSymbol } });
+    return this.prisma.ledgerAccount.findUnique({ where: { userId_assetId: { userId, assetId: asset.id } } });
+  }
+
+  async postTransaction(tx: Prisma.TransactionClient, input: PostTransactionInput): Promise<PostTransactionResult> {
+    if (input.postings.length < 2) {
+      throw new UnbalancedTransactionError("n/a", "a transaction needs at least two postings");
+    }
+
+    const asset = await tx.asset.findUniqueOrThrow({ where: { symbol: input.assetSymbol } });
+
+    const amounts = input.postings.map((p) => new Prisma.Decimal(p.amount));
+    const total = sumAmounts(amounts);
+    if (!total.isZero()) {
+      throw new UnbalancedTransactionError(asset.id, total.toString());
+    }
+
+    const { row: transaction, alreadyExisted } = await createIdempotent(
+      tx,
+      "idempotencyKey",
+      () =>
+        tx.ledgerTransaction.create({
+          data: {
+            assetId: asset.id,
+            type: input.type,
+            referenceType: input.referenceType,
+            referenceId: input.referenceId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        }),
+      () => tx.ledgerTransaction.findUniqueOrThrow({ where: { idempotencyKey: input.idempotencyKey } }),
+    );
+
+    if (alreadyExisted) {
+      return { transactionId: transaction.id, alreadyPosted: true };
+    }
+    const transactionId = transaction.id;
+
+    for (let i = 0; i < input.postings.length; i += 1) {
+      const posting = input.postings[i];
+      const amount = amounts[i];
+      const account = await this.resolveAccount(tx, asset.id, posting.account);
 
       const balanceAfter = computeBalanceAfter(account.cachedBalance, amount);
-      if (isNegative(balanceAfter)) {
+      if (account.ownerType === "USER" && isNegative(balanceAfter)) {
         throw new InsufficientBalanceError(account.id, account.cachedBalance.toString(), amount.toString());
       }
 
-      const entry = await tx.ledgerEntry.create({
-        data: {
-          accountId: account.id,
-          amount,
-          type: input.type,
-          referenceType: input.referenceType,
-          referenceId: input.referenceId,
-          balanceAfter,
-        },
+      await tx.ledgerEntry.create({
+        data: { transactionId, accountId: account.id, amount, balanceAfter },
       });
 
       await tx.ledgerAccount.update({
         where: { id: account.id },
         data: { cachedBalance: balanceAfter },
       });
-
-      return entry;
-    };
-
-    if (client === this.prisma) {
-      return this.prisma.$transaction(run, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     }
-    // Already inside an outer transaction (e.g. withdrawal state transition) — reuse it.
-    return run(client);
+
+    return { transactionId, alreadyPosted: false };
+  }
+
+  async resolveAccount(tx: Prisma.TransactionClient, assetId: string, ref: AccountRef): Promise<LedgerAccount> {
+    if (ref.type === "USER") {
+      return tx.ledgerAccount.upsert({
+        where: { userId_assetId: { userId: ref.userId, assetId } },
+        create: { ownerType: "USER", userId: ref.userId, assetId, cachedBalance: 0, reservedBalance: 0 },
+        update: {},
+      });
+    }
+
+    return tx.ledgerAccount.upsert({
+      where: { houseAccountKey_assetId: { houseAccountKey: ref.key, assetId } },
+      create: { ownerType: "HOUSE", houseAccountKey: ref.key, assetId, cachedBalance: 0, reservedBalance: 0 },
+      update: {},
+    });
   }
 }
-
-export type PrismaTransactionClient = Omit<
-  PrismaClient,
-  "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends"
->;

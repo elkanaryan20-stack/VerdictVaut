@@ -1,6 +1,13 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { Prisma, WalletAddressStatus } from "@prisma/client";
 import { PrismaService } from "../../prisma/prisma.service";
+import { SerializableTransactionRunner } from "../../prisma/serializable-transaction-runner";
+
+interface ClaimedAddressRow {
+  id: string;
+  destinationTag: string | null;
+  environment: "SANDBOX" | "PRODUCTION";
+}
 
 /**
  * Assigns a stable, dedicated deposit address per (user, asset, network)
@@ -10,7 +17,10 @@ import { PrismaService } from "../../prisma/prisma.service";
  */
 @Injectable()
 export class DepositAddressService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly txRunner: SerializableTransactionRunner,
+  ) {}
 
   async getOrAssign(userId: string, assetSymbol: string, networkCode: string) {
     const asset = await this.prisma.asset.findUnique({ where: { symbol: assetSymbol } });
@@ -34,22 +44,42 @@ export class DepositAddressService {
       return existing;
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      const availableAddress = await tx.walletAddress.findFirst({
-        where: { assetNetworkId: assetNetwork.id, status: WalletAddressStatus.AVAILABLE },
-        orderBy: { createdAt: "asc" },
+    return this.txRunner.run(async (tx) => {
+      // Re-check inside the transaction: two concurrent calls for the
+      // same user could both have missed the fast-path check above.
+      const existingInTx = await tx.depositAddressAssignment.findUnique({
+        where: { userId_assetId_networkId: { userId, assetId: asset.id, networkId: network.id } },
+        include: { walletAddress: true },
       });
+      if (existingInTx) {
+        return existingInTx;
+      }
 
-      if (!availableAddress) {
+      // Atomically claim one AVAILABLE address: SKIP LOCKED means two
+      // concurrent claims for the same asset/network never contend for
+      // the same row — each gets a distinct address (or a deterministic
+      // "pool exhausted" failure), with no unguarded read-then-write gap.
+      const claimed = await tx.$queryRaw<ClaimedAddressRow[]>(Prisma.sql`
+        UPDATE "wallet_addresses"
+        SET "status" = ${WalletAddressStatus.ASSIGNED}::"WalletAddressStatus", "updatedAt" = NOW()
+        WHERE "id" = (
+          SELECT "id" FROM "wallet_addresses"
+          WHERE "assetNetworkId" = ${assetNetwork.id}
+            AND "status" = ${WalletAddressStatus.AVAILABLE}::"WalletAddressStatus"
+          ORDER BY "createdAt" ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING "id", "destinationTag", "environment"
+      `);
+
+      if (claimed.length === 0) {
         throw new BadRequestException(
           `No available deposit address for ${assetSymbol} on ${networkCode} — an admin needs to provision more.`,
         );
       }
 
-      await tx.walletAddress.update({
-        where: { id: availableAddress.id },
-        data: { status: WalletAddressStatus.ASSIGNED },
-      });
+      const availableAddress = claimed[0];
 
       return tx.depositAddressAssignment.create({
         data: {
