@@ -9,9 +9,15 @@ import { Prisma } from "@prisma/client";
 import { AuditLogService } from "../../src/audit/audit-log.service";
 import { LedgerService } from "../../src/ledger/ledger.service";
 import { ReservationService } from "../../src/ledger/reservation.service";
+import { MarketsService } from "../../src/markets/markets.service";
 import { PrismaService } from "../../src/prisma/prisma.service";
 import { SerializableTransactionRunner } from "../../src/prisma/serializable-transaction-runner";
+import { ZeroFeeCalculator } from "../../src/trading/fees/zero-fee.calculator";
+import { OrderBookService } from "../../src/trading/order-book/order-book.service";
 import { OrdersService } from "../../src/trading/orders.service";
+import { PositionReservationService } from "../../src/trading/positions/position-reservation.service";
+import { PositionsService } from "../../src/trading/positions/positions.service";
+import { OrderRiskValidator } from "../../src/trading/risk/order-risk-validator.service";
 import { DepositAddressService } from "../../src/wallet/addresses/deposit-address.service";
 import { DepositsService } from "../../src/wallet/deposits/deposits.service";
 import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
@@ -26,12 +32,26 @@ export const reservations = new ReservationService(prisma);
 export const auditLog = new AuditLogService(prisma);
 export const depositsService = new DepositsService(prisma, ledger, txRunner, auditLog);
 export const depositAddressService = new DepositAddressService(prisma, txRunner);
-export const ordersService = new OrdersService(prisma, reservations, txRunner);
 
 const manualBroadcastExecutor = new ManualBroadcastExecutor();
 const productionCustodyExecutor = new ProductionCustodyExecutor();
 export const executorFactory = new WithdrawalExecutorFactory(prisma, manualBroadcastExecutor, productionCustodyExecutor);
 export const withdrawalsService = new WithdrawalsService(prisma, ledger, reservations, executorFactory, txRunner, auditLog);
+
+export const marketsService = new MarketsService(prisma, txRunner, auditLog);
+export const positionReservations = new PositionReservationService(prisma);
+export const positionsService = new PositionsService(prisma);
+export const orderRiskValidator = new OrderRiskValidator(prisma);
+export const feeCalculator = new ZeroFeeCalculator();
+export const orderBookService = new OrderBookService(prisma);
+export const ordersService = new OrdersService(
+  prisma,
+  reservations,
+  positionReservations,
+  orderRiskValidator,
+  feeCalculator,
+  txRunner,
+);
 
 let userCounter = 0;
 
@@ -97,4 +117,62 @@ export async function fundUserForTest(userId: string, assetSymbol: string, amoun
 export async function getUserAccount(userId: string, assetSymbol: string) {
   const asset = await getAsset(assetSymbol);
   return prisma.ledgerAccount.findUnique({ where: { userId_assetId: { userId, assetId: asset.id } } });
+}
+
+/**
+ * Test-fixture helper only. There is no real position-crediting mechanism
+ * in this phase — that is the (not-yet-built) matching engine's job — so
+ * this directly sets a Position's quantity via Prisma to test SELL-order
+ * share-reservation without a matcher. This never runs in the shipped
+ * app and never represents fabricated real trading activity; it exists
+ * solely so PositionReservationService can be exercised deterministically.
+ */
+export async function grantPositionForTest(userId: string, marketId: string, outcomeId: string, quantity: string) {
+  return prisma.position.upsert({
+    where: { userId_marketId_outcomeId: { userId, marketId, outcomeId } },
+    create: { userId, marketId, outcomeId, quantity: new Prisma.Decimal(quantity), reservedQuantity: 0 },
+    update: { quantity: new Prisma.Decimal(quantity) },
+  });
+}
+
+let marketCounter = 0;
+
+/**
+ * Creates a real DRAFT market with two outcomes (YES/NO by default) via
+ * the actual MarketsService, plus a fresh category (categories aren't
+ * seeded). Does not open it — call openMarketForTest for that.
+ */
+export async function createTestMarket(adminId: string, overrides: { closeTime?: string; maxExposure?: string } = {}) {
+  marketCounter += 1;
+  const marker = `${Date.now()}-${marketCounter}-${Math.random().toString(36).slice(2)}`;
+  const category = await prisma.marketCategory.create({
+    data: { slug: `test-cat-${marker}`, name: "Test Category" },
+  });
+
+  const market = await marketsService.create(
+    {
+      slug: `test-market-${marker}`,
+      title: "Test Market",
+      description: "A test market",
+      categorySlug: category.slug,
+      closeTime: overrides.closeTime,
+      outcomes: [
+        { key: "YES", label: "Yes" },
+        { key: "NO", label: "No" },
+      ],
+    },
+    adminId,
+  );
+
+  if (overrides.maxExposure) {
+    await prisma.market.update({ where: { id: market.id }, data: { maxExposure: new Prisma.Decimal(overrides.maxExposure) } });
+  }
+
+  const yes = market.outcomes.find((o) => o.key === "YES")!;
+  const no = market.outcomes.find((o) => o.key === "NO")!;
+  return { market, yes, no };
+}
+
+export async function openMarketForTest(marketId: string, adminId: string) {
+  return marketsService.open(marketId, adminId);
 }

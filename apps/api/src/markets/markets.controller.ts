@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, UseGuards } from "@nestjs/common";
+import { Controller, Get, Param, Post, Body, UseGuards } from "@nestjs/common";
 import { UserRole } from "@prisma/client";
 import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
@@ -31,5 +31,19 @@ export class MarketsController {
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   create(@Body() dto: CreateMarketDto, @CurrentUser() user: AuthenticatedUser) {
     return this.marketsService.create(dto, user.id);
+  }
+
+  @Post(":id/open")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  open(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.marketsService.open(id, user.id);
+  }
+
+  @Post(":id/close")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  close(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.marketsService.close(id, user.id);
   }
 }

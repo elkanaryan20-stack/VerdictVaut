@@ -24,12 +24,18 @@ enum UserStatus {
   SUSPENDED
 }
 
+// DRAFT -> OPEN -> CLOSED -> RESOLVING -> RESOLVED, with CANCELLED reachable
+// from any pre-RESOLVED state and PAUSED a reversible halt from OPEN back to
+// OPEN. Trading is allowed only in OPEN (enforced in OrdersService, not by a
+// CHECK constraint, since that decision needs application context).
 enum MarketStatus {
   DRAFT
   OPEN
   PAUSED
   CLOSED
+  RESOLVING
   RESOLVED
+  CANCELLED
 }
 
 enum OrderSide {
@@ -37,6 +43,10 @@ enum OrderSide {
   SELL
 }
 
+// MARKET exists as a value for forward compatibility but is rejected at the
+// service layer for now — see OrdersService. A resting "market order" with
+// no matching engine to execute it immediately is an incoherent state, not
+// a safe simplification.
 enum OrderType {
   LIMIT
   MARKET
@@ -47,6 +57,7 @@ enum OrderStatus {
   PARTIALLY_FILLED
   FILLED
   CANCELLED
+  EXPIRED
   REJECTED
 }
 
@@ -179,6 +190,8 @@ model User {
   withdrawals               Withdrawal[]
   riskLimit                 RiskLimit?
   createdMarkets            Market[]                   @relation("MarketCreatedBy")
+  fillsAsBuyer              Fill[]                     @relation("FillBuyer")
+  fillsAsSeller             Fill[]                     @relation("FillSeller")
 
   @@map("users")
 }
@@ -212,17 +225,27 @@ model MarketCategory {
 }
 
 model Market {
-  id               String       @id @default(uuid())
-  slug             String       @unique
-  title            String
-  description      String
-  categoryId       String
-  status           MarketStatus @default(DRAFT)
-  closeTime        DateTime?
-  resolutionSource String?
-  createdById      String
-  createdAt        DateTime     @default(now())
-  updatedAt        DateTime     @updatedAt
+  id                 String       @id @default(uuid())
+  slug               String       @unique
+  title              String
+  description        String
+  categoryId         String
+  status             MarketStatus @default(DRAFT)
+  resolutionSource   String?
+  // What resolves the market, as distinct from resolutionSource (where to
+  // check) — the rule a resolver applies, e.g. "Resolves YES if the Fed
+  // cuts rates at the March 2027 FOMC meeting per the official statement."
+  resolutionCriteria String?
+  openTime           DateTime?
+  closeTime          DateTime?
+  resolutionTime     DateTime?
+  // Optional per-market cap on aggregate open BUY exposure (sum of
+  // remainingQuantity * price across resting BUY orders) for one outcome.
+  // Null means no cap is configured — never a silently-invented default.
+  maxExposure        Decimal?     @db.Decimal(36, 18)
+  createdById        String
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
 
   category    MarketCategory  @relation(fields: [categoryId], references: [id])
   createdBy   User            @relation("MarketCreatedBy", fields: [createdById], references: [id])
@@ -231,13 +254,20 @@ model Market {
   settlements Settlement[]
 
   @@index([categoryId])
+  @@index([status])
   @@map("markets")
 }
 
 model MarketOutcome {
   id        String   @id @default(uuid())
   marketId  String
+  // Stable, machine-referenced identifier (e.g. "YES"/"NO") — distinct from
+  // `label`, the human-readable display text, so relabeling a market never
+  // touches the identity outcomes are ordered/traded by. Binary markets use
+  // YES/NO today; the model does not assume only two outcomes ever exist.
+  key       String
   label     String
+  sortOrder Int      @default(0)
   createdAt DateTime @default(now())
 
   market      Market       @relation(fields: [marketId], references: [id], onDelete: Cascade)
@@ -245,68 +275,123 @@ model MarketOutcome {
   positions   Position[]
   settlements Settlement[]
 
-  @@unique([marketId, label])
+  @@unique([marketId, key])
   @@map("market_outcomes")
 }
 
 model Order {
-  id             String      @id @default(uuid())
-  userId         String
-  marketId       String
-  outcomeId      String
-  side           OrderSide
-  type           OrderType
-  price          Decimal?    @db.Decimal(18, 6)
-  quantity       Decimal     @db.Decimal(36, 18)
-  filledQuantity Decimal     @default(0) @db.Decimal(36, 18)
-  status         OrderStatus @default(OPEN)
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
+  id                String      @id @default(uuid())
+  userId            String
+  marketId          String
+  outcomeId         String
+  side              OrderSide
+  type              OrderType
+  price             Decimal?    @db.Decimal(18, 6)
+  quantity          Decimal     @db.Decimal(36, 18)
+  filledQuantity    Decimal     @default(0) @db.Decimal(36, 18)
+  // The live field the (future) matcher decrements; filledQuantity is the
+  // complementary historical figure. filledQuantity + remainingQuantity =
+  // quantity is enforced by a DB CHECK constraint, not just convention.
+  remainingQuantity Decimal     @db.Decimal(36, 18)
+  status            OrderStatus @default(OPEN)
+  // Client-supplied (or server-generated when omitted) idempotency key.
+  // Always populated — see OrdersService — so the unique index below is
+  // never defeated by NULLs not colliding under Postgres's default
+  // unique-index semantics.
+  clientOrderId     String
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
 
-  user       User          @relation(fields: [userId], references: [id])
-  market     Market        @relation(fields: [marketId], references: [id])
-  outcome    MarketOutcome @relation(fields: [outcomeId], references: [id])
-  makerFills Fill[]        @relation("MakerOrder")
-  takerFills Fill[]        @relation("TakerOrder")
+  user      User          @relation(fields: [userId], references: [id])
+  market    Market        @relation(fields: [marketId], references: [id])
+  outcome   MarketOutcome @relation(fields: [outcomeId], references: [id])
+  buyFills  Fill[]        @relation("BuyOrder")
+  sellFills Fill[]        @relation("SellOrder")
 
+  @@unique([userId, clientOrderId])
+  // Primary order-book / price-time-priority lookup path.
+  @@index([marketId, outcomeId, side, status, price, createdAt])
   @@index([marketId, outcomeId, status])
   @@index([userId])
   @@map("orders")
 }
 
 model Fill {
-  id           String   @id @default(uuid())
-  makerOrderId String
-  takerOrderId String
-  marketId     String
-  outcomeId    String
-  price        Decimal  @db.Decimal(18, 6)
-  quantity     Decimal  @db.Decimal(36, 18)
-  fee          Decimal  @default(0) @db.Decimal(36, 18)
-  createdAt    DateTime @default(now())
+  id             String   @id @default(uuid())
+  marketId       String
+  outcomeId      String
+  buyOrderId     String
+  sellOrderId    String
+  buyerUserId    String
+  sellerUserId   String
+  price          Decimal  @db.Decimal(18, 6)
+  quantity       Decimal  @db.Decimal(36, 18)
+  fee            Decimal  @default(0) @db.Decimal(36, 18)
+  // Set by the (future) matcher once per execution — guards against the
+  // same match being applied twice, the same primitive used for
+  // LedgerTransaction/FundReservation in the ledger. Fills are append-only:
+  // no service method updates an existing Fill row.
+  idempotencyKey String   @unique
+  executedAt     DateTime @default(now())
 
-  makerOrder Order @relation("MakerOrder", fields: [makerOrderId], references: [id])
-  takerOrder Order @relation("TakerOrder", fields: [takerOrderId], references: [id])
+  buyOrder  Order @relation("BuyOrder", fields: [buyOrderId], references: [id])
+  sellOrder Order @relation("SellOrder", fields: [sellOrderId], references: [id])
+  buyer     User  @relation("FillBuyer", fields: [buyerUserId], references: [id])
+  seller    User  @relation("FillSeller", fields: [sellerUserId], references: [id])
 
   @@index([marketId, outcomeId])
+  @@index([buyOrderId])
+  @@index([sellOrderId])
   @@map("fills")
 }
 
 model Position {
-  id          String   @id @default(uuid())
-  userId      String
-  marketId    String
-  outcomeId   String
-  quantity    Decimal  @default(0) @db.Decimal(36, 18)
-  avgPrice    Decimal  @default(0) @db.Decimal(18, 6)
-  realizedPnl Decimal  @default(0) @db.Decimal(36, 18)
-  updatedAt   DateTime @updatedAt
+  id               String   @id @default(uuid())
+  userId           String
+  marketId         String
+  outcomeId        String
+  quantity         Decimal  @default(0) @db.Decimal(36, 18)
+  // Earmarked by an ACTIVE PositionReservation (SELL orders) — the
+  // outcome-share mirror of LedgerAccount.reservedBalance. Available shares
+  // = quantity - reservedQuantity, enforced by DB CHECK, same invariant
+  // shape as the cash ledger's.
+  reservedQuantity Decimal  @default(0) @db.Decimal(36, 18)
+  avgPrice         Decimal  @default(0) @db.Decimal(18, 6)
+  realizedPnl      Decimal  @default(0) @db.Decimal(36, 18)
+  updatedAt        DateTime @updatedAt
 
-  user    User          @relation(fields: [userId], references: [id])
-  outcome MarketOutcome @relation(fields: [outcomeId], references: [id])
+  user         User                  @relation(fields: [userId], references: [id])
+  outcome      MarketOutcome         @relation(fields: [outcomeId], references: [id])
+  reservations PositionReservation[]
 
   @@unique([userId, marketId, outcomeId])
   @@map("positions")
+}
+
+// Outcome-share reservation — the position-quantity counterpart to
+// FundReservation (cash). Deliberately mirrors its shape (ACTIVE ->
+// RELEASED|CAPTURED, its own idempotency key) rather than reusing
+// FundReservation directly, because FundReservation is hard-FK'd to
+// LedgerAccount (a real-asset account) and shares are not a LedgerAccount
+// asset — conflating the two would be the "accounting shortcut" this
+// architecture is explicitly trying to avoid.
+model PositionReservation {
+  id             String            @id @default(uuid())
+  positionId     String
+  amount         Decimal           @db.Decimal(36, 18)
+  status         ReservationStatus @default(ACTIVE)
+  referenceType  String
+  referenceId    String
+  idempotencyKey String            @unique
+  createdAt      DateTime          @default(now())
+  releasedAt     DateTime?
+  capturedAt     DateTime?
+
+  position Position @relation(fields: [positionId], references: [id])
+
+  @@index([positionId, status])
+  @@index([referenceType, referenceId])
+  @@map("position_reservations")
 }
 
 model Settlement {
@@ -650,6 +735,10 @@ model RiskLimit {
   userId             String   @unique
   maxPositionSize    Decimal? @db.Decimal(36, 18)
   maxDailyWithdrawal Decimal? @db.Decimal(36, 18)
+  // Per-order extension points. Null (the default) means unlimited —
+  // no arbitrary production limit is invented without configuration.
+  maxOrderQuantity   Decimal? @db.Decimal(36, 18)
+  maxOrderNotional   Decimal? @db.Decimal(36, 18)
   kycTier            Int      @default(0)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt

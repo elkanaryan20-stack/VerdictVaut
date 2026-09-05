@@ -85,12 +85,12 @@ describe("Database-level financial invariants (real Postgres)", () => {
         createdById: user.id,
       },
     });
-    const outcome = await prisma.marketOutcome.create({ data: { marketId: market.id, label: "YES" } });
+    const outcome = await prisma.marketOutcome.create({ data: { marketId: market.id, key: "YES", label: "YES" } });
 
     await expect(
       prisma.$executeRaw`
-        INSERT INTO "orders" ("id", "userId", "marketId", "outcomeId", "side", "type", "quantity", "filledQuantity", "status", "createdAt", "updatedAt")
-        VALUES (gen_random_uuid()::text, ${user.id}, ${market.id}, ${outcome.id}, 'BUY', 'MARKET', 0, 0, 'OPEN', NOW(), NOW())
+        INSERT INTO "orders" ("id", "userId", "marketId", "outcomeId", "side", "type", "quantity", "filledQuantity", "remainingQuantity", "clientOrderId", "status", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid()::text, ${user.id}, ${market.id}, ${outcome.id}, 'BUY', 'MARKET', 0, 0, 0, ${"legacy-check-" + Date.now()}, 'OPEN', NOW(), NOW())
       `,
     ).rejects.toThrow(/orders_quantity_positive_check/);
   });
