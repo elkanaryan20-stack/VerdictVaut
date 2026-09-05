@@ -4,12 +4,19 @@ import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
 import { Roles } from "../common/decorators/roles.decorator";
 import { RolesGuard } from "../common/guards/roles.guard";
+import { SettlementService } from "../settlement/settlement.service";
 import { CreateMarketDto } from "./dto/create-market.dto";
 import { MarketsService } from "./markets.service";
+import { ResolveMarketDto } from "./resolution/dto/resolve-market.dto";
+import { ResolutionService } from "./resolution/resolution.service";
 
 @Controller("markets")
 export class MarketsController {
-  constructor(private readonly marketsService: MarketsService) {}
+  constructor(
+    private readonly marketsService: MarketsService,
+    private readonly resolutionService: ResolutionService,
+    private readonly settlementService: SettlementService,
+  ) {}
 
   @Get()
   list() {
@@ -45,5 +52,38 @@ export class MarketsController {
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   close(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
     return this.marketsService.close(id, user.id);
+  }
+
+  // Decides the winning outcome and attempts settlement immediately.
+  // ResolutionService independently re-verifies the resolver's role
+  // against the DB (defense in depth alongside RolesGuard here).
+  @Post(":id/resolve")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  resolve(@Param("id") id: string, @Body() dto: ResolveMarketDto, @CurrentUser() user: AuthenticatedUser) {
+    return this.resolutionService.resolve(id, user.id, dto.winningOutcomeId, dto.notes);
+  }
+
+  // Recovery path for a market whose settlement pass previously failed
+  // or was left incomplete — safe to call any number of times.
+  @Post(":id/retry-settlement")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  retrySettlement(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.resolutionService.retrySettlement(id, user.id);
+  }
+
+  // Aggregate, public resolution/settlement status — no individual
+  // user's payout amount (see settlement/mine below for that).
+  @Get(":id/resolution")
+  getResolutionStatus(@Param("id") id: string) {
+    return this.resolutionService.getResolutionStatus(id);
+  }
+
+  // The calling user's own settlement result(s) for this market.
+  @Get(":id/settlement/mine")
+  @UseGuards(JwtAuthGuard)
+  getMySettlement(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.settlementService.getUserSettlements(user.id, id);
   }
 }

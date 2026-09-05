@@ -3,16 +3,15 @@ import { MarketStatus } from "@prisma/client";
 import { AuditLogService } from "../audit/audit-log.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { SerializableTransactionRunner } from "../prisma/serializable-transaction-runner";
+import { OrdersService } from "../trading/orders.service";
 import { CreateMarketDto } from "./dto/create-market.dto";
 
 /**
- * Market lifecycle implemented in this phase: DRAFT -> OPEN -> CLOSED.
- * RESOLVING/RESOLVED/CANCELLED exist on MarketStatus for forward
- * compatibility with the (not-yet-built) resolution/settlement phase —
- * nothing here produces them. Trading is gated on status === OPEN (and
- * closeTime, defensively) in OrdersService, not by a DB constraint, since
- * that decision needs the current time and can't be expressed as a
- * static CHECK.
+ * Market lifecycle: DRAFT -> OPEN -> CLOSED -> RESOLVING -> RESOLVED (see
+ * ResolutionService/SettlementService for the latter two transitions).
+ * Trading is gated on status === OPEN (and closeTime, defensively) in
+ * OrdersService, not by a DB constraint, since that decision needs the
+ * current time and can't be expressed as a static CHECK.
  */
 @Injectable()
 export class MarketsService {
@@ -20,6 +19,7 @@ export class MarketsService {
     private readonly prisma: PrismaService,
     private readonly txRunner: SerializableTransactionRunner,
     private readonly auditLog: AuditLogService,
+    private readonly ordersService: OrdersService,
   ) {}
 
   async listOpen() {
@@ -83,14 +83,55 @@ export class MarketsService {
     return this.transitionStatus(marketId, adminId, [MarketStatus.DRAFT], MarketStatus.OPEN, "market.open");
   }
 
+  /**
+   * Unlike the generic transitionStatus() path open() uses, closing a
+   * market also terminates every order still resting on its book — once
+   * CLOSED, a market can never return to OPEN, and matching/new-order
+   * placement is already gated on status === OPEN elsewhere, so a
+   * resting order can never be filled again after this point. Leaving it
+   * OPEN/PARTIALLY_FILLED forever would strand its reservation and
+   * misrepresent the book, so every resting order is expired (not
+   * cancelled — this is a system-driven termination, not the user's own
+   * action) and its reservation released, atomically with this same
+   * status transition. This is also what makes it safe for resolution to
+   * assume zero active reservations remain once a market reaches CLOSED.
+   */
   async close(marketId: string, adminId: string) {
-    return this.transitionStatus(
-      marketId,
-      adminId,
-      [MarketStatus.OPEN, MarketStatus.PAUSED],
-      MarketStatus.CLOSED,
-      "market.close",
-    );
+    const { market, previousStatus, expiredOrders } = await this.txRunner.run(async (tx) => {
+      const current = await tx.market.findUnique({ where: { id: marketId } });
+      if (!current) {
+        throw new NotFoundException("Market not found");
+      }
+
+      const result = await tx.market.updateMany({
+        where: { id: marketId, status: { in: [MarketStatus.OPEN, MarketStatus.PAUSED] } },
+        data: { status: MarketStatus.CLOSED },
+      });
+      if (result.count === 0) {
+        throw new ConflictException(
+          `Market ${marketId} is in status ${current.status}, expected one of: OPEN, PAUSED`,
+        );
+      }
+
+      const expiredOrders = await this.ordersService.expireRestingOrdersForMarket(tx, marketId);
+
+      return {
+        market: await tx.market.findUniqueOrThrow({ where: { id: marketId } }),
+        previousStatus: current.status,
+        expiredOrders,
+      };
+    });
+
+    await this.auditLog.record({
+      actorId: adminId,
+      action: "market.close",
+      resourceType: "Market",
+      resourceId: marketId,
+      before: { status: previousStatus },
+      after: { status: market.status, expiredOrders },
+    });
+
+    return market;
   }
 
   private async transitionStatus(

@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, NotFoundException } from "@nest
 import { AuditLogService } from "../audit/audit-log.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { SerializableTransactionRunner } from "../prisma/serializable-transaction-runner";
+import { OrdersService } from "../trading/orders.service";
 import { MarketsService } from "./markets.service";
 
 describe("MarketsService", () => {
@@ -12,6 +13,7 @@ describe("MarketsService", () => {
   };
   let txRunner: { run: jest.Mock };
   let auditLog: { record: jest.Mock };
+  let ordersService: { expireRestingOrdersForMarket: jest.Mock };
 
   beforeEach(() => {
     prisma = {
@@ -25,11 +27,13 @@ describe("MarketsService", () => {
     };
     txRunner = { run: jest.fn((fn: (tx: unknown) => unknown) => fn(prisma)) };
     auditLog = { record: jest.fn() };
+    ordersService = { expireRestingOrdersForMarket: jest.fn().mockResolvedValue(0) };
 
     service = new MarketsService(
       prisma as unknown as PrismaService,
       txRunner as unknown as SerializableTransactionRunner,
       auditLog as unknown as AuditLogService,
+      ordersService as unknown as OrdersService,
     );
   });
 
@@ -129,6 +133,25 @@ describe("MarketsService", () => {
       prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "CLOSED" });
       prisma.market.updateMany.mockResolvedValue({ count: 0 });
       await expect(service.close("market-1", "admin-1")).rejects.toThrow(ConflictException);
+      expect(ordersService.expireRestingOrdersForMarket).not.toHaveBeenCalled();
+    });
+
+    it("close() expires every resting order for the market atomically with the status transition", async () => {
+      prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "OPEN" });
+      prisma.market.updateMany.mockResolvedValue({ count: 1 });
+      prisma.market.findUniqueOrThrow.mockResolvedValue({ id: "market-1", status: "CLOSED" });
+      ordersService.expireRestingOrdersForMarket.mockResolvedValue(3);
+
+      const result = await service.close("market-1", "admin-1");
+
+      expect(result.status).toBe("CLOSED");
+      expect(ordersService.expireRestingOrdersForMarket).toHaveBeenCalledWith(prisma, "market-1");
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "market.close",
+          after: { status: "CLOSED", expiredOrders: 3 },
+        }),
+      );
     });
   });
 });

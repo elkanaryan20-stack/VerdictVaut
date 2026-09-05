@@ -84,6 +84,22 @@ enum LedgerAccountOwnerType {
 enum HouseAccountKey {
   EXTERNAL_CHAIN
   FEE_REVENUE
+  // Counterparty for market-resolution payouts (see SettlementService).
+  // DELIBERATE ACCOUNTING BOUNDARY: this system has no complete-set /
+  // collateral-minting mechanism for outcome shares — a share's cash
+  // counterpart is never escrowed at trade time (a BUY's reserved cash
+  // is simply transferred to the matched SELL's own cash balance at
+  // execution, per ExecutionCoordinator.postTradeLedger; nothing is set
+  // aside against future settlement). So a winning position's payout at
+  // resolution is not backed by pre-collateralized platform funds — this
+  // account funds it directly and is expected to run persistently
+  // negative, exactly like EXTERNAL_CHAIN. Losing positions receive a
+  // zero payout and post no ledger entry at all, so nothing ever flows
+  // the other way to offset this. Replacing this with real
+  // collateralization (e.g. locking BUY-side cash into this pool at
+  // trade time, or a complete-set mint/split mechanism) is out of scope
+  // for this phase and should happen before real funds are on the line.
+  SETTLEMENT_POOL
 }
 
 enum ReservationStatus {
@@ -167,6 +183,17 @@ enum AuditActorType {
   SYSTEM
 }
 
+// PENDING never actually persists today — Settlement rows are created
+// already-COMPLETED at resolution time (the payout RATE for an outcome is
+// decided and fixed the instant the market resolves; nothing further
+// "processes" about it afterward). Kept as a real state, not collapsed to
+// a boolean, so a future multi-step rate-approval workflow has somewhere
+// to live without a schema change.
+enum SettlementStatus {
+  PENDING
+  COMPLETED
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Identity
 // ────────────────────────────────────────────────────────────────────────
@@ -192,6 +219,8 @@ model User {
   createdMarkets            Market[]                   @relation("MarketCreatedBy")
   fillsAsBuyer              Fill[]                     @relation("FillBuyer")
   fillsAsSeller             Fill[]                     @relation("FillSeller")
+  marketResolutions         MarketResolution[]
+  positionSettlements       PositionSettlement[]
 
   @@map("users")
 }
@@ -252,6 +281,8 @@ model Market {
   outcomes    MarketOutcome[]
   orders      Order[]
   settlements Settlement[]
+  resolution  MarketResolution?
+  positionSettlements PositionSettlement[]
 
   @@index([categoryId])
   @@index([status])
@@ -274,6 +305,8 @@ model MarketOutcome {
   orders      Order[]
   positions   Position[]
   settlements Settlement[]
+  resolutionWins      MarketResolution[]
+  positionSettlements PositionSettlement[]
 
   @@unique([marketId, key])
   @@map("market_outcomes")
@@ -385,14 +418,28 @@ model Position {
   // shape as the cash ledger's.
   reservedQuantity Decimal  @default(0) @db.Decimal(36, 18)
   avgPrice         Decimal  @default(0) @db.Decimal(18, 6)
+  // Ordinary trade P&L, realized the instant shares change hands (see
+  // ExecutionCoordinator.updatePositions) — entirely independent of, and
+  // NOT the same figure as, a market-resolution settlement payout (see
+  // PositionSettlement.payoutAmount). Never conflate the two.
   realizedPnl      Decimal  @default(0) @db.Decimal(36, 18)
+  // Null = not yet settled. Set exactly once, atomically with the
+  // creation of this position's PositionSettlement row (which is the
+  // actual idempotent guarantee — see that model). A frozen historical
+  // marker: nothing updates quantity/avgPrice/realizedPnl after this is
+  // set, since no further trading can occur once a market leaves OPEN.
+  settledAt        DateTime?
   updatedAt        DateTime @updatedAt
 
   user         User                  @relation(fields: [userId], references: [id])
   outcome      MarketOutcome         @relation(fields: [outcomeId], references: [id])
   reservations PositionReservation[]
+  settlement   PositionSettlement?
 
   @@unique([userId, marketId, outcomeId])
+  // Enumerating a market's still-unsettled positions (SettlementService)
+  // is an indexed range scan, not a full-table scan.
+  @@index([marketId, settledAt])
   @@map("positions")
 }
 
@@ -429,20 +476,92 @@ model PositionReservation {
   @@map("position_reservations")
 }
 
+// The resolved payout RATE for one outcome of one market — exactly one
+// row per (market, outcome), created for EVERY outcome (not just the
+// winner) atomically with MarketResolution, in the same transaction as
+// the CLOSED -> RESOLVING status transition. This is the rate; it says
+// nothing about any individual user's position — that is
+// PositionSettlement's job, one level down.
 model Settlement {
-  id             String    @id @default(uuid())
+  id             String           @id @default(uuid())
   marketId       String
   outcomeId      String
-  payoutPerShare Decimal   @db.Decimal(18, 6)
-  status         String    @default("PENDING")
+  payoutPerShare Decimal          @db.Decimal(18, 6)
+  status         SettlementStatus @default(PENDING)
   processedAt    DateTime?
-  createdAt      DateTime  @default(now())
+  createdAt      DateTime         @default(now())
 
   market  Market        @relation(fields: [marketId], references: [id])
   outcome MarketOutcome @relation(fields: [outcomeId], references: [id])
 
-  @@index([marketId])
+  @@unique([marketId, outcomeId])
   @@map("settlements")
+}
+
+// The single authoritative, auditable record of what a market resolved
+// to — created exactly once per market (marketId is unique, the actual
+// DB-level "never resolve twice" guarantee, alongside the CLOSED ->
+// RESOLVING CAS in ResolutionService) atomically with that transition.
+// resolvedAt is when the outcome was DECIDED; settledAt is a distinct,
+// later event — set only once every position in this market has been
+// paid out and the market reaches RESOLVED (see SettlementService). A
+// market can sit with resolvedAt set and settledAt still null for a
+// while if settlement is large/retried; that is an expected, valid,
+// in-progress state (status = RESOLVING), not a bug.
+model MarketResolution {
+  id               String    @id @default(uuid())
+  marketId         String    @unique
+  winningOutcomeId String
+  resolverId       String
+  // Optional human-readable rationale (e.g. a citation of the resolution
+  // source). Free text, not JSON — there is nothing structured to gain
+  // from encoding a rationale as a document.
+  notes            String?
+  resolvedAt       DateTime  @default(now())
+  settledAt        DateTime?
+
+  market         Market        @relation(fields: [marketId], references: [id])
+  winningOutcome MarketOutcome @relation(fields: [winningOutcomeId], references: [id])
+  resolver       User          @relation(fields: [resolverId], references: [id])
+
+  @@map("market_resolutions")
+}
+
+// Append-only, idempotent, per-position payout record — the settlement
+// counterpart to Fill. Its existence (idempotencyKey unique, positionId
+// unique) IS the authoritative "this position has been settled"
+// guarantee: it is created in the SAME transaction as the ledger posting
+// (when payoutAmount > 0) and the owning Position's settledAt stamp, so
+// this row existing implies both already happened too — never partially.
+// quantity/payoutPerShare are immutable snapshots taken at settlement
+// time, independent of Position's own (by then frozen) figures.
+model PositionSettlement {
+  id       String @id @default(uuid())
+  positionId String @unique
+  marketId   String
+  outcomeId  String
+  userId     String
+  quantity       Decimal  @db.Decimal(36, 18)
+  payoutPerShare Decimal  @db.Decimal(18, 6)
+  payoutAmount   Decimal  @db.Decimal(36, 18)
+  // Null when payoutAmount is zero (a losing position, or a winning
+  // position that happened to hold zero quantity) — nothing was posted
+  // to the ledger because no cash moved. Not a hard FK: this is a soft
+  // reference for convenience, mirroring how LedgerTransaction itself
+  // points OUTWARD at its cause (referenceType/referenceId) rather than
+  // the cause holding a hard FK back into the ledger.
+  ledgerTransactionId String?
+  idempotencyKey      String   @unique
+  settledAt           DateTime @default(now())
+
+  position Position      @relation(fields: [positionId], references: [id])
+  market   Market        @relation(fields: [marketId], references: [id])
+  outcome  MarketOutcome @relation(fields: [outcomeId], references: [id])
+  user     User          @relation(fields: [userId], references: [id])
+
+  @@index([marketId])
+  @@index([userId])
+  @@map("position_settlements")
 }
 
 // ────────────────────────────────────────────────────────────────────────

@@ -27,7 +27,7 @@ describe("OrdersService", () => {
     market: { findUnique: jest.Mock };
     marketOutcome: { findUnique: jest.Mock };
     asset: { findFirstOrThrow: jest.Mock };
-    order: { create: jest.Mock; findUnique: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
+    order: { create: jest.Mock; findUnique: jest.Mock; findMany: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
     fill: { findMany: jest.Mock };
     fundReservation: { findFirst: jest.Mock };
   };
@@ -51,7 +51,8 @@ describe("OrdersService", () => {
       order: {
         create: jest.fn().mockImplementation(async ({ data }) => ({ id: "order-1", ...data })),
         findUnique: jest.fn(),
-        updateMany: jest.fn(),
+        findMany: jest.fn().mockResolvedValue([]),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findUniqueOrThrow: jest.fn().mockImplementation(async ({ where }: { where: { id?: string } }) => ({
           id: where?.id ?? "order-1",
           status: "OPEN",
@@ -278,6 +279,60 @@ describe("OrdersService", () => {
       executionCoordinator.matchAndExecute.mockRejectedValue(new Error("still broken"));
 
       await expect(service.retryMatching("user-1", "order-1")).rejects.toThrow(MatchingAttemptFailedException);
+    });
+  });
+
+  describe("expireRestingOrdersForMarket", () => {
+    it("expires every OPEN/PARTIALLY_FILLED order for the market and releases each one's own reservation", async () => {
+      prisma.order.findMany.mockResolvedValue([
+        { id: "buy-1", side: "BUY", status: "OPEN" },
+        { id: "sell-1", side: "SELL", status: "PARTIALLY_FILLED" },
+      ]);
+      reservations.findActiveByReference.mockResolvedValue({ id: "res-1" });
+      positionReservations.findActiveByReference.mockResolvedValue({ id: "pres-1" });
+
+      const count = await service.expireRestingOrdersForMarket(prisma as unknown as Prisma.TransactionClient, "market-1");
+
+      expect(count).toBe(2);
+      expect(prisma.order.updateMany).toHaveBeenCalledWith({
+        where: { id: "buy-1", status: "OPEN" },
+        data: { status: "EXPIRED" },
+      });
+      expect(prisma.order.updateMany).toHaveBeenCalledWith({
+        where: { id: "sell-1", status: "PARTIALLY_FILLED" },
+        data: { status: "EXPIRED" },
+      });
+      expect(reservations.release).toHaveBeenCalledWith(prisma, "res-1");
+      expect(positionReservations.release).toHaveBeenCalledWith(prisma, "pres-1");
+    });
+
+    it("is a no-op with nothing to release when no orders are resting", async () => {
+      prisma.order.findMany.mockResolvedValue([]);
+
+      const count = await service.expireRestingOrdersForMarket(prisma as unknown as Prisma.TransactionClient, "market-1");
+
+      expect(count).toBe(0);
+      expect(reservations.release).not.toHaveBeenCalled();
+      expect(positionReservations.release).not.toHaveBeenCalled();
+    });
+
+    it("skips releasing a reservation for an order the CAS finds already changed underneath it", async () => {
+      prisma.order.findMany.mockResolvedValue([{ id: "buy-1", side: "BUY", status: "OPEN" }]);
+      prisma.order.updateMany.mockResolvedValue({ count: 0 }); // something else already changed this order's status
+
+      await service.expireRestingOrdersForMarket(prisma as unknown as Prisma.TransactionClient, "market-1");
+
+      expect(reservations.findActiveByReference).not.toHaveBeenCalled();
+      expect(reservations.release).not.toHaveBeenCalled();
+    });
+
+    it("does nothing when an order has no active reservation to release", async () => {
+      prisma.order.findMany.mockResolvedValue([{ id: "buy-1", side: "BUY", status: "OPEN" }]);
+      reservations.findActiveByReference.mockResolvedValue(null);
+
+      await service.expireRestingOrdersForMarket(prisma as unknown as Prisma.TransactionClient, "market-1");
+
+      expect(reservations.release).not.toHaveBeenCalled();
     });
   });
 

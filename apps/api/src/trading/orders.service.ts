@@ -351,4 +351,43 @@ export class OrdersService {
   async listMine(userId: string) {
     return this.prisma.order.findMany({ where: { userId }, orderBy: { createdAt: "desc" } });
   }
+
+  /**
+   * Terminates every still-resting (OPEN/PARTIALLY_FILLED) order for a
+   * market and releases whatever each one's own reservation still
+   * earmarks. Called by MarketsService.close() inside the SAME
+   * transaction as the OPEN/PAUSED -> CLOSED status transition (`tx` is
+   * the caller's own transaction client, not a fresh one opened here) so
+   * the book's termination is atomic with the market leaving OPEN for
+   * good. EXPIRED (not CANCELLED) marks this as a system-driven
+   * termination distinct from a user's own OrdersService.cancel().
+   *
+   * Bounded by the same composite order-book index OrderBookService
+   * relies on (marketId, outcomeId, side, status, price, sequence) — this
+   * is naturally bounded by how many orders were ever resting for one
+   * market, not a full-table scan.
+   */
+  async expireRestingOrdersForMarket(tx: Prisma.TransactionClient, marketId: string): Promise<number> {
+    const restingOrders = await tx.order.findMany({
+      where: { marketId, status: { in: [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED] } },
+    });
+
+    for (const order of restingOrders) {
+      const result = await tx.order.updateMany({
+        where: { id: order.id, status: order.status },
+        data: { status: OrderStatus.EXPIRED },
+      });
+      if (result.count === 0) continue; // already changed by something else — nothing to release
+
+      if (order.side === OrderSide.BUY) {
+        const reservation = await this.reservations.findActiveByReference(tx, "Order", order.id);
+        if (reservation) await this.reservations.release(tx, reservation.id);
+      } else {
+        const reservation = await this.positionReservations.findActiveByReference(tx, "Order", order.id);
+        if (reservation) await this.positionReservations.release(tx, reservation.id);
+      }
+    }
+
+    return restingOrders.length;
+  }
 }

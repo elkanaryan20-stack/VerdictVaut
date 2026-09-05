@@ -20,6 +20,8 @@ import { OrdersService } from "../../src/trading/orders.service";
 import { PositionReservationService } from "../../src/trading/positions/position-reservation.service";
 import { PositionsService } from "../../src/trading/positions/positions.service";
 import { OrderRiskValidator } from "../../src/trading/risk/order-risk-validator.service";
+import { ResolutionService } from "../../src/markets/resolution/resolution.service";
+import { SettlementService } from "../../src/settlement/settlement.service";
 import { DepositAddressService } from "../../src/wallet/addresses/deposit-address.service";
 import { DepositsService } from "../../src/wallet/deposits/deposits.service";
 import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
@@ -40,7 +42,6 @@ const productionCustodyExecutor = new ProductionCustodyExecutor();
 export const executorFactory = new WithdrawalExecutorFactory(prisma, manualBroadcastExecutor, productionCustodyExecutor);
 export const withdrawalsService = new WithdrawalsService(prisma, ledger, reservations, executorFactory, txRunner, auditLog);
 
-export const marketsService = new MarketsService(prisma, txRunner, auditLog);
 export const positionReservations = new PositionReservationService(prisma);
 export const positionsService = new PositionsService(prisma);
 export const orderRiskValidator = new OrderRiskValidator(prisma);
@@ -66,18 +67,29 @@ export const ordersService = new OrdersService(
   txRunner,
   executionCoordinator,
 );
+export const settlementService = new SettlementService(prisma, txRunner, ledger);
+export const resolutionService = new ResolutionService(prisma, txRunner, auditLog, settlementService);
+export const marketsService = new MarketsService(prisma, txRunner, auditLog, ordersService);
 
 let userCounter = 0;
 
-export async function createTestUser(status: "ACTIVE" | "PENDING_VERIFICATION" | "SUSPENDED" = "ACTIVE") {
+export async function createTestUser(
+  status: "ACTIVE" | "PENDING_VERIFICATION" | "SUSPENDED" = "ACTIVE",
+  role: "USER" | "RISK_OPS" | "ADMIN" | "SUPER_ADMIN" = "USER",
+) {
   userCounter += 1;
   return prisma.user.create({
     data: {
       email: `test-${Date.now()}-${userCounter}-${Math.random().toString(36).slice(2)}@example.com`,
       passwordHash: "unused-in-tests",
       status,
+      role,
     },
   });
+}
+
+export async function createTestAdmin() {
+  return createTestUser("ACTIVE", "ADMIN");
 }
 
 export async function getAsset(symbol: string) {
