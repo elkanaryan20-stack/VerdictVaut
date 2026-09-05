@@ -10,12 +10,15 @@ import {
 } from "./helpers";
 
 /**
- * No matching engine exists in this phase, so a Fill is never produced
- * by the running app here — these tests exercise the Fill model exactly
- * the way the future matcher/execution-coordinator will: a direct,
- * immutable insert once per real execution. That is what proves the
- * idempotency protection actually works, independent of whoever ends up
- * calling it.
+ * A real matching engine now exists (see trading/matching,
+ * trading/execution) and automatically fills these crossing orders as a
+ * side effect of placing them — see matching-execution.integration-spec.ts
+ * for tests of that real behavior. The manual prisma.fill.create() calls
+ * here are deliberately independent of it: they exercise the Fill model's
+ * own DB-level invariants directly (idempotency-key uniqueness, the
+ * buy/sell-distinct CHECK), under a different idempotencyKey than
+ * whatever the real matcher already produced for the same orders, so the
+ * two coexist without interfering.
  */
 describe("Fills and positions (real Postgres)", () => {
   it("records a fill referencing the buy/sell orders and both parties", async () => {
@@ -40,11 +43,13 @@ describe("Fills and positions (real Postgres)", () => {
         outcomeId: yes.id,
         buyOrderId: buyOrder.id,
         sellOrderId: sellOrder.id,
+        makerOrderId: buyOrder.id,
+        takerOrderId: sellOrder.id,
         buyerUserId: buyer.id,
         sellerUserId: seller.id,
         price: "0.5",
         quantity: "10",
-        idempotencyKey: `fill:${buyOrder.id}:${sellOrder.id}:1`,
+        idempotencyKey: `fill:${buyOrder.id}:${sellOrder.id}:manual-test-1`,
       },
     });
 
@@ -69,12 +74,14 @@ describe("Fills and positions (real Postgres)", () => {
       marketId: market.id, outcomeId: yes.id, side: "SELL", type: "LIMIT", quantity: "10", price: "0.5",
     } as never);
 
-    const idempotencyKey = `fill:${buyOrder.id}:${sellOrder.id}:1`;
+    const idempotencyKey = `fill:${buyOrder.id}:${sellOrder.id}:manual-test-2`;
     const fillData = {
       marketId: market.id,
       outcomeId: yes.id,
       buyOrderId: buyOrder.id,
       sellOrderId: sellOrder.id,
+      makerOrderId: buyOrder.id,
+      takerOrderId: sellOrder.id,
       buyerUserId: buyer.id,
       sellerUserId: seller.id,
       price: "0.5",
@@ -107,6 +114,8 @@ describe("Fills and positions (real Postgres)", () => {
           outcomeId: yes.id,
           buyOrderId: order.id,
           sellOrderId: order.id,
+          makerOrderId: order.id,
+          takerOrderId: order.id,
           buyerUserId: trader.id,
           sellerUserId: trader.id,
           price: "0.5",

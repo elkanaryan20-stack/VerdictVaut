@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
+import { StaleSnapshotConflictError } from "./idempotent-create.util";
 import { PrismaService } from "./prisma.service";
 
 const SERIALIZATION_FAILURE_SQLSTATE = "40001";
@@ -8,6 +9,13 @@ const BASE_BACKOFF_MS = 10;
 const MAX_BACKOFF_MS = 250;
 
 function isSerializationFailure(error: unknown): boolean {
+  // A stale-snapshot conflict inside createIdempotent (see its docblock)
+  // is not a Postgres-reported serialization failure, but it demands the
+  // exact same remedy — retry the whole transaction with a fresh
+  // snapshot — so it is treated as one here.
+  if (error instanceof StaleSnapshotConflictError) {
+    return true;
+  }
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
     // Prisma surfaces the underlying Postgres SQLSTATE on `.meta.code` for
     // errors it doesn't have a dedicated P-code for (P2034 covers some

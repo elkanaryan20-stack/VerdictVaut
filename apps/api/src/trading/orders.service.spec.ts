@@ -3,11 +3,13 @@ import { Prisma } from "@prisma/client";
 import { ReservationService } from "../ledger/reservation.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { SerializableTransactionRunner } from "../prisma/serializable-transaction-runner";
+import { ExecutionCoordinator } from "./execution/execution-coordinator.service";
 import { FeeCalculator } from "./fees/fee-calculator.interface";
 import { CreateOrderDto } from "./dto/create-order.dto";
 import { OrdersService } from "./orders.service";
 import { PositionReservationService } from "./positions/position-reservation.service";
 import { OrderRiskValidator } from "./risk/order-risk-validator.service";
+import { MatchingAttemptFailedException } from "./trading.errors";
 
 function makeIdempotencyConflict() {
   return new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
@@ -26,12 +28,15 @@ describe("OrdersService", () => {
     marketOutcome: { findUnique: jest.Mock };
     asset: { findFirstOrThrow: jest.Mock };
     order: { create: jest.Mock; findUnique: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
+    fill: { findMany: jest.Mock };
+    fundReservation: { findFirst: jest.Mock };
   };
   let reservations: { reserve: jest.Mock; release: jest.Mock; findActiveByReference: jest.Mock };
   let positionReservations: { reserve: jest.Mock; release: jest.Mock; findActiveByReference: jest.Mock };
   let riskValidator: { validate: jest.Mock };
   let feeCalculator: { estimateBuyReserveFee: jest.Mock };
   let txRunner: { run: jest.Mock };
+  let executionCoordinator: { matchAndExecute: jest.Mock };
 
   const market = { id: "market-1", status: "OPEN", closeTime: null };
   const outcome = { id: "outcome-1", marketId: "market-1" };
@@ -47,8 +52,13 @@ describe("OrdersService", () => {
         create: jest.fn().mockImplementation(async ({ data }) => ({ id: "order-1", ...data })),
         findUnique: jest.fn(),
         updateMany: jest.fn(),
-        findUniqueOrThrow: jest.fn(),
+        findUniqueOrThrow: jest.fn().mockImplementation(async ({ where }: { where: { id?: string } }) => ({
+          id: where?.id ?? "order-1",
+          status: "OPEN",
+        })),
       },
+      fill: { findMany: jest.fn().mockResolvedValue([]) },
+      fundReservation: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     reservations = {
       reserve: jest.fn().mockResolvedValue({ reservationId: "res-1", alreadyReserved: false }),
@@ -63,6 +73,7 @@ describe("OrdersService", () => {
     riskValidator = { validate: jest.fn().mockResolvedValue(undefined) };
     feeCalculator = { estimateBuyReserveFee: jest.fn().mockReturnValue(new Prisma.Decimal(0)) };
     txRunner = { run: jest.fn((fn: (tx: unknown) => unknown) => fn(prisma)) };
+    executionCoordinator = { matchAndExecute: jest.fn().mockResolvedValue([]) };
 
     service = new OrdersService(
       prisma as unknown as PrismaService,
@@ -71,6 +82,7 @@ describe("OrdersService", () => {
       riskValidator as unknown as OrderRiskValidator,
       feeCalculator as unknown as FeeCalculator,
       txRunner as unknown as SerializableTransactionRunner,
+      executionCoordinator as unknown as ExecutionCoordinator,
     );
   });
 
@@ -186,7 +198,7 @@ describe("OrdersService", () => {
   it("is idempotent: a duplicate clientOrderId returns the existing order without re-reserving", async () => {
     const clientOrderId = "retry-key-1";
     prisma.order.create.mockRejectedValueOnce(makeIdempotencyConflict());
-    prisma.order.findUniqueOrThrow.mockResolvedValueOnce({
+    prisma.order.findUniqueOrThrow.mockResolvedValue({
       id: "existing-order-1",
       userId: "user-1",
       status: "OPEN",
@@ -198,6 +210,75 @@ describe("OrdersService", () => {
     expect(result.id).toBe("existing-order-1");
     expect(reservations.reserve).not.toHaveBeenCalled();
     expect(riskValidator.validate).toHaveBeenCalledTimes(1); // attempted once, inside the failed create path
+    expect(executionCoordinator.matchAndExecute).toHaveBeenCalledWith("existing-order-1");
+  });
+
+  it("attempts to match the order against the resting book after funding", async () => {
+    await service.create("user-1", buy());
+    expect(executionCoordinator.matchAndExecute).toHaveBeenCalledWith("order-1");
+  });
+
+  describe("post-funding matching failure", () => {
+    it("throws a distinct MatchingAttemptFailedException — never a silent success — when the matching attempt fails", async () => {
+      executionCoordinator.matchAndExecute.mockRejectedValue(new Error("boom"));
+      await expect(service.create("user-1", buy())).rejects.toThrow(MatchingAttemptFailedException);
+    });
+
+    it("carries the created order's id on the thrown exception, since the order legitimately exists and is correctly funded", async () => {
+      executionCoordinator.matchAndExecute.mockRejectedValue(new Error("boom"));
+      await expect(service.create("user-1", buy())).rejects.toMatchObject({ orderId: "order-1" });
+    });
+
+    it("does not roll back or skip funding just because the downstream matching attempt is about to fail", async () => {
+      executionCoordinator.matchAndExecute.mockRejectedValue(new Error("boom"));
+      await expect(service.create("user-1", buy())).rejects.toThrow(MatchingAttemptFailedException);
+      // The funding transaction (order creation + reservation) already
+      // committed before matchAndExecute was ever called — a failure there
+      // must never be allowed to look like the order was never placed.
+      expect(prisma.order.create).toHaveBeenCalledTimes(1);
+      expect(reservations.reserve).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("retryMatching", () => {
+    const restingOrder = (status: string) => ({
+      id: "order-1",
+      userId: "user-1",
+      status,
+      side: "BUY",
+      quantity: "10",
+      filledQuantity: "0",
+      remainingQuantity: "10",
+    });
+
+    it("re-attempts matching for a still-OPEN order and returns the resulting placement summary", async () => {
+      prisma.order.findUnique.mockResolvedValue(restingOrder("OPEN"));
+
+      await service.retryMatching("user-1", "order-1");
+
+      expect(executionCoordinator.matchAndExecute).toHaveBeenCalledWith("order-1");
+    });
+
+    it("is a safe no-op for a terminal order — never re-attempts matching on a FILLED/CANCELLED order", async () => {
+      prisma.order.findUnique.mockResolvedValue(restingOrder("FILLED"));
+
+      await service.retryMatching("user-1", "order-1");
+
+      expect(executionCoordinator.matchAndExecute).not.toHaveBeenCalled();
+    });
+
+    it("rejects retrying someone else's order", async () => {
+      prisma.order.findUnique.mockResolvedValue({ id: "order-1", userId: "owner", status: "OPEN", side: "BUY" });
+      await expect(service.retryMatching("someone-else", "order-1")).rejects.toThrow(ForbiddenException);
+      expect(executionCoordinator.matchAndExecute).not.toHaveBeenCalled();
+    });
+
+    it("propagates a distinct MatchingAttemptFailedException when the retried matching attempt fails again", async () => {
+      prisma.order.findUnique.mockResolvedValue({ id: "order-1", userId: "user-1", status: "OPEN", side: "BUY" });
+      executionCoordinator.matchAndExecute.mockRejectedValue(new Error("still broken"));
+
+      await expect(service.retryMatching("user-1", "order-1")).rejects.toThrow(MatchingAttemptFailedException);
+    });
   });
 
   it("cancel() rejects someone else's order", async () => {

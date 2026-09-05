@@ -97,6 +97,47 @@ export class ReservationService {
     return { captured: result.released };
   }
 
+  /**
+   * Applies a partial (or full) execution against a still-ACTIVE
+   * reservation, WITHOUT changing its status — the reservation stays
+   * ACTIVE, earmarking whatever remains for the rest of the order. Callers
+   * (the ExecutionCoordinator) are responsible for ensuring this is invoked
+   * at most once per fill: it is not itself idempotency-keyed, and relying
+   * on an external once-only gate (the Fill row's unique idempotencyKey,
+   * created in the same transaction before this is called) is the same
+   * pattern already used throughout this codebase for gating a ledger
+   * write behind a status-transition guard.
+   */
+  async consume(tx: Prisma.TransactionClient, reservationId: string, amount: Prisma.Decimal.Value): Promise<void> {
+    const amt = new Prisma.Decimal(amount);
+    if (amt.lessThanOrEqualTo(0)) {
+      throw new InvalidReservationAmountError(amt.toString());
+    }
+
+    const reservation = await tx.fundReservation.findUniqueOrThrow({ where: { id: reservationId } });
+    if (reservation.status !== "ACTIVE") {
+      throw new Error(`Cannot consume FundReservation ${reservationId}: status is ${reservation.status}, not ACTIVE`);
+    }
+
+    const unconsumed = reservation.amount.minus(reservation.consumedAmount);
+    if (amt.greaterThan(unconsumed)) {
+      throw new Error(
+        `Cannot consume ${amt.toString()} from FundReservation ${reservationId}: only ${unconsumed.toString()} unconsumed`,
+      );
+    }
+
+    await tx.fundReservation.update({
+      where: { id: reservationId },
+      data: { consumedAmount: reservation.consumedAmount.plus(amt) },
+    });
+
+    const account = await tx.ledgerAccount.findUniqueOrThrow({ where: { id: reservation.accountId } });
+    await tx.ledgerAccount.update({
+      where: { id: account.id },
+      data: { reservedBalance: account.reservedBalance.minus(amt) },
+    });
+  }
+
   private async transition(
     tx: Prisma.TransactionClient,
     reservationId: string,
@@ -115,9 +156,14 @@ export class ReservationService {
     const reservation = await tx.fundReservation.findUniqueOrThrow({ where: { id: reservationId } });
     const account = await tx.ledgerAccount.findUniqueOrThrow({ where: { id: reservation.accountId } });
 
+    // Only the still-earmarked (never-consumed) remainder is released back
+    // to available balance — the already-consumed portion left reservedBalance
+    // permanently as part of the fill's own accounting (see consume()) and
+    // must never be subtracted a second time here.
+    const unconsumed = reservation.amount.minus(reservation.consumedAmount);
     await tx.ledgerAccount.update({
       where: { id: account.id },
-      data: { reservedBalance: account.reservedBalance.minus(reservation.amount) },
+      data: { reservedBalance: account.reservedBalance.minus(unconsumed) },
     });
 
     return { released: true };

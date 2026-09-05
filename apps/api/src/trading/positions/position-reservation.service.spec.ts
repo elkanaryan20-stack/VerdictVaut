@@ -16,7 +16,13 @@ describe("PositionReservationService", () => {
   let tx: {
     $executeRawUnsafe: jest.Mock;
     position: { upsert: jest.Mock; update: jest.Mock; findUniqueOrThrow: jest.Mock };
-    positionReservation: { create: jest.Mock; findUniqueOrThrow: jest.Mock; updateMany: jest.Mock; findFirst: jest.Mock };
+    positionReservation: {
+      create: jest.Mock;
+      update: jest.Mock;
+      findUniqueOrThrow: jest.Mock;
+      updateMany: jest.Mock;
+      findFirst: jest.Mock;
+    };
   };
 
   const position = (quantity: string, reserved: string) => ({
@@ -35,6 +41,7 @@ describe("PositionReservationService", () => {
       },
       positionReservation: {
         create: jest.fn().mockImplementation(async ({ data }) => ({ id: "pres-1", ...data, status: "ACTIVE" })),
+        update: jest.fn().mockResolvedValue({}),
         findUniqueOrThrow: jest.fn(),
         updateMany: jest.fn(),
         findFirst: jest.fn(),
@@ -121,6 +128,7 @@ describe("PositionReservationService", () => {
         id: "pres-1",
         positionId: "position-1",
         amount: new Prisma.Decimal("40"),
+        consumedAmount: new Prisma.Decimal("0"),
       });
       tx.position.findUniqueOrThrow.mockResolvedValueOnce(position("100", "40"));
 
@@ -143,6 +151,67 @@ describe("PositionReservationService", () => {
       const result = await service.capture(tx as never, "pres-1");
       expect(result.captured).toBe(false);
       expect(tx.position.update).not.toHaveBeenCalled();
+    });
+
+    it("after a partial consume, only releases the still-unconsumed remainder", async () => {
+      tx.positionReservation.updateMany.mockResolvedValueOnce({ count: 1 });
+      tx.positionReservation.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "pres-1",
+        positionId: "position-1",
+        amount: new Prisma.Decimal("40"),
+        consumedAmount: new Prisma.Decimal("15"),
+      });
+      tx.position.findUniqueOrThrow.mockResolvedValueOnce(position("100", "25"));
+
+      await service.release(tx as never, "pres-1");
+
+      const newReserved = tx.position.update.mock.calls[0][0].data.reservedQuantity as Prisma.Decimal;
+      expect(newReserved.toString()).toBe("0");
+    });
+  });
+
+  describe("consume", () => {
+    it("applies a partial execution without changing the reservation's status", async () => {
+      tx.positionReservation.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "pres-1",
+        positionId: "position-1",
+        status: "ACTIVE",
+        amount: new Prisma.Decimal("40"),
+        consumedAmount: new Prisma.Decimal("0"),
+      });
+      tx.position.findUniqueOrThrow.mockResolvedValueOnce(position("100", "40"));
+
+      await service.consume(tx as never, "pres-1", "15");
+
+      const newConsumed = tx.positionReservation.update.mock.calls[0][0].data.consumedAmount as Prisma.Decimal;
+      expect(newConsumed.toString()).toBe("15");
+      const newReserved = tx.position.update.mock.calls[0][0].data.reservedQuantity as Prisma.Decimal;
+      expect(newReserved.toString()).toBe("25");
+    });
+
+    it("rejects consuming more than what remains unconsumed", async () => {
+      tx.positionReservation.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "pres-1",
+        positionId: "position-1",
+        status: "ACTIVE",
+        amount: new Prisma.Decimal("40"),
+        consumedAmount: new Prisma.Decimal("30"),
+      });
+
+      await expect(service.consume(tx as never, "pres-1", "15")).rejects.toThrow(/only 10 unconsumed/);
+      expect(tx.positionReservation.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects consuming from a reservation that is not ACTIVE", async () => {
+      tx.positionReservation.findUniqueOrThrow.mockResolvedValueOnce({
+        id: "pres-1",
+        positionId: "position-1",
+        status: "RELEASED",
+        amount: new Prisma.Decimal("40"),
+        consumedAmount: new Prisma.Decimal("0"),
+      });
+
+      await expect(service.consume(tx as never, "pres-1", "15")).rejects.toThrow(/status is RELEASED/);
     });
   });
 });

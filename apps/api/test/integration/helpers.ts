@@ -12,7 +12,9 @@ import { ReservationService } from "../../src/ledger/reservation.service";
 import { MarketsService } from "../../src/markets/markets.service";
 import { PrismaService } from "../../src/prisma/prisma.service";
 import { SerializableTransactionRunner } from "../../src/prisma/serializable-transaction-runner";
+import { ExecutionCoordinator } from "../../src/trading/execution/execution-coordinator.service";
 import { ZeroFeeCalculator } from "../../src/trading/fees/zero-fee.calculator";
+import { PriceTimePriorityMatchingEngine } from "../../src/trading/matching/price-time-priority-matching-engine";
 import { OrderBookService } from "../../src/trading/order-book/order-book.service";
 import { OrdersService } from "../../src/trading/orders.service";
 import { PositionReservationService } from "../../src/trading/positions/position-reservation.service";
@@ -44,6 +46,17 @@ export const positionsService = new PositionsService(prisma);
 export const orderRiskValidator = new OrderRiskValidator(prisma);
 export const feeCalculator = new ZeroFeeCalculator();
 export const orderBookService = new OrderBookService(prisma);
+export const matchingEngine = new PriceTimePriorityMatchingEngine();
+export const executionCoordinator = new ExecutionCoordinator(
+  prisma,
+  txRunner,
+  orderBookService,
+  ledger,
+  reservations,
+  positionReservations,
+  matchingEngine,
+  feeCalculator,
+);
 export const ordersService = new OrdersService(
   prisma,
   reservations,
@@ -51,6 +64,7 @@ export const ordersService = new OrdersService(
   orderRiskValidator,
   feeCalculator,
   txRunner,
+  executionCoordinator,
 );
 
 let userCounter = 0;

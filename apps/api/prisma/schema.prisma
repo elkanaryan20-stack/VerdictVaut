@@ -299,6 +299,15 @@ model Order {
   // never defeated by NULLs not colliding under Postgres's default
   // unique-index semantics.
   clientOrderId     String
+  // Monotonic, gap-tolerant, server-assigned tie-breaker for price-time
+  // priority. createdAt is a millisecond timestamp — two orders placed in
+  // the same millisecond (routine under concurrent submission) would be
+  // ordered ambiguously by it, and the id (a UUID) is intentionally
+  // non-sequential and must never be used as an ordering signal. sequence
+  // is a DB-generated bigserial: strictly increasing, assigned atomically
+  // at insert time, safe as the deterministic same-price FIFO tie-breaker
+  // the matching engine relies on.
+  sequence          BigInt      @unique @default(autoincrement())
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
 
@@ -307,10 +316,14 @@ model Order {
   outcome   MarketOutcome @relation(fields: [outcomeId], references: [id])
   buyFills  Fill[]        @relation("BuyOrder")
   sellFills Fill[]        @relation("SellOrder")
+  makerFills Fill[]       @relation("MakerOrder")
+  takerFills Fill[]       @relation("TakerOrder")
 
   @@unique([userId, clientOrderId])
-  // Primary order-book / price-time-priority lookup path.
-  @@index([marketId, outcomeId, side, status, price, createdAt])
+  // Primary order-book / price-time-priority lookup path: resting
+  // candidates for a given market+outcome+side+status, ordered by price
+  // then by the deterministic sequence tie-breaker.
+  @@index([marketId, outcomeId, side, status, price, sequence])
   @@index([marketId, outcomeId, status])
   @@index([userId])
   @@map("orders")
@@ -322,26 +335,41 @@ model Fill {
   outcomeId      String
   buyOrderId     String
   sellOrderId    String
+  // MAKER = the resting order that was already on the book (its price is
+  // always the execution price). TAKER = the incoming order that crossed
+  // it. Always one of makerOrderId/takerOrderId equals buyOrderId and the
+  // other equals sellOrderId — enforced by fills_maker_taker_check — but
+  // buy/sell (economic direction) and maker/taker (who was resting vs.
+  // incoming) are independent axes and both are kept explicit rather than
+  // derived, since either one could be the maker.
+  makerOrderId   String
+  takerOrderId   String
   buyerUserId    String
   sellerUserId   String
   price          Decimal  @db.Decimal(18, 6)
   quantity       Decimal  @db.Decimal(36, 18)
   fee            Decimal  @default(0) @db.Decimal(36, 18)
-  // Set by the (future) matcher once per execution — guards against the
-  // same match being applied twice, the same primitive used for
-  // LedgerTransaction/FundReservation in the ledger. Fills are append-only:
-  // no service method updates an existing Fill row.
+  // Deterministic, derived from the (makerOrderId, takerOrderId) execution
+  // identity by the matching/execution layer — guards against the same
+  // match being applied twice (retry, concurrent re-derivation of the same
+  // instruction), the same primitive used for LedgerTransaction/
+  // FundReservation in the ledger. Fills are append-only: no service
+  // method updates an existing Fill row.
   idempotencyKey String   @unique
   executedAt     DateTime @default(now())
 
   buyOrder  Order @relation("BuyOrder", fields: [buyOrderId], references: [id])
   sellOrder Order @relation("SellOrder", fields: [sellOrderId], references: [id])
+  makerOrder Order @relation("MakerOrder", fields: [makerOrderId], references: [id])
+  takerOrder Order @relation("TakerOrder", fields: [takerOrderId], references: [id])
   buyer     User  @relation("FillBuyer", fields: [buyerUserId], references: [id])
   seller    User  @relation("FillSeller", fields: [sellerUserId], references: [id])
 
   @@index([marketId, outcomeId])
   @@index([buyOrderId])
   @@index([sellOrderId])
+  @@index([makerOrderId])
+  @@index([takerOrderId])
   @@map("fills")
 }
 
@@ -379,6 +407,13 @@ model PositionReservation {
   id             String            @id @default(uuid())
   positionId     String
   amount         Decimal           @db.Decimal(36, 18)
+  // Portion of `amount` already applied against a real execution (a SELL
+  // fill). A partial fill consumes only the executed quantity, leaving the
+  // remainder ACTIVE and earmarked for the rest of the order — release()
+  // and capture() must net against this, never against the full original
+  // `amount`, or a partially-consumed reservation would be double-counted
+  // on release. 0 <= consumedAmount <= amount, enforced by a DB CHECK.
+  consumedAmount Decimal           @default(0) @db.Decimal(36, 18)
   status         ReservationStatus @default(ACTIVE)
   referenceType  String
   referenceId    String
@@ -491,6 +526,13 @@ model FundReservation {
   id             String            @id @default(uuid())
   accountId      String
   amount         Decimal           @db.Decimal(36, 18)
+  // Portion of `amount` already applied against a real execution (a BUY
+  // fill, at the fill's execution price — which may be better than the
+  // order's limit price, so this can be less than the naive
+  // quantity*limitPrice share). release()/capture() must net against this,
+  // never against the full original `amount`. 0 <= consumedAmount <=
+  // amount, enforced by a DB CHECK.
+  consumedAmount Decimal           @default(0) @db.Decimal(36, 18)
   status         ReservationStatus @default(ACTIVE)
   referenceType  String
   referenceId    String

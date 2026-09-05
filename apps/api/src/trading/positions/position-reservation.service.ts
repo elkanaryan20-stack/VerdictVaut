@@ -97,6 +97,42 @@ export class PositionReservationService {
     return { captured: result.released };
   }
 
+  /**
+   * Applies a partial (or full) execution against a still-ACTIVE
+   * reservation, WITHOUT changing its status — see ReservationService.consume,
+   * whose contract and reliance on an external once-only gate (the Fill
+   * row's idempotencyKey) this mirrors exactly.
+   */
+  async consume(tx: Prisma.TransactionClient, reservationId: string, amount: Prisma.Decimal.Value): Promise<void> {
+    const amt = new Prisma.Decimal(amount);
+    if (amt.lessThanOrEqualTo(0)) {
+      throw new Error(`Position reservation consume amount must be positive, got ${amt.toString()}`);
+    }
+
+    const reservation = await tx.positionReservation.findUniqueOrThrow({ where: { id: reservationId } });
+    if (reservation.status !== "ACTIVE") {
+      throw new Error(`Cannot consume PositionReservation ${reservationId}: status is ${reservation.status}, not ACTIVE`);
+    }
+
+    const unconsumed = reservation.amount.minus(reservation.consumedAmount);
+    if (amt.greaterThan(unconsumed)) {
+      throw new Error(
+        `Cannot consume ${amt.toString()} from PositionReservation ${reservationId}: only ${unconsumed.toString()} unconsumed`,
+      );
+    }
+
+    await tx.positionReservation.update({
+      where: { id: reservationId },
+      data: { consumedAmount: reservation.consumedAmount.plus(amt) },
+    });
+
+    const position = await tx.position.findUniqueOrThrow({ where: { id: reservation.positionId } });
+    await tx.position.update({
+      where: { id: position.id },
+      data: { reservedQuantity: position.reservedQuantity.minus(amt) },
+    });
+  }
+
   private async transition(
     tx: Prisma.TransactionClient,
     reservationId: string,
@@ -115,9 +151,13 @@ export class PositionReservationService {
     const reservation = await tx.positionReservation.findUniqueOrThrow({ where: { id: reservationId } });
     const position = await tx.position.findUniqueOrThrow({ where: { id: reservation.positionId } });
 
+    // Only the still-earmarked (never-consumed) remainder is released —
+    // the consumed portion already left reservedQuantity permanently as
+    // part of the fill's own accounting (see consume()).
+    const unconsumed = reservation.amount.minus(reservation.consumedAmount);
     await tx.position.update({
       where: { id: position.id },
-      data: { reservedQuantity: position.reservedQuantity.minus(reservation.amount) },
+      data: { reservedQuantity: position.reservedQuantity.minus(unconsumed) },
     });
 
     return { released: true };

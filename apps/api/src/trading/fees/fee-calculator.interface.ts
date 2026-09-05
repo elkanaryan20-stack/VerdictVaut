@@ -7,6 +7,19 @@ export interface FeeContext {
   quantity: Prisma.Decimal;
 }
 
+export interface FillFeeContext extends FeeContext {
+  /** Execution price/quantity of this specific fill — may differ from a resting order's own limit price (price improvement). */
+  makerUserId: string;
+  takerUserId: string;
+}
+
+export interface FillFeeResult {
+  /** Fee charged to the buyer, in the settlement asset. Zero means no fee leg is posted for this side. */
+  buyerFee: Prisma.Decimal;
+  /** Fee charged to the seller, in the settlement asset. Zero means no fee leg is posted for this side. */
+  sellerFee: Prisma.Decimal;
+}
+
 /**
  * The one seam for every fee the platform ever charges — maker, taker,
  * market-specific, or platform-wide. Nothing in the order lifecycle
@@ -24,6 +37,15 @@ export interface FeeCalculator {
    * the higher of the two if they ever differ.
    */
   estimateBuyReserveFee(context: FeeContext): Prisma.Decimal;
+
+  /**
+   * The actual fee(s) to charge for one real execution, computed by the
+   * ExecutionCoordinator at fill time and posted through LedgerService as
+   * explicit FEE-type postings to FEE_REVENUE. The matching engine never
+   * calls this and never knows fees exist — fees are entirely a
+   * settlement-time concern layered on top of a fee-agnostic match.
+   */
+  calculateFillFee(context: FillFeeContext): FillFeeResult;
 }
 
 // TypeScript interfaces don't exist at runtime, so NestJS DI needs an
