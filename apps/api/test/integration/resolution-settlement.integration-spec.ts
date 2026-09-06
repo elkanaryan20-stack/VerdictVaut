@@ -1,6 +1,6 @@
 import { BadRequestException, ConflictException, ForbiddenException } from "@nestjs/common";
 import {
-  createTestAdmin,
+  createTestSuperAdmin,
   createTestMarket,
   createTestUser,
   fundUserForTest,
@@ -15,7 +15,7 @@ import {
 } from "./helpers";
 
 async function setupClosedMarket(overrides: { closeTime?: string } = {}) {
-  const admin = await createTestAdmin();
+  const admin = await createTestSuperAdmin();
   const { market, yes, no } = await createTestMarket(admin.id, overrides);
   await openMarketForTest(market.id, admin.id);
   await marketsService.close(market.id, admin.id);
@@ -86,7 +86,7 @@ describe("Market resolution & settlement (real Postgres)", () => {
     });
 
     it("rejects resolving a market that was never closed (still OPEN)", async () => {
-      const admin = await createTestAdmin();
+      const admin = await createTestSuperAdmin();
       const { market, yes } = await createTestMarket(admin.id);
       await openMarketForTest(market.id, admin.id);
 

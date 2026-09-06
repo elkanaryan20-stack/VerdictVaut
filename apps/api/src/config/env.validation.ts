@@ -38,6 +38,13 @@ class EnvironmentVariables {
   @IsString()
   @IsOptional()
   CORS_ALLOWED_ORIGINS: string = "";
+
+  @IsOptional()
+  CHAIN_WATCHER_ENABLED: string = "false";
+
+  @IsInt()
+  @IsOptional()
+  CHAIN_WATCHER_POLL_INTERVAL_MS: number = 30000;
 }
 
 export function validateEnv(config: Record<string, unknown>) {

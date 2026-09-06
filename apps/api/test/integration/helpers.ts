@@ -24,10 +24,14 @@ import { ResolutionService } from "../../src/markets/resolution/resolution.servi
 import { SettlementService } from "../../src/settlement/settlement.service";
 import { DepositAddressService } from "../../src/wallet/addresses/deposit-address.service";
 import { DepositsService } from "../../src/wallet/deposits/deposits.service";
+import { ConfirmationPolicyService } from "../../src/wallet/confirmation/confirmation-policy.service";
 import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
 import { ProductionCustodyExecutor } from "../../src/wallet/executors/production-custody.executor";
 import { WithdrawalExecutorFactory } from "../../src/wallet/executors/withdrawal-executor.factory";
 import { WithdrawalsService } from "../../src/wallet/withdrawals/withdrawals.service";
+import { ReconciliationService } from "../../src/wallet/reconciliation/reconciliation.service";
+import { DepositReprocessingService } from "../../src/wallet/watchers/deposit-reprocessing.service";
+import { DepositWatcherService } from "../../src/wallet/watchers/deposit-watcher.service";
 
 export const prisma = new PrismaService();
 export const txRunner = new SerializableTransactionRunner(prisma);
@@ -36,6 +40,17 @@ export const reservations = new ReservationService(prisma);
 export const auditLog = new AuditLogService(prisma);
 export const depositsService = new DepositsService(prisma, ledger, txRunner, auditLog);
 export const depositAddressService = new DepositAddressService(prisma, txRunner);
+export const confirmationPolicyService = new ConfirmationPolicyService(prisma);
+
+// DepositWatcherService, DepositReprocessingService, and
+// ReconciliationService all depend on a chain-adapter/custody-provider
+// factory that makes real network calls — deliberately NOT wired up
+// here. Tests that need them construct the service directly with a
+// fake factory (implementing the same narrow interface) so real DB
+// behavior (cursors, crediting, reconciliation discrepancies) is
+// exercised against real Postgres without any real network I/O — see
+// deposit-watcher-and-reconciliation.integration-spec.ts.
+export { DepositWatcherService, DepositReprocessingService, ReconciliationService };
 
 const manualBroadcastExecutor = new ManualBroadcastExecutor();
 const productionCustodyExecutor = new ProductionCustodyExecutor();
@@ -90,6 +105,10 @@ export async function createTestUser(
 
 export async function createTestAdmin() {
   return createTestUser("ACTIVE", "ADMIN");
+}
+
+export async function createTestSuperAdmin() {
+  return createTestUser("ACTIVE", "SUPER_ADMIN");
 }
 
 export async function getAsset(symbol: string) {

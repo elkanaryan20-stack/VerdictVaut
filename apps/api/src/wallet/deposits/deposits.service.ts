@@ -1,5 +1,5 @@
-import { Injectable, Logger } from "@nestjs/common";
-import { DepositStatus, Prisma } from "@prisma/client";
+import { Injectable, Logger, NotFoundException } from "@nestjs/common";
+import { Deposit, DepositStatus, Prisma } from "@prisma/client";
 import { AuditLogService } from "../../audit/audit-log.service";
 import { LedgerService } from "../../ledger/ledger.service";
 import { PrismaService } from "../../prisma/prisma.service";
@@ -21,20 +21,22 @@ export interface ObservedTransactionInput {
   amount: string;
   confirmations: number;
   requiredConfirmations: number;
+  /**
+   * Destination tag/memo the chain actually reported on this transaction
+   * (XRP and similar tag-addressed chains) — omitted, never fabricated,
+   * when the chain didn't carry one. Always persisted verbatim (see
+   * Deposit.destinationTag) regardless of whether it turns out valid.
+   */
+  destinationTag?: string;
   rawProviderPayload?: Record<string, unknown>;
 }
 
 /**
  * This is the crediting path a real chain watcher/reconciliation job
- * calls once it has observed an actual transaction on-chain — it is
- * never invoked from a user- or frontend-facing endpoint, because a
- * deposit must never be credited "because the frontend said so".
- *
- * No chain watcher is wired up yet (that requires a real RPC/provider
- * integration per network, deliberately left for the next phase), so
- * this method currently has no caller in the running app — it exists so
- * the crediting transaction boundary is defined, correct, and testable
- * ahead of that integration.
+ * calls once it has observed an actual transaction on-chain (see
+ * DepositWatcherService and DepositReprocessingService) — it is never
+ * invoked from a user- or frontend-facing endpoint, because a deposit
+ * must never be credited "because the frontend said so".
  *
  * Idempotency: `recordObservedTransaction` may be called any number of
  * times for the same (assetNetworkId, txHash, eventIndex) — duplicate
@@ -61,9 +63,32 @@ export class DepositsService {
   async recordObservedTransaction(input: ObservedTransactionInput) {
     const eventIndex = input.eventIndex ?? 0;
 
-    const { deposit, justCredited } = await this.txRunner.run(async (tx) => {
+    const { deposit, justCredited, justFailed } = await this.txRunner.run(async (tx) => {
       const isConfirmed = input.confirmations >= input.requiredConfirmations;
       const assetNetwork = await tx.assetNetwork.findUniqueOrThrow({ where: { id: input.assetNetworkId } });
+      const walletAddress = await tx.walletAddress.findUniqueOrThrow({ where: { id: input.walletAddressId } });
+
+      // XRP (and any other tag/memo-addressed chain): never credit a
+      // deposit to this address's owner on address match alone when a
+      // tag is configured as required — the observed tag must actually
+      // match the one this address was provisioned with.
+      const tagValid =
+        !assetNetwork.memoRequired || (input.destinationTag != null && input.destinationTag === walletAddress.destinationTag);
+      const failureReason = tagValid
+        ? null
+        : `Destination tag mismatch: observed ${input.destinationTag ?? "(none)"}, expected ${walletAddress.destinationTag ?? "(none)"}`;
+
+      const now = new Date();
+      // Captured before the upsert specifically so justFailed (below) can
+      // tell "this call is the one that first made it FAILED" apart from
+      // "it was already FAILED" — Prisma's upsert return value alone
+      // can't distinguish those for a row created directly as FAILED.
+      const previousStatus = (
+        await tx.deposit.findUnique({
+          where: { assetNetworkId_txHash_eventIndex: { assetNetworkId: input.assetNetworkId, txHash: input.txHash, eventIndex } },
+          select: { status: true },
+        })
+      )?.status;
 
       const upserted = await tx.deposit.upsert({
         where: {
@@ -83,33 +108,61 @@ export class DepositsService {
           amount: new Prisma.Decimal(input.amount),
           confirmations: input.confirmations,
           requiredConfirmations: input.requiredConfirmations,
-          status: isConfirmed ? DepositStatus.CONFIRMED : DepositStatus.PENDING,
+          status: !tagValid ? DepositStatus.FAILED : isConfirmed ? DepositStatus.CONFIRMED : DepositStatus.PENDING,
+          destinationTag: input.destinationTag ?? null,
+          failureReason,
           rawProviderPayload: input.rawProviderPayload as Prisma.InputJsonValue,
-          confirmedAt: isConfirmed ? new Date() : null,
+          confirmedAt: tagValid && isConfirmed ? now : null,
+          lastCheckedAt: now,
         },
         // Deliberately does not touch `status` here — a late-arriving or
         // duplicate watcher update must never regress a deposit that has
         // already reached CONFIRMED/CREDITED back to an earlier status.
+        // The guarded updateMany calls below are the only place a
+        // pre-existing row's status ever changes.
         update: {
           confirmations: input.confirmations,
           rawProviderPayload: input.rawProviderPayload as Prisma.InputJsonValue,
+          destinationTag: input.destinationTag ?? undefined,
+          lastCheckedAt: now,
         },
       });
 
-      if (isConfirmed && upserted.status === DepositStatus.PENDING) {
+      if (!tagValid) {
+        await tx.deposit.updateMany({
+          where: { id: upserted.id, status: { in: [DepositStatus.PENDING, DepositStatus.CONFIRMED] } },
+          data: { status: DepositStatus.FAILED, failureReason },
+        });
+      } else if (isConfirmed && upserted.status === DepositStatus.PENDING) {
         await tx.deposit.updateMany({
           where: { id: upserted.id, status: DepositStatus.PENDING },
-          data: { status: DepositStatus.CONFIRMED, confirmedAt: new Date() },
+          data: { status: DepositStatus.CONFIRMED, confirmedAt: now },
         });
       }
 
       let justCredited = false;
-      if (isConfirmed) {
+      if (isConfirmed && tagValid) {
         justCredited = await this.creditDeposit(tx, upserted.id, upserted.userId, upserted.amount, input.assetSymbol);
       }
 
-      return { deposit: await tx.deposit.findUniqueOrThrow({ where: { id: upserted.id } }), justCredited };
+      return {
+        deposit: await tx.deposit.findUniqueOrThrow({ where: { id: upserted.id } }),
+        justCredited,
+        justFailed: !tagValid && previousStatus !== DepositStatus.FAILED,
+      };
     });
+
+    if (justFailed) {
+      await this.auditLog.record({
+        actorType: "SYSTEM",
+        action: "deposit.tag_mismatch",
+        resourceType: "Deposit",
+        resourceId: deposit.id,
+        after: { status: deposit.status, failureReason: deposit.failureReason },
+        reason: deposit.failureReason ?? undefined,
+        idempotencyKey: `deposit:${deposit.id}:tag_mismatch`,
+      });
+    }
 
     if (justCredited) {
       await this.auditLog.record({
@@ -134,7 +187,7 @@ export class DepositsService {
     amount: Prisma.Decimal,
     assetSymbol: string,
   ): Promise<boolean> {
-    const { alreadyPosted } = await this.ledger.postTransaction(tx, {
+    const { transactionId, alreadyPosted } = await this.ledger.postTransaction(tx, {
       assetSymbol,
       type: "DEPOSIT",
       referenceType: "Deposit",
@@ -151,7 +204,7 @@ export class DepositsService {
     // attempt somehow didn't commit (e.g. a crash between the two).
     const statusUpdate = await tx.deposit.updateMany({
       where: { id: depositId, status: { not: DepositStatus.CREDITED } },
-      data: { status: DepositStatus.CREDITED, creditedAt: new Date() },
+      data: { status: DepositStatus.CREDITED, creditedAt: new Date(), ledgerTransactionId: transactionId },
     });
 
     if (alreadyPosted) {
@@ -163,14 +216,75 @@ export class DepositsService {
     return statusUpdate.count > 0;
   }
 
+  /**
+   * Marks a not-yet-credited deposit as chain-invalidated (a reorg
+   * dropped it, or a reprocess found it no longer exists on chain) — a
+   * terminal, economically-inert outcome distinct from FAILED. Never
+   * touches a CREDITED row: once real funds have moved, this is not the
+   * mechanism to undo that (see requirement #13 — an unsafe automatic
+   * reversal after credit is an explicit, documented blocker, not
+   * something this method silently attempts).
+   */
+  async rejectIfNotCredited(depositId: string, reason: string): Promise<{ deposit: Deposit; justRejected: boolean }> {
+    return this.txRunner.run(async (tx) => {
+      const result = await tx.deposit.updateMany({
+        where: { id: depositId, status: { in: [DepositStatus.PENDING, DepositStatus.CONFIRMED] } },
+        data: { status: DepositStatus.REJECTED, failureReason: reason, lastCheckedAt: new Date() },
+      });
+      const deposit = await tx.deposit.findUniqueOrThrow({ where: { id: depositId } });
+      return { deposit, justRejected: result.count > 0 };
+    });
+  }
+
+  async touchLastChecked(depositId: string): Promise<void> {
+    await this.prisma.deposit.update({ where: { id: depositId }, data: { lastCheckedAt: new Date(), retryCount: { increment: 1 } } });
+  }
+
   async listMine(userId: string) {
     return this.prisma.deposit.findMany({ where: { userId }, orderBy: { detectedAt: "desc" } });
+  }
+
+  async getOwned(userId: string, depositId: string) {
+    const deposit = await this.prisma.deposit.findUnique({
+      where: { id: depositId },
+      include: { assetNetwork: { include: { asset: true, network: true } } },
+    });
+    if (!deposit || deposit.userId !== userId) {
+      throw new NotFoundException("Deposit not found");
+    }
+    return deposit;
+  }
+
+  async getById(depositId: string) {
+    const deposit = await this.prisma.deposit.findUnique({
+      where: { id: depositId },
+      include: {
+        user: { select: { id: true, email: true } },
+        assetNetwork: { include: { asset: true, network: true } },
+        walletAddress: true,
+      },
+    });
+    if (!deposit) {
+      throw new NotFoundException("Deposit not found");
+    }
+    return deposit;
   }
 
   async listAll() {
     return this.prisma.deposit.findMany({
       orderBy: { detectedAt: "desc" },
       include: { user: { select: { id: true, email: true } }, assetNetwork: { include: { asset: true, network: true } } },
+    });
+  }
+
+  /** Deposits that have sat unresolved for a while — the "discoverable" half of requirement #20 (observability). */
+  async listStale(olderThanMs: number) {
+    return this.prisma.deposit.findMany({
+      where: {
+        status: { in: [DepositStatus.PENDING, DepositStatus.CONFIRMED, DepositStatus.FAILED] },
+        OR: [{ lastCheckedAt: { lt: new Date(Date.now() - olderThanMs) } }, { lastCheckedAt: null }],
+      },
+      orderBy: { detectedAt: "asc" },
     });
   }
 }

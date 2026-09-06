@@ -11,6 +11,13 @@ export interface AppConfig {
   };
   devFundingToolsEnabled: boolean;
   corsAllowedOrigins: string[];
+  chainWatcher: {
+    // Off by default: unit/integration tests, and any environment that
+    // hasn't deliberately opted in, must never make outbound network
+    // calls to a real chain provider just from importing this module.
+    enabled: boolean;
+    pollIntervalMs: number;
+  };
 }
 
 export default (): AppConfig => ({
@@ -34,4 +41,8 @@ export default (): AppConfig => ({
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean),
+  chainWatcher: {
+    enabled: process.env.CHAIN_WATCHER_ENABLED === "true",
+    pollIntervalMs: parseInt(process.env.CHAIN_WATCHER_POLL_INTERVAL_MS ?? "30000", 10),
+  },
 });

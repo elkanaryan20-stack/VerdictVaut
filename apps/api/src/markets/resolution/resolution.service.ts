@@ -187,8 +187,12 @@ export class ResolutionService {
     if (!user) {
       throw new ForbiddenException("Unknown user");
     }
-    if (user.role !== UserRole.ADMIN && user.role !== UserRole.SUPER_ADMIN) {
-      throw new ForbiddenException("Only an ADMIN or SUPER_ADMIN may resolve or settle a market");
+    // Market resolution moves real settlement money — reserved to the
+    // single platform SUPER_ADMIN authority, not every ADMIN (see the
+    // platform-control-model note: deny-by-default for financial/admin
+    // operations, no "admin can do everything" guard).
+    if (user.role !== UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException("Only a SUPER_ADMIN may resolve or settle a market");
     }
   }
 }

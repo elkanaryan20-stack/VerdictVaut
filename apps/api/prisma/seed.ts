@@ -50,8 +50,21 @@ async function main() {
     { assetSymbol: "ETH", networkCode: "ethereum-sepolia", isNative: true, minConfirmations: 12 },
     { assetSymbol: "SOL", networkCode: "solana-devnet", isNative: true, minConfirmations: 32 },
     { assetSymbol: "XRP", networkCode: "xrpl-testnet", isNative: true, memoRequired: true, minConfirmations: 1 },
-    { assetSymbol: "USDC", networkCode: "ethereum-sepolia", isNative: false, minConfirmations: 12 },
-    { assetSymbol: "USDC", networkCode: "base-sepolia", isNative: false, minConfirmations: 12 },
+    // Circle's own published testnet USDC deployments — confirmed live
+    // (deployed contract bytecode, matching Circle's standard
+    // upgradeable FiatTokenProxy) against the public RPC endpoints this
+    // app defaults to (see chain-adapters/rpc-config.service.ts) at the
+    // time this was written. USDC on Sepolia and USDC on Base Sepolia
+    // are deliberately different contract addresses on different
+    // networks — never assume one asset has one universal address.
+    { assetSymbol: "USDC", networkCode: "ethereum-sepolia", isNative: false, contractAddress: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", minConfirmations: 12 },
+    { assetSymbol: "USDC", networkCode: "base-sepolia", isNative: false, contractAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", minConfirmations: 12 },
+    // Tether does not publish an official Sepolia testnet deployment —
+    // contractAddress is deliberately left unset rather than inventing
+    // one. This asset/network pair stays configured but non-functional
+    // for deposits (EvmDepositAdapter.validateNetwork rejects a token
+    // AssetNetwork with no contractAddress) until a real address is
+    // available.
     { assetSymbol: "USDT", networkCode: "ethereum-sepolia", isNative: false, minConfirmations: 12 },
   ];
 

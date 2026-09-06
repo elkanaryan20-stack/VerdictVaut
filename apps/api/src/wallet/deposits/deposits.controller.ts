@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, Param, Post, UseGuards } from "@nestjs/common";
 import { IsString } from "class-validator";
 import { JwtAuthGuard } from "../../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../../common/decorators/current-user.decorator";
@@ -34,5 +34,13 @@ export class DepositsController {
   @Post("addresses")
   assignAddress(@CurrentUser() user: AuthenticatedUser, @Body() dto: AssignAddressDto) {
     return this.depositAddressService.getOrAssign(user.id, dto.assetSymbol, dto.networkCode);
+  }
+
+  // Registered after the "addresses" routes above — Nest matches literal
+  // path segments in declaration order, so ":id" must come last or it
+  // would swallow "GET /wallet/deposits/addresses" instead.
+  @Get(":id")
+  getMine(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string) {
+    return this.depositsService.getOwned(user.id, id);
   }
 }

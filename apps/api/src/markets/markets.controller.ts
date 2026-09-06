@@ -55,20 +55,24 @@ export class MarketsController {
   }
 
   // Decides the winning outcome and attempts settlement immediately.
+  // Market resolution moves real money (settlement payouts) and is a
+  // platform-control action reserved to the single SUPER_ADMIN authority
+  // (see the platform-control-model note) — not every ADMIN.
   // ResolutionService independently re-verifies the resolver's role
   // against the DB (defense in depth alongside RolesGuard here).
   @Post(":id/resolve")
   @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Roles(UserRole.SUPER_ADMIN)
   resolve(@Param("id") id: string, @Body() dto: ResolveMarketDto, @CurrentUser() user: AuthenticatedUser) {
     return this.resolutionService.resolve(id, user.id, dto.winningOutcomeId, dto.notes);
   }
 
   // Recovery path for a market whose settlement pass previously failed
-  // or was left incomplete — safe to call any number of times.
+  // or was left incomplete — safe to call any number of times. Same
+  // SUPER_ADMIN restriction as resolve() — it moves the same money.
   @Post(":id/retry-settlement")
   @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Roles(UserRole.SUPER_ADMIN)
   retrySettlement(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
     return this.resolutionService.retrySettlement(id, user.id);
   }

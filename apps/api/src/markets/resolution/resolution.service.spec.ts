@@ -19,7 +19,7 @@ describe("ResolutionService", () => {
   let auditLog: { record: jest.Mock };
   let settlementService: { settleMarket: jest.Mock };
 
-  const admin = { id: "admin-1", role: "ADMIN" };
+  const admin = { id: "admin-1", role: "SUPER_ADMIN" };
   const nonAdmin = { id: "user-1", role: "USER" };
   const market = {
     id: "market-1",
@@ -69,6 +69,12 @@ describe("ResolutionService", () => {
     it("allows a SUPER_ADMIN to resolve", async () => {
       prisma.user.findUnique.mockResolvedValue({ id: "root-1", role: "SUPER_ADMIN" });
       await expect(service.resolve("market-1", "root-1", "yes-1")).resolves.toBeDefined();
+    });
+
+    it("rejects resolution by a plain ADMIN — only SUPER_ADMIN may resolve or settle a market", async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: "admin-2", role: "ADMIN" });
+      await expect(service.resolve("market-1", "admin-2", "yes-1")).rejects.toThrow(ForbiddenException);
+      expect(prisma.market.updateMany).not.toHaveBeenCalled();
     });
   });
 

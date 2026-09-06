@@ -144,10 +144,25 @@ enum AddressAssignmentStatus {
   REVOKED
 }
 
+// PENDING covers both "just detected" and "accumulating confirmations"
+// (DETECTED/CONFIRMING in the conceptual state-machine sense) — the
+// Deposit row's `confirmations` counter already tracks progress within
+// that single status, so a separate CONFIRMING state would carry no
+// information PENDING + confirmations doesn't. CONFIRMED means the
+// configured ConfirmationPolicy considers the transaction final and it is
+// eligible for crediting; CREDITED means the ledger posting has happened
+// (terminal, see DepositsService.creditDeposit). REJECTED is terminal and
+// distinct from FAILED: it means the chain itself invalidated the
+// transaction before credit (e.g. a reorg dropped it, or it never
+// resolves to a valid transfer) — an economic "this never happened",
+// never entered after CREDITED. FAILED is terminal for a
+// processing-side problem (adapter/validation error, tag mismatch) that
+// may be worth investigating/retrying via the admin reprocess path.
 enum DepositStatus {
   PENDING
   CONFIRMED
   CREDITED
+  REJECTED
   FAILED
 }
 
@@ -802,8 +817,33 @@ model Deposit {
   confirmations         Int           @default(0)
   requiredConfirmations Int
   status                DepositStatus @default(PENDING)
+  // Observed on-chain destination tag/memo (XRP and similar tag-addressed
+  // chains) — captured whenever the adapter reports one, regardless of
+  // whether this asset/network requires it, so it is never silently
+  // discarded. Compared against the receiving WalletAddress's configured
+  // tag before crediting when AssetNetwork.memoRequired is true; see
+  // DepositsService.
+  destinationTag        String?
+  // Set only when this deposit could not be safely processed (a tag
+  // mismatch, an adapter/validation error) — human-readable, never a
+  // secret. Distinct from a REJECTED status's chain-level invalidation:
+  // this can accompany FAILED, or a still-PENDING/CONFIRMED row awaiting
+  // admin reprocessing.
+  failureReason         String?
+  // Number of admin-triggered reprocessing attempts against this deposit
+  // -- operational visibility only, never itself a trigger for crediting.
+  retryCount            Int           @default(0)
+  // Soft reference to the LedgerTransaction this deposit's credit posted,
+  // set atomically with creditedAt/CREDITED (mirrors
+  // PositionSettlement.ledgerTransactionId) -- lets reconciliation join
+  // deposit and ledger history without trusting cached balances.
+  ledgerTransactionId   String?
   rawProviderPayload    Json?
   detectedAt            DateTime      @default(now())
+  // Last time a watcher or admin reprocess actually re-checked this
+  // deposit's on-chain state -- lets stalled/never-progressing deposits
+  // be found with a simple query instead of scanning rawProviderPayload.
+  lastCheckedAt         DateTime?
   confirmedAt           DateTime?
   creditedAt            DateTime?
 
@@ -814,6 +854,7 @@ model Deposit {
 
   @@unique([assetNetworkId, txHash, eventIndex])
   @@index([userId, status])
+  @@index([status, lastCheckedAt])
   @@map("deposits")
 }
 
