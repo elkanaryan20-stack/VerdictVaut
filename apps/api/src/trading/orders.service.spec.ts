@@ -6,7 +6,7 @@ import { SerializableTransactionRunner } from "../prisma/serializable-transactio
 import { ExecutionCoordinator } from "./execution/execution-coordinator.service";
 import { FeeCalculator } from "./fees/fee-calculator.interface";
 import { CreateOrderDto } from "./dto/create-order.dto";
-import { OrdersService } from "./orders.service";
+import { OrdersService, toOrderView } from "./orders.service";
 import { PositionReservationService } from "./positions/position-reservation.service";
 import { OrderRiskValidator } from "./risk/order-risk-validator.service";
 import { MatchingAttemptFailedException } from "./trading.errors";
@@ -27,7 +27,7 @@ describe("OrdersService", () => {
     market: { findUnique: jest.Mock };
     marketOutcome: { findUnique: jest.Mock };
     asset: { findFirstOrThrow: jest.Mock };
-    order: { create: jest.Mock; findUnique: jest.Mock; findMany: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
+    order: { create: jest.Mock; findUnique: jest.Mock; findMany: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock; count: jest.Mock };
     fill: { findMany: jest.Mock };
     fundReservation: { findFirst: jest.Mock };
   };
@@ -57,6 +57,7 @@ describe("OrdersService", () => {
           id: where?.id ?? "order-1",
           status: "OPEN",
         })),
+        count: jest.fn().mockResolvedValue(0),
       },
       fill: { findMany: jest.fn().mockResolvedValue([]) },
       fundReservation: { findFirst: jest.fn().mockResolvedValue(null) },
@@ -379,5 +380,95 @@ describe("OrdersService", () => {
   it("getOwnOrder() throws NotFoundException for a missing order", async () => {
     prisma.order.findUnique.mockResolvedValue(null);
     await expect(service.getOwnOrder("user-1", "missing")).rejects.toThrow(NotFoundException);
+  });
+
+  describe("toOrderView", () => {
+    const rawOrder = {
+      id: "order-1",
+      userId: "user-1",
+      marketId: "market-1",
+      outcomeId: "outcome-1",
+      side: "BUY",
+      type: "LIMIT",
+      price: new Prisma.Decimal("0.5"),
+      quantity: new Prisma.Decimal("10"),
+      filledQuantity: new Prisma.Decimal("0"),
+      remainingQuantity: new Prisma.Decimal("10"),
+      status: "OPEN",
+      clientOrderId: "coid-1",
+      sequence: 42n,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+    };
+
+    it("strips the native-bigint sequence field", () => {
+      const view = toOrderView(rawOrder as never);
+      expect(view).not.toHaveProperty("sequence");
+    });
+
+    it("produces a JSON.stringify-safe object (a raw Order with a bigint sequence throws)", () => {
+      expect(() => JSON.stringify(rawOrder)).toThrow(TypeError);
+      expect(() => JSON.stringify(toOrderView(rawOrder as never))).not.toThrow();
+    });
+
+    it("passes through included market/outcome relations when present", () => {
+      const withRelations = { ...rawOrder, market: { id: "market-1" }, outcome: { id: "outcome-1" } };
+      const view = toOrderView(withRelations as never);
+      expect(view.market).toEqual({ id: "market-1" });
+      expect(view.outcome).toEqual({ id: "outcome-1" });
+    });
+
+    it("omits market/outcome keys entirely when the relation wasn't included", () => {
+      const view = toOrderView(rawOrder as never);
+      expect(view).not.toHaveProperty("market");
+      expect(view).not.toHaveProperty("outcome");
+    });
+  });
+
+  describe("listMine", () => {
+    it("scopes to the caller and applies default pagination", async () => {
+      prisma.order.findMany.mockResolvedValue([]);
+      prisma.order.count.mockResolvedValue(0);
+
+      const result = await service.listMine("user-1");
+
+      expect(prisma.order.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: "user-1" }, skip: 0, take: 20 }),
+      );
+      expect(prisma.order.count).toHaveBeenCalledWith({ where: { userId: "user-1" } });
+      expect(result).toEqual({ items: [], total: 0, page: 1, pageSize: 20 });
+    });
+
+    it("applies marketId and status filters", async () => {
+      prisma.order.findMany.mockResolvedValue([]);
+      prisma.order.count.mockResolvedValue(0);
+
+      await service.listMine("user-1", { marketId: "market-1", status: "OPEN" as never });
+
+      expect(prisma.order.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: "user-1", marketId: "market-1", status: "OPEN" } }),
+      );
+      expect(prisma.order.count).toHaveBeenCalledWith({ where: { userId: "user-1", marketId: "market-1", status: "OPEN" } });
+    });
+
+    it("clamps pageSize to the maximum and page to a minimum of 1", async () => {
+      prisma.order.findMany.mockResolvedValue([]);
+      prisma.order.count.mockResolvedValue(0);
+
+      const result = await service.listMine("user-1", { page: 0, pageSize: 100000 });
+
+      expect(result.page).toBe(1);
+      expect(result.pageSize).toBe(100);
+      expect(prisma.order.findMany).toHaveBeenCalledWith(expect.objectContaining({ skip: 0, take: 100 }));
+    });
+
+    it("falls back to defaults for a non-finite page/pageSize", async () => {
+      prisma.order.findMany.mockResolvedValue([]);
+      prisma.order.count.mockResolvedValue(0);
+
+      const result = await service.listMine("user-1", { page: NaN, pageSize: NaN });
+
+      expect(result).toEqual(expect.objectContaining({ page: 1, pageSize: 20 }));
+    });
   });
 });

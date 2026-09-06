@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common";
 import { LedgerModule } from "../ledger/ledger.module";
 import { ExecutionCoordinator } from "./execution/execution-coordinator.service";
+import { FillsService } from "./fills/fills.service";
 import { OrderBookService } from "./order-book/order-book.service";
 import { OrdersService } from "./orders.service";
 import { FEE_CALCULATOR } from "./fees/fee-calculator.interface";
@@ -22,9 +23,10 @@ import { TradingController } from "./trading.controller";
     OrderRiskValidator,
     OrderBookService,
     ExecutionCoordinator,
+    FillsService,
     { provide: FEE_CALCULATOR, useClass: ZeroFeeCalculator },
     { provide: MATCHING_ENGINE, useClass: PriceTimePriorityMatchingEngine },
   ],
-  exports: [OrdersService, PositionReservationService, PositionsService, ExecutionCoordinator],
+  exports: [OrdersService, PositionReservationService, PositionsService, ExecutionCoordinator, FillsService],
 })
 export class TradingModule {}

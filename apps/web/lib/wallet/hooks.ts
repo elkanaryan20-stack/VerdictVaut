@@ -18,17 +18,26 @@ export const walletKeys = {
   deposit: (id: string) => ["wallet", "deposit", id] as const,
 };
 
-export function useBalances() {
+/**
+ * `enabled` defaults to true (every existing /wallet caller runs inside
+ * AuthGuard, so it's always meant to fire there) — Phase 6B's order
+ * ticket is the first caller that can render on a PUBLIC page for an
+ * anonymous visitor, where firing an authenticated request at all would
+ * be a wasted, guaranteed-401 call.
+ */
+export function useBalances(enabled = true) {
   return useQuery({
     queryKey: walletKeys.balances,
     queryFn: fetchBalances,
+    enabled,
   });
 }
 
-export function useAssetNetworks() {
+export function useAssetNetworks(enabled = true) {
   return useQuery({
     queryKey: walletKeys.assetNetworks,
     queryFn: fetchAssetNetworks,
+    enabled,
     // Reference/configuration data — changes rarely, no need to refetch on every focus.
     staleTime: 5 * 60_000,
   });

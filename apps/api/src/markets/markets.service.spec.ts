@@ -9,7 +9,7 @@ describe("MarketsService", () => {
   let service: MarketsService;
   let prisma: {
     marketCategory: { findUnique: jest.Mock };
-    market: { create: jest.Mock; findUnique: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
+    market: { create: jest.Mock; findUnique: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock; findMany: jest.Mock };
   };
   let txRunner: { run: jest.Mock };
   let auditLog: { record: jest.Mock };
@@ -23,6 +23,7 @@ describe("MarketsService", () => {
         findUnique: jest.fn(),
         updateMany: jest.fn(),
         findUniqueOrThrow: jest.fn(),
+        findMany: jest.fn(),
       },
     };
     txRunner = { run: jest.fn((fn: (tx: unknown) => unknown) => fn(prisma)) };
@@ -84,6 +85,28 @@ describe("MarketsService", () => {
         { key: "YES", label: "Yes", sortOrder: 0 },
         { key: "NO", label: "No", sortOrder: 1 },
       ]);
+    });
+  });
+
+  describe("list", () => {
+    it("with no status filters to the publicly-visible lifecycle states, excluding DRAFT", async () => {
+      prisma.market.findMany.mockResolvedValue([]);
+      await service.list();
+
+      expect(prisma.market.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: { in: ["OPEN", "CLOSED", "RESOLVING", "RESOLVED"] } },
+        }),
+      );
+    });
+
+    it("with a status filters to exactly that status", async () => {
+      prisma.market.findMany.mockResolvedValue([]);
+      await service.list("RESOLVED" as never);
+
+      expect(prisma.market.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { status: "RESOLVED" } }),
+      );
     });
   });
 

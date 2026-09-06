@@ -2,14 +2,16 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { ArrowDownToLine, LayoutDashboard, History, LogOut } from "lucide-react";
+import { ArrowDownToLine, Briefcase, LayoutDashboard, History, LogIn, LogOut, TrendingUp } from "lucide-react";
 import { cn } from "../../lib/cn";
 import { useAuth } from "../../lib/auth/auth-context";
 
 const NAV_ITEMS = [
+  { href: "/markets", label: "Markets", icon: TrendingUp, exact: false },
   { href: "/wallet", label: "Overview", icon: LayoutDashboard, exact: true },
   { href: "/wallet/deposit", label: "Deposit", icon: ArrowDownToLine, exact: false },
   { href: "/wallet/deposits", label: "History", icon: History, exact: false },
+  { href: "/portfolio", label: "Portfolio", icon: Briefcase, exact: false },
 ];
 
 function isActive(pathname: string, href: string, exact: boolean) {
@@ -45,7 +47,7 @@ function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: () 
 
 export function WalletSidebar() {
   const pathname = usePathname();
-  const { user, logout } = useAuth();
+  const { status, user, logout } = useAuth();
   const router = useRouter();
 
   async function handleLogout() {
@@ -63,15 +65,27 @@ export function WalletSidebar() {
         <NavLinks pathname={pathname} />
       </nav>
       <div className="border-t border-vault-border p-3">
-        {user && <p className="truncate px-3 pb-2 text-xs text-white/40">{user.email}</p>}
-        <button
-          type="button"
-          onClick={handleLogout}
-          className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-white/60 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-vault-gold"
-        >
-          <LogOut className="h-4 w-4" aria-hidden="true" />
-          Sign out
-        </button>
+        {status === "authenticated" ? (
+          <>
+            {user && <p className="truncate px-3 pb-2 text-xs text-white/40">{user.email}</p>}
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-white/60 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-vault-gold"
+            >
+              <LogOut className="h-4 w-4" aria-hidden="true" />
+              Sign out
+            </button>
+          </>
+        ) : (
+          <Link
+            href="/login"
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-white/60 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-vault-gold"
+          >
+            <LogIn className="h-4 w-4" aria-hidden="true" />
+            Log in
+          </Link>
+        )}
       </div>
     </aside>
   );

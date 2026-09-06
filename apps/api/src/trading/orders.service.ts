@@ -12,6 +12,66 @@ import { OrderRiskValidator } from "./risk/order-risk-validator.service";
 import { CreateOrderDto } from "./dto/create-order.dto";
 import { MatchingAttemptFailedException } from "./trading.errors";
 
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_PAGE_SIZE = 100;
+
+/**
+ * Client-safe projection of an Order row. Deliberately omits `sequence`:
+ * it's a raw `bigint` (Prisma's native representation, not a Decimal),
+ * and `JSON.stringify` throws on any object containing one — returning a
+ * raw Order straight from a controller would crash that response, not
+ * just leak an internal field. `sequence` is also purely an internal
+ * price-time-priority tie-breaker clients must never treat as an
+ * ordering signal (see the field's own docblock in schema.prisma), so
+ * dropping it is correct on both grounds, not just a serialization fix.
+ */
+export interface OrderView {
+  id: string;
+  userId: string;
+  marketId: string;
+  outcomeId: string;
+  side: OrderSide;
+  type: OrderType;
+  price: Prisma.Decimal | null;
+  quantity: Prisma.Decimal;
+  filledQuantity: Prisma.Decimal;
+  remainingQuantity: Prisma.Decimal;
+  status: OrderStatus;
+  clientOrderId: string;
+  createdAt: Date;
+  updatedAt: Date;
+  market?: unknown;
+  outcome?: unknown;
+}
+
+export function toOrderView(order: Order & { market?: unknown; outcome?: unknown }): OrderView {
+  return {
+    id: order.id,
+    userId: order.userId,
+    marketId: order.marketId,
+    outcomeId: order.outcomeId,
+    side: order.side,
+    type: order.type,
+    price: order.price,
+    quantity: order.quantity,
+    filledQuantity: order.filledQuantity,
+    remainingQuantity: order.remainingQuantity,
+    status: order.status,
+    clientOrderId: order.clientOrderId,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    ...("market" in order ? { market: order.market } : {}),
+    ...("outcome" in order ? { outcome: order.outcome } : {}),
+  };
+}
+
+export interface PaginatedOrders {
+  items: OrderView[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
 export interface OrderPlacementResult {
   orderId: string;
   status: OrderStatus;
@@ -348,8 +408,36 @@ export class OrdersService {
     return order;
   }
 
-  async listMine(userId: string) {
-    return this.prisma.order.findMany({ where: { userId }, orderBy: { createdAt: "desc" } });
+  /**
+   * Paginated, same convention as DepositsService.listMine: an account's
+   * order history is unbounded over time, and page/pageSize are clamped so
+   * a malformed or hostile query param can't force an unbounded scan.
+   */
+  async listMine(
+    userId: string,
+    options: { page?: number; pageSize?: number; marketId?: string; status?: OrderStatus } = {},
+  ): Promise<PaginatedOrders> {
+    const safePage = Number.isFinite(options.page) && (options.page as number) >= 1 ? Math.trunc(options.page as number) : 1;
+    const requestedPageSize =
+      Number.isFinite(options.pageSize) && (options.pageSize as number) >= 1 ? Math.trunc(options.pageSize as number) : DEFAULT_PAGE_SIZE;
+    const safePageSize = Math.min(MAX_PAGE_SIZE, requestedPageSize);
+
+    const where: Prisma.OrderWhereInput = { userId };
+    if (options.marketId) where.marketId = options.marketId;
+    if (options.status) where.status = options.status;
+
+    const [rows, total] = await Promise.all([
+      this.prisma.order.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip: (safePage - 1) * safePageSize,
+        take: safePageSize,
+        include: { market: true, outcome: true },
+      }),
+      this.prisma.order.count({ where }),
+    ]);
+
+    return { items: rows.map((row) => toOrderView(row)), total, page: safePage, pageSize: safePageSize };
   }
 
   /**

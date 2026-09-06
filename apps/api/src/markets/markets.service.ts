@@ -22,9 +22,22 @@ export class MarketsService {
     private readonly ordersService: OrdersService,
   ) {}
 
-  async listOpen() {
+  /**
+   * DRAFT is intentionally excluded even when no filter is given — it's a
+   * pre-publication state with no public visibility, unlike the other four
+   * (OPEN/CLOSED/RESOLVING/RESOLVED) which are all legitimate states for a
+   * market a user has already seen or traded on.
+   */
+  async list(status?: MarketStatus) {
+    if (status) {
+      return this.prisma.market.findMany({
+        where: { status },
+        include: { category: true, outcomes: { orderBy: { sortOrder: "asc" } } },
+        orderBy: { createdAt: "desc" },
+      });
+    }
     return this.prisma.market.findMany({
-      where: { status: MarketStatus.OPEN },
+      where: { status: { in: [MarketStatus.OPEN, MarketStatus.CLOSED, MarketStatus.RESOLVING, MarketStatus.RESOLVED] } },
       include: { category: true, outcomes: { orderBy: { sortOrder: "asc" } } },
       orderBy: { createdAt: "desc" },
     });

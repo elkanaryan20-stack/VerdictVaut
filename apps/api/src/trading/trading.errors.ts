@@ -1,6 +1,18 @@
-export class InsufficientPositionError extends Error {
-  constructor(positionId: string, available: string, requested: string) {
-    super(`Insufficient outcome shares on position ${positionId}: available=${available}, requested=${requested}`);
+import { BadRequestException } from "@nestjs/common";
+
+/**
+ * Extends BadRequestException — see InsufficientBalanceError's docblock
+ * in ledger/ledger.errors.ts for the full reasoning: this used to fall
+ * through as a generic 500, making an ordinary "you don't have enough
+ * shares to sell" outcome indistinguishable from a server fault.
+ */
+export class InsufficientPositionError extends BadRequestException {
+  constructor(
+    public readonly positionId: string,
+    public readonly available: string,
+    public readonly requested: string,
+  ) {
+    super("Insufficient available position quantity to complete this request.");
     this.name = "InsufficientPositionError";
   }
 }

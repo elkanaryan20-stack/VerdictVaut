@@ -12,28 +12,9 @@ import {
 } from "@verdictvaut/shared-types";
 import { z } from "zod";
 import { apiFetch } from "../api-client";
+import { parseOrThrow } from "../api-validation";
 
-export class MalformedResponseError extends Error {
-  constructor(context: string, issues: string) {
-    super(`Unexpected data shape from the server (${context}): ${issues}`);
-    this.name = "MalformedResponseError";
-  }
-}
-
-/**
- * Every response the wallet UI treats as financial fact is validated
- * against the shared Zod schema before anything renders it — a
- * malformed or unexpectedly-shaped backend response surfaces as a clear
- * "something went wrong" error state, never as a silently wrong number
- * on screen or a raw runtime crash deep in a component.
- */
-function parseOrThrow<T>(schema: z.ZodType<T>, data: unknown, context: string): T {
-  const result = schema.safeParse(data);
-  if (!result.success) {
-    throw new MalformedResponseError(context, result.error.issues.map((issue) => issue.message).join("; "));
-  }
-  return result.data;
-}
+export { MalformedResponseError } from "../api-validation";
 
 export async function fetchBalances(): Promise<AssetBalance[]> {
   const data = await apiFetch<unknown>("/wallet/balances");

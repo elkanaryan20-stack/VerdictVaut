@@ -1,5 +1,5 @@
-import { Controller, Get, Param, Post, Body, UseGuards } from "@nestjs/common";
-import { UserRole } from "@prisma/client";
+import { BadRequestException, Controller, Get, Param, Post, Body, Query, UseGuards } from "@nestjs/common";
+import { MarketStatus, UserRole } from "@prisma/client";
 import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
 import { Roles } from "../common/decorators/roles.decorator";
@@ -18,9 +18,18 @@ export class MarketsController {
     private readonly settlementService: SettlementService,
   ) {}
 
+  // ?status= restricts to a single lifecycle status (OPEN/CLOSED/RESOLVING/
+  // RESOLVED); DRAFT is never a valid filter value here — it's not a
+  // publicly-visible state (see MarketsService.list's docblock).
   @Get()
-  list() {
-    return this.marketsService.listOpen();
+  list(@Query("status") status?: string) {
+    if (status === undefined) {
+      return this.marketsService.list();
+    }
+    if (!Object.values(MarketStatus).includes(status as MarketStatus) || status === MarketStatus.DRAFT) {
+      throw new BadRequestException(`Invalid status filter '${status}'`);
+    }
+    return this.marketsService.list(status as MarketStatus);
   }
 
   @Get("categories")
