@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, Param, Post, Query, UseGuards } from "@nestjs/common";
 import { IsString } from "class-validator";
 import { JwtAuthGuard } from "../../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../../common/decorators/current-user.decorator";
@@ -22,8 +22,12 @@ export class DepositsController {
   ) {}
 
   @Get()
-  listMine(@CurrentUser() user: AuthenticatedUser) {
-    return this.depositsService.listMine(user.id);
+  listMine(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query("page") page?: string,
+    @Query("pageSize") pageSize?: string,
+  ) {
+    return this.depositsService.listMine(user.id, page ? parseInt(page, 10) : undefined, pageSize ? parseInt(pageSize, 10) : undefined);
   }
 
   @Get("addresses")

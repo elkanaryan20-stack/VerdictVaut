@@ -23,6 +23,7 @@ import { OrderRiskValidator } from "../../src/trading/risk/order-risk-validator.
 import { ResolutionService } from "../../src/markets/resolution/resolution.service";
 import { SettlementService } from "../../src/settlement/settlement.service";
 import { DepositAddressService } from "../../src/wallet/addresses/deposit-address.service";
+import { BalancesService } from "../../src/wallet/balances/balances.service";
 import { DepositsService } from "../../src/wallet/deposits/deposits.service";
 import { ConfirmationPolicyService } from "../../src/wallet/confirmation/confirmation-policy.service";
 import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
@@ -41,6 +42,7 @@ export const auditLog = new AuditLogService(prisma);
 export const depositsService = new DepositsService(prisma, ledger, txRunner, auditLog);
 export const depositAddressService = new DepositAddressService(prisma, txRunner);
 export const confirmationPolicyService = new ConfirmationPolicyService(prisma);
+export const balancesService = new BalancesService(prisma);
 
 // DepositWatcherService, DepositReprocessingService, and
 // ReconciliationService all depend on a chain-adapter/custody-provider

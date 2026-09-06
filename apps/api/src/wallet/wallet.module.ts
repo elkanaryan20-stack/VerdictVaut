@@ -3,6 +3,8 @@ import { LedgerModule } from "../ledger/ledger.module";
 import { AssetsNetworksController } from "./assets-networks/assets-networks.controller";
 import { AssetsNetworksService } from "./assets-networks/assets-networks.service";
 import { DepositAddressService } from "./addresses/deposit-address.service";
+import { BalancesController } from "./balances/balances.controller";
+import { BalancesService } from "./balances/balances.service";
 import { BitcoinDepositAdapter } from "./chain-adapters/bitcoin/bitcoin-deposit-adapter";
 import { DepositChainAdapterFactory } from "./chain-adapters/deposit-chain-adapter.factory";
 import { EvmDepositAdapter } from "./chain-adapters/evm/evm-deposit-adapter";
@@ -28,9 +30,10 @@ import { DepositWatcherService } from "./watchers/deposit-watcher.service";
 
 @Module({
   imports: [LedgerModule],
-  controllers: [AssetsNetworksController, DepositsController, WithdrawalsController],
+  controllers: [AssetsNetworksController, BalancesController, DepositsController, WithdrawalsController],
   providers: [
     AssetsNetworksService,
+    BalancesService,
     DepositAddressService,
     DepositsService,
     WithdrawalsService,

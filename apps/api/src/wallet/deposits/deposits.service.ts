@@ -5,6 +5,20 @@ import { LedgerService } from "../../ledger/ledger.service";
 import { PrismaService } from "../../prisma/prisma.service";
 import { SerializableTransactionRunner } from "../../prisma/serializable-transaction-runner";
 
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_PAGE_SIZE = 100;
+
+type DepositWithAssetNetwork = Deposit & {
+  assetNetwork: Prisma.AssetNetworkGetPayload<{ include: { asset: true; network: true } }>;
+};
+
+export interface PaginatedDeposits {
+  items: DepositWithAssetNetwork[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
 export interface ObservedTransactionInput {
   userId: string;
   assetSymbol: string;
@@ -240,8 +254,30 @@ export class DepositsService {
     await this.prisma.deposit.update({ where: { id: depositId }, data: { lastCheckedAt: new Date(), retryCount: { increment: 1 } } });
   }
 
-  async listMine(userId: string) {
-    return this.prisma.deposit.findMany({ where: { userId }, orderBy: { detectedAt: "desc" } });
+  /**
+   * Paginated — a user's deposit history is unbounded over time, and
+   * loading it in full into a browser tab would only get worse the
+   * longer an account has existed. `page` is clamped to >= 1 and
+   * `pageSize` to [1, MAX_PAGE_SIZE] so a malformed or hostile query
+   * param can't force an unbounded scan.
+   */
+  async listMine(userId: string, page = 1, pageSize = DEFAULT_PAGE_SIZE): Promise<PaginatedDeposits> {
+    const safePage = Number.isFinite(page) && page >= 1 ? Math.trunc(page) : 1;
+    const requestedPageSize = Number.isFinite(pageSize) && pageSize >= 1 ? Math.trunc(pageSize) : DEFAULT_PAGE_SIZE;
+    const safePageSize = Math.min(MAX_PAGE_SIZE, requestedPageSize);
+
+    const [items, total] = await Promise.all([
+      this.prisma.deposit.findMany({
+        where: { userId },
+        orderBy: { detectedAt: "desc" },
+        skip: (safePage - 1) * safePageSize,
+        take: safePageSize,
+        include: { assetNetwork: { include: { asset: true, network: true } } },
+      }),
+      this.prisma.deposit.count({ where: { userId } }),
+    ]);
+
+    return { items, total, page: safePage, pageSize: safePageSize };
   }
 
   async getOwned(userId: string, depositId: string) {

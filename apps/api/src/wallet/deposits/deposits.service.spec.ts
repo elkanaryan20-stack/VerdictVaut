@@ -8,7 +8,14 @@ describe("DepositsService", () => {
   let prisma: {
     assetNetwork: { findUniqueOrThrow: jest.Mock };
     walletAddress: { findUniqueOrThrow: jest.Mock };
-    deposit: { findUnique: jest.Mock; upsert: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock };
+    deposit: {
+      findUnique: jest.Mock;
+      upsert: jest.Mock;
+      updateMany: jest.Mock;
+      findUniqueOrThrow: jest.Mock;
+      findMany: jest.Mock;
+      count: jest.Mock;
+    };
   };
   let ledger: { postTransaction: jest.Mock };
   let auditLog: { record: jest.Mock };
@@ -49,6 +56,8 @@ describe("DepositsService", () => {
           return Promise.resolve({ count: 1 });
         }),
         findUniqueOrThrow: jest.fn(() => Promise.resolve(depositRow)),
+        findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
       },
     };
 
@@ -124,6 +133,54 @@ describe("DepositsService", () => {
       const { justRejected } = await service.rejectIfNotCredited("dep-1", "reorged out");
       expect(justRejected).toBe(false);
       expect(depositRow.status).toBe("CREDITED");
+    });
+  });
+
+  describe("listMine (pagination)", () => {
+    it("defaults to page 1 of 20 and returns the pagination envelope", async () => {
+      prisma.deposit.count.mockResolvedValue(45);
+      const result = await service.listMine("user-1");
+
+      expect(result.page).toBe(1);
+      expect(result.pageSize).toBe(20);
+      expect(result.total).toBe(45);
+      expect(prisma.deposit.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: "user-1" }, skip: 0, take: 20 }),
+      );
+    });
+
+    it("computes skip from the requested page", async () => {
+      await service.listMine("user-1", 3, 10);
+      expect(prisma.deposit.findMany).toHaveBeenCalledWith(expect.objectContaining({ skip: 20, take: 10 }));
+    });
+
+    it("clamps a non-positive page to 1", async () => {
+      const result = await service.listMine("user-1", 0);
+      expect(result.page).toBe(1);
+      const result2 = await service.listMine("user-1", -5);
+      expect(result2.page).toBe(1);
+    });
+
+    it("clamps pageSize to the maximum rather than allowing an unbounded fetch", async () => {
+      const result = await service.listMine("user-1", 1, 100000);
+      expect(result.pageSize).toBe(100);
+      expect(prisma.deposit.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 100 }));
+    });
+
+    it("falls back to the default pageSize for a zero/falsy pageSize rather than requesting zero items", async () => {
+      const result = await service.listMine("user-1", 1, 0);
+      expect(result.pageSize).toBe(20);
+    });
+
+    it("falls back to safe defaults for a NaN page/pageSize (e.g. a malformed query param)", async () => {
+      const result = await service.listMine("user-1", NaN, NaN);
+      expect(result.page).toBe(1);
+      expect(result.pageSize).toBe(20);
+    });
+
+    it("orders by detectedAt descending — newest first", async () => {
+      await service.listMine("user-1");
+      expect(prisma.deposit.findMany).toHaveBeenCalledWith(expect.objectContaining({ orderBy: { detectedAt: "desc" } }));
     });
   });
 });
