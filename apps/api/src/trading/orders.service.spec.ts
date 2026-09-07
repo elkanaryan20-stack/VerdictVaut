@@ -24,7 +24,7 @@ describe("OrdersService", () => {
   let prisma: {
     $executeRawUnsafe: jest.Mock;
     user: { findUniqueOrThrow: jest.Mock };
-    market: { findUnique: jest.Mock };
+    market: { findUnique: jest.Mock; findUniqueOrThrow: jest.Mock };
     marketOutcome: { findUnique: jest.Mock };
     asset: { findFirstOrThrow: jest.Mock };
     order: { create: jest.Mock; findUnique: jest.Mock; findMany: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock; count: jest.Mock };
@@ -45,7 +45,10 @@ describe("OrdersService", () => {
     prisma = {
       $executeRawUnsafe: jest.fn().mockResolvedValue(undefined),
       user: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: "user-1", status: "ACTIVE" }) },
-      market: { findUnique: jest.fn().mockResolvedValue(market) },
+      market: {
+        findUnique: jest.fn().mockResolvedValue(market),
+        findUniqueOrThrow: jest.fn().mockResolvedValue(market),
+      },
       marketOutcome: { findUnique: jest.fn().mockResolvedValue(outcome) },
       asset: { findFirstOrThrow: jest.fn().mockResolvedValue({ symbol: "USDC" }) },
       order: {
@@ -119,6 +122,19 @@ describe("OrdersService", () => {
   it("rejects an order on a market that is not OPEN", async () => {
     prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "CLOSED", closeTime: null });
     await expect(service.create("user-1", buy())).rejects.toThrow(BadRequestException);
+    expect(reservations.reserve).not.toHaveBeenCalled();
+  });
+
+  it("re-validates the market is still OPEN inside the funding transaction — rejects a market that closed between the outer check and the transaction", async () => {
+    // The outer (pre-transaction) read still sees OPEN...
+    prisma.market.findUnique.mockResolvedValue(market);
+    // ...but the market closed concurrently by the time the transaction's
+    // own re-check runs — this is the exact race a concurrent
+    // MarketsService.close() call would produce.
+    prisma.market.findUniqueOrThrow.mockResolvedValue({ id: "market-1", status: "CLOSED", closeTime: null });
+
+    await expect(service.create("user-1", buy())).rejects.toThrow(BadRequestException);
+    expect(prisma.order.create).not.toHaveBeenCalled();
     expect(reservations.reserve).not.toHaveBeenCalled();
   });
 

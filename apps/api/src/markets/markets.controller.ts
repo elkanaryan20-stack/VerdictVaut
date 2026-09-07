@@ -1,9 +1,11 @@
 import { BadRequestException, Controller, Get, Param, Post, Body, Query, UseGuards } from "@nestjs/common";
+import { Throttle } from "@nestjs/throttler";
 import { MarketStatus, UserRole } from "@prisma/client";
 import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
 import { Roles } from "../common/decorators/roles.decorator";
 import { RolesGuard } from "../common/guards/roles.guard";
+import { ADMIN_MUTATION_THROTTLE } from "../common/throttle-presets";
 import { SettlementService } from "../settlement/settlement.service";
 import { CreateMarketDto } from "./dto/create-market.dto";
 import { MarketsService } from "./markets.service";
@@ -72,6 +74,7 @@ export class MarketsController {
   @Post(":id/resolve")
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   resolve(@Param("id") id: string, @Body() dto: ResolveMarketDto, @CurrentUser() user: AuthenticatedUser) {
     return this.resolutionService.resolve(id, user.id, dto.winningOutcomeId, dto.notes);
   }
@@ -82,6 +85,7 @@ export class MarketsController {
   @Post(":id/retry-settlement")
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   retrySettlement(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
     return this.resolutionService.retrySettlement(id, user.id);
   }

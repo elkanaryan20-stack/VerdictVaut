@@ -195,6 +195,53 @@ describe("Market lifecycle (real Postgres)", () => {
     expect(buyerAccount?.reservedBalance.toString()).toBe("0"); // remaining earmark released
   });
 
+  it(
+    "resolve vs order submission: an order submitted concurrently with market close never survives as a resting order on a CLOSED market " +
+      "(race: OrdersService.create()'s pre-transaction market-status read can go stale if MarketsService.close() commits between that " +
+      "read and the funding transaction; invariant: the funding transaction re-validates market status under SERIALIZABLE, so either " +
+      "the order is rejected as CLOSED, or it was created and expired by close() itself — never left OPEN/PARTIALLY_FILLED on a market " +
+      "that is no longer OPEN, which would otherwise strand a reservation and block ResolutionService's own defensive resting-order check)",
+    async () => {
+      const admin = await createTestUser();
+      const trader = await createTestUser();
+      const { market, yes } = await createTestMarket(admin.id);
+      await openMarketForTest(market.id, admin.id);
+      await fundUserForTest(trader.id, "USDC", "100");
+
+      const results = await Promise.allSettled([
+        ordersService.create(trader.id, {
+          marketId: market.id,
+          outcomeId: yes.id,
+          side: "BUY",
+          type: "LIMIT",
+          quantity: "10",
+          price: "0.5",
+        } as never),
+        marketsService.close(market.id, admin.id),
+      ]);
+
+      expect(results[1].status).toBe("fulfilled"); // close() itself always succeeds
+
+      const finalMarket = await prisma.market.findUniqueOrThrow({ where: { id: market.id } });
+      expect(finalMarket.status).toBe("CLOSED");
+
+      const restingOrders = await prisma.order.count({
+        where: { marketId: market.id, status: { in: ["OPEN", "PARTIALLY_FILLED"] } },
+      });
+      expect(restingOrders).toBe(0); // the invariant that actually matters: nothing survives resting past close, whichever way the race fell
+
+      if (results[0].status === "fulfilled") {
+        // The order won the race and was created before close() committed —
+        // close()'s own resting-order expiry must have caught it.
+        const order = results[0].value as { id: string };
+        const finalOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+        expect(finalOrder.status).toBe("EXPIRED");
+        const account = await getUserAccount(trader.id, "USDC");
+        expect(account?.reservedBalance.toString()).toBe("0"); // released, not stranded
+      }
+    },
+  );
+
   it("rejects trading on a market past its configured closeTime, even if status is still OPEN", async () => {
     const admin = await createTestUser();
     const trader = await createTestUser();

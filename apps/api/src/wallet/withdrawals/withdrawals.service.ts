@@ -75,6 +75,38 @@ export class WithdrawalsService {
     assertValidDestinationAddress(network.family, dto.destinationAddress);
 
     const withdrawal = await this.txRunner.run(async (tx) => {
+      // RiskLimit.maxDailyWithdrawal is opt-in (null = unlimited, same
+      // convention as OrderRiskValidator) — when configured, it caps this
+      // asset's own withdrawal volume (requested, in-flight, or already
+      // moved — everything except REJECTED/FAILED, which never happened)
+      // over a trailing 24h window. Read and enforced INSIDE this same
+      // SERIALIZABLE transaction, before the new row is created, so two
+      // concurrent requests that would each individually fit under the cap
+      // but jointly exceed it are caught by Postgres's own serializable
+      // conflict detection (the same phantom-read protection
+      // OrderRiskValidator.checkMarketExposure relies on) rather than by
+      // an application-level lock.
+      const riskLimit = await tx.riskLimit.findUnique({ where: { userId } });
+      if (riskLimit?.maxDailyWithdrawal) {
+        const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const recent = await tx.withdrawal.findMany({
+          where: {
+            userId,
+            assetNetwork: { assetId: asset.id },
+            status: { notIn: [WithdrawalStatus.REJECTED, WithdrawalStatus.FAILED] },
+            createdAt: { gte: since },
+          },
+          select: { amount: true },
+        });
+        const alreadyRequested = recent.reduce((sum, w) => sum.plus(w.amount), new Prisma.Decimal(0));
+        if (alreadyRequested.plus(amount).greaterThan(riskLimit.maxDailyWithdrawal)) {
+          throw new BadRequestException(
+            `This withdrawal would exceed your configured daily withdrawal limit of ${riskLimit.maxDailyWithdrawal.toString()} ${asset.symbol} ` +
+              `(already requested ${alreadyRequested.toString()} in the last 24 hours)`,
+          );
+        }
+      }
+
       const created = await tx.withdrawal.create({
         data: {
           userId,

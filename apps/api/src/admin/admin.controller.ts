@@ -1,9 +1,11 @@
 import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
+import { Throttle } from "@nestjs/throttler";
 import { UserRole } from "@prisma/client";
 import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
 import { Roles } from "../common/decorators/roles.decorator";
 import { RolesGuard } from "../common/guards/roles.guard";
+import { ADMIN_MUTATION_THROTTLE } from "../common/throttle-presets";
 import { AssetsNetworksService } from "../wallet/assets-networks/assets-networks.service";
 import { DepositAddressService } from "../wallet/addresses/deposit-address.service";
 import { DepositsService } from "../wallet/deposits/deposits.service";
@@ -26,6 +28,12 @@ import { CreateAssetNetworkDto, ProvisionAddressDto, RejectWithdrawalDto, SetAct
  * never be able to reconfigure assets/networks, provision deposit
  * addresses, run reconciliation, reprocess a deposit, or move a
  * withdrawal through approval/broadcast.
+ *
+ * @Throttle(ADMIN_MUTATION_THROTTLE) is applied per-method on every
+ * SUPER_ADMIN mutation below (deliberately NOT at the class level) — the
+ * read-only listing endpoints stay on the ordinary global default so an
+ * operational dashboard polling them is never throttled by a limit meant
+ * for rare, high-stakes platform-control actions.
  */
 @Controller("admin")
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -44,6 +52,7 @@ export class AdminController {
   // ── Asset / network configuration (SUPER_ADMIN only) ─────────────────
   @Post("asset-networks")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async createAssetNetwork(@CurrentUser() admin: AuthenticatedUser, @Body() dto: CreateAssetNetworkDto) {
     const created = await this.assetsNetworksService.createAssetNetwork(dto);
     await this.auditLogService.record({
@@ -68,6 +77,7 @@ export class AdminController {
 
   @Patch("asset-networks/:id/active")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async setAssetNetworkActive(
     @CurrentUser() admin: AuthenticatedUser,
     @Param("id") id: string,
@@ -86,6 +96,7 @@ export class AdminController {
 
   @Patch("assets/:id/active")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async setAssetActive(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string, @Body() dto: SetActiveDto) {
     const updated = await this.assetsNetworksService.setAssetActive(id, dto.isActive);
     await this.auditLogService.record({
@@ -100,6 +111,7 @@ export class AdminController {
 
   @Patch("networks/:id/active")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async setNetworkActive(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string, @Body() dto: SetActiveDto) {
     const updated = await this.assetsNetworksService.setNetworkActive(id, dto.isActive);
     await this.auditLogService.record({
@@ -115,6 +127,7 @@ export class AdminController {
   // ── Wallet addresses (address-pool administration — SUPER_ADMIN only) ─
   @Post("wallet-addresses")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async provisionAddress(@CurrentUser() admin: AuthenticatedUser, @Body() dto: ProvisionAddressDto) {
     const created = await this.depositAddressService.provisionAddress(dto);
     await this.auditLogService.record({
@@ -158,6 +171,7 @@ export class AdminController {
 
   @Post("deposits/:id/reprocess")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async reprocessDeposit(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
     return this.reprocessingService.reprocess(id, admin.id);
   }
@@ -170,6 +184,7 @@ export class AdminController {
 
   @Post("withdrawals/:id/approve")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async approveWithdrawal(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
     const before = await this.withdrawalsService.getById(id);
     const updated = await this.withdrawalsService.approve(id);
@@ -187,6 +202,7 @@ export class AdminController {
 
   @Post("withdrawals/:id/reject")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async rejectWithdrawal(
     @CurrentUser() admin: AuthenticatedUser,
     @Param("id") id: string,
@@ -209,6 +225,7 @@ export class AdminController {
 
   @Post("withdrawals/:id/broadcast")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async broadcastWithdrawal(
     @CurrentUser() admin: AuthenticatedUser,
     @Param("id") id: string,
@@ -231,6 +248,7 @@ export class AdminController {
   // ── Reconciliation (settlement/reconciliation controls — SUPER_ADMIN only) ─
   @Post("reconciliation/:assetNetworkId/run")
   @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
   async runReconciliation(@CurrentUser() admin: AuthenticatedUser, @Param("assetNetworkId") assetNetworkId: string) {
     const run = await this.reconciliationService.run(assetNetworkId);
     await this.auditLogService.record({

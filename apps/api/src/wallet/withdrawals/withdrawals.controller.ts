@@ -1,6 +1,8 @@
 import { Body, Controller, Get, Post, UseGuards } from "@nestjs/common";
+import { Throttle } from "@nestjs/throttler";
 import { JwtAuthGuard } from "../../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../../common/decorators/current-user.decorator";
+import { WITHDRAWAL_REQUEST_THROTTLE } from "../../common/throttle-presets";
 import { RequestWithdrawalDto } from "./dto/request-withdrawal.dto";
 import { WithdrawalsService } from "./withdrawals.service";
 
@@ -10,6 +12,7 @@ export class WithdrawalsController {
   constructor(private readonly withdrawalsService: WithdrawalsService) {}
 
   @Post()
+  @Throttle(WITHDRAWAL_REQUEST_THROTTLE)
   request(@CurrentUser() user: AuthenticatedUser, @Body() dto: RequestWithdrawalDto) {
     return this.withdrawalsService.request(user.id, dto);
   }

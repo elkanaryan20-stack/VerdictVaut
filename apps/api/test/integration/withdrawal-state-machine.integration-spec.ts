@@ -1,4 +1,4 @@
-import { ConflictException, ForbiddenException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException } from "@nestjs/common";
 import { InsufficientBalanceError } from "../../src/ledger/ledger.errors";
 import { createTestUser, fundUserForTest, getUserAccount, prisma, withdrawalsService } from "./helpers";
 
@@ -44,6 +44,42 @@ describe("Withdrawal state machine (real Postgres)", () => {
 
     await requestWithdrawal(user.id, "60");
     await expect(requestWithdrawal(user.id, "60")).rejects.toThrow(InsufficientBalanceError);
+  });
+
+  it("enforces a configured maxDailyWithdrawal limit — a previously dead RiskLimit field", async () => {
+    const user = await createTestUser();
+    await fundUserForTest(user.id, "USDC", "1000");
+    await prisma.riskLimit.create({ data: { userId: user.id, maxDailyWithdrawal: "250" } });
+
+    await requestWithdrawal(user.id, "200");
+    // 200 already requested in the trailing 24h + 100 more would be 300 > 250.
+    await expect(requestWithdrawal(user.id, "100")).rejects.toThrow(BadRequestException);
+
+    // Exactly at the remaining headroom (50) still succeeds.
+    const third = await requestWithdrawal(user.id, "50");
+    expect(third.status).toBe("RISK_REVIEW");
+  });
+
+  it("does not count a REJECTED withdrawal against the daily limit", async () => {
+    const user = await createTestUser();
+    await fundUserForTest(user.id, "USDC", "1000");
+    await prisma.riskLimit.create({ data: { userId: user.id, maxDailyWithdrawal: "250" } });
+
+    const first = await requestWithdrawal(user.id, "200");
+    await withdrawalsService.reject(first.id, "risk flag");
+
+    // The rejected 200 never happened economically, so a fresh 200 request still fits under the 250 cap.
+    const second = await requestWithdrawal(user.id, "200");
+    expect(second.status).toBe("RISK_REVIEW");
+  });
+
+  it("leaves withdrawals unlimited when maxDailyWithdrawal is not configured (null = unlimited)", async () => {
+    const user = await createTestUser();
+    await fundUserForTest(user.id, "USDC", "10000");
+
+    await requestWithdrawal(user.id, "5000");
+    const second = await requestWithdrawal(user.id, "4000");
+    expect(second.status).toBe("RISK_REVIEW");
   });
 
   it("only one of two concurrent approve() calls succeeds; the executor is invoked exactly once", async () => {

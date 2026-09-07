@@ -71,6 +71,34 @@ describe("Database-level financial invariants (real Postgres)", () => {
     ).rejects.toThrow(/deposits_amount_positive_check/);
   });
 
+  it("rejects a deposit inserted directly as CREDITED with no ledgerTransactionId (Phase 8 hardening)", async () => {
+    const user = await createTestUser();
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+    const asset = await getAsset("USDC");
+    const address = await provisionAddress(assetNetwork.id, `0xCreditedNoLedgerRef${Date.now()}${Math.random()}`);
+
+    await expect(
+      prisma.$executeRaw`
+        INSERT INTO "deposits" ("id", "userId", "assetId", "assetNetworkId", "walletAddressId", "txHash", "amount", "confirmations", "requiredConfirmations", "status", "detectedAt")
+        VALUES (gen_random_uuid()::text, ${user.id}, ${asset.id}, ${assetNetwork.id}, ${address.id}, ${"0xcreditednoledgerref" + Date.now()}, 10, 12, 12, 'CREDITED', NOW())
+      `,
+    ).rejects.toThrow(/deposits_credited_consistency_check/);
+  });
+
+  it("rejects a non-CREDITED deposit that carries a ledgerTransactionId (Phase 8 hardening)", async () => {
+    const user = await createTestUser();
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+    const asset = await getAsset("USDC");
+    const address = await provisionAddress(assetNetwork.id, `0xPendingWithLedgerRef${Date.now()}${Math.random()}`);
+
+    await expect(
+      prisma.$executeRaw`
+        INSERT INTO "deposits" ("id", "userId", "assetId", "assetNetworkId", "walletAddressId", "txHash", "amount", "confirmations", "requiredConfirmations", "status", "detectedAt", "ledgerTransactionId")
+        VALUES (gen_random_uuid()::text, ${user.id}, ${asset.id}, ${assetNetwork.id}, ${address.id}, ${"0xpendingwithledgerref" + Date.now()}, 10, 0, 12, 'PENDING', NOW(), gen_random_uuid()::text)
+      `,
+    ).rejects.toThrow(/deposits_credited_consistency_check/);
+  });
+
   it("rejects a non-positive order quantity", async () => {
     const user = await createTestUser();
     const category = await prisma.marketCategory.create({

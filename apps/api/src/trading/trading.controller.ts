@@ -1,7 +1,9 @@
 import { BadRequestException, Body, Controller, Get, Param, Post, Query, UseGuards } from "@nestjs/common";
+import { Throttle } from "@nestjs/throttler";
 import { OrderStatus } from "@prisma/client";
 import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
+import { TRADING_THROTTLE } from "../common/throttle-presets";
 import { CreateOrderDto } from "./dto/create-order.dto";
 import { FillsService } from "./fills/fills.service";
 import { OrderBookService } from "./order-book/order-book.service";
@@ -31,6 +33,7 @@ export class TradingController {
 
   @Post("orders")
   @UseGuards(JwtAuthGuard)
+  @Throttle(TRADING_THROTTLE)
   async createOrder(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateOrderDto): Promise<OrderPlacementResponse> {
     try {
       const order = await this.ordersService.create(user.id, dto);
@@ -55,6 +58,7 @@ export class TradingController {
 
   @Post("orders/:id/retry-matching")
   @UseGuards(JwtAuthGuard)
+  @Throttle(TRADING_THROTTLE)
   async retryMatching(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string): Promise<OrderPlacementResponse> {
     try {
       return await this.ordersService.retryMatching(user.id, id);
@@ -69,6 +73,7 @@ export class TradingController {
   // read as an ordering signal (see Order.sequence's docblock).
   @Post("orders/:id/cancel")
   @UseGuards(JwtAuthGuard)
+  @Throttle(TRADING_THROTTLE)
   async cancelOrder(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string) {
     return toOrderView(await this.ordersService.cancel(user.id, id));
   }

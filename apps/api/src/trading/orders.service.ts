@@ -199,6 +199,30 @@ export class OrdersService {
         tx,
         "clientOrderId",
         async () => {
+          // Re-validate the market is still OPEN INSIDE this SERIALIZABLE
+          // transaction, not just from the plain (non-transactional) read
+          // above — that earlier read can go stale if MarketsService.close()
+          // commits concurrently between it and this point. Re-reading via
+          // `tx` here means Postgres's serializable snapshot isolation
+          // genuinely prevents a new order from being funded/created
+          // against a market that is concurrently closing: either this
+          // transaction sees close()'s already-committed CLOSED status, or
+          // — under true concurrency — a write-skew is detected and this
+          // transaction is retried by SerializableTransactionRunner, at
+          // which point it will see the final state. Without this, a
+          // stray order could be created (and funded) for a CLOSED market
+          // moments after MarketsService.close() already expired every
+          // order that existed at that instant, leaving it resting
+          // forever and blocking resolution's own defensive
+          // "no resting orders" check.
+          const currentMarket = await tx.market.findUniqueOrThrow({ where: { id: market.id } });
+          if (currentMarket.status !== MarketStatus.OPEN) {
+            throw new BadRequestException("Market is not open for trading");
+          }
+          if (currentMarket.closeTime && currentMarket.closeTime.getTime() <= Date.now()) {
+            throw new BadRequestException("Market has passed its close time");
+          }
+
           await this.riskValidator.validate(
             { userId, marketId: market.id, outcomeId: outcome.id, side: dto.side, price, quantity },
             tx,
