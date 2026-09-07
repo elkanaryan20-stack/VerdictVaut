@@ -1,7 +1,7 @@
 "use client";
 
-import type { MarketListFilterStatus, MarketStatus, OrderStatus } from "@verdictvaut/shared-types";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { MarketListFilterStatus, MarketRef, MarketStatus, OrderStatus, PositionSettlement } from "@verdictvaut/shared-types";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   cancelOrder,
   fetchMarket,
@@ -162,6 +162,59 @@ export function useMyFills(options: ListMyFillsOptions) {
     queryFn: () => fetchMyFills(options),
     placeholderData: (previous) => previous,
   });
+}
+
+export type SettlementWithMarket = PositionSettlement & { market: MarketRef | null };
+
+/**
+ * Cross-market settlement/payout history. There is no backend endpoint
+ * for "all of my settlements" — only GET /markets/:id/settlement/mine,
+ * scoped to one market at a time (see MarketResolutionPanel, the other
+ * consumer of that same endpoint). This derives the set of markets worth
+ * asking by reading `settledAt` off the user's own positions (already
+ * fetched for the Positions tab) and fans out one settlement request per
+ * distinct market — bounded by how many markets this specific user has
+ * ever settled in, not a platform-wide scan, so no backend addition is
+ * warranted for what is fundamentally a join the frontend can do cheaply.
+ */
+export function useMySettlements(enabled = true) {
+  const positionsQuery = useMyPositions(enabled);
+  const settledPositions = (positionsQuery.data ?? []).filter((p) => p.settledAt !== null);
+  const marketIds = Array.from(new Set(settledPositions.map((p) => p.marketId)));
+  const marketById = new Map(settledPositions.filter((p) => p.outcome?.market).map((p) => [p.marketId, p.outcome!.market]));
+
+  const settlementQueries = useQueries({
+    queries: marketIds.map((marketId) => ({
+      queryKey: tradingKeys.mySettlement(marketId),
+      queryFn: () => fetchMySettlement(marketId),
+      enabled,
+    })),
+  });
+
+  const isLoading = positionsQuery.isLoading || settlementQueries.some((q) => q.isLoading);
+  // A failure fetching one market's settlements must never hide the
+  // settlements that DID load successfully for other markets — only
+  // "we have nothing to show" (no positions at all, or every settlement
+  // request failed) counts as a hard error; a mix of some-succeeded/
+  // some-failed instead surfaces as `hasPartialError` alongside the
+  // partial `items` list, so the caller can show both.
+  const hasPartialError = settlementQueries.some((q) => q.isError);
+  const isError = positionsQuery.isError || (marketIds.length > 0 && settlementQueries.every((q) => q.isError));
+
+  const items: SettlementWithMarket[] = settlementQueries
+    .flatMap((q) => q.data ?? [])
+    .map((settlement) => ({ ...settlement, market: marketById.get(settlement.marketId) ?? null }))
+    .sort((a, b) => {
+      if (a.settledAt === b.settledAt) return 0;
+      return a.settledAt < b.settledAt ? 1 : -1;
+    });
+
+  function refetch() {
+    positionsQuery.refetch();
+    settlementQueries.forEach((q) => q.refetch());
+  }
+
+  return { items, isLoading, isError, hasPartialError, refetch };
 }
 
 /**

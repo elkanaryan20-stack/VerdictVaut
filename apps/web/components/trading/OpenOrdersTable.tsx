@@ -2,7 +2,7 @@
 
 import type { Order } from "@verdictvaut/shared-types";
 import { ApiError } from "../../lib/api-client";
-import { formatAmount, formatExactAmount } from "../../lib/format";
+import { formatAmount, formatDateTime, formatExactAmount } from "../../lib/format";
 import { useCancelOrder, useMyOrders } from "../../lib/trading/hooks";
 import { isCancellableOrderStatus } from "../../lib/trading/order-status";
 import { Button } from "../ui/Button";
@@ -91,11 +91,12 @@ export function OpenOrdersTable() {
                     {order.side}
                   </span>
                   <span className="truncate text-sm text-white">{order.market?.title ?? order.marketId}</span>
+                  <span className="shrink-0 text-xs text-white/40">{order.outcome?.label ?? order.outcomeId}</span>
                   <OrderStatusBadge status={order.status} />
                 </div>
                 <p className="mt-1 text-xs text-white/40">
                   {formatAmount(order.remainingQuantity)} of {formatAmount(order.quantity)} remaining
-                  {order.price && <> @ {formatExactAmount(order.price)}</>}
+                  {order.price && <> @ {formatExactAmount(order.price)}</>} · {formatDateTime(order.createdAt)}
                 </p>
               </div>
               {isCancellableOrderStatus(order.status) && <CancelButton order={order} />}

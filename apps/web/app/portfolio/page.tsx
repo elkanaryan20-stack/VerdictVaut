@@ -6,12 +6,14 @@ import { FillsTable } from "../../components/trading/FillsTable";
 import { OpenOrdersTable } from "../../components/trading/OpenOrdersTable";
 import { OrderHistoryTable } from "../../components/trading/OrderHistoryTable";
 import { PositionsTable } from "../../components/trading/PositionsTable";
+import { SettlementHistoryTable } from "../../components/trading/SettlementHistoryTable";
 
 const TABS = [
   { value: "open-orders", label: "Open orders" },
   { value: "positions", label: "Positions" },
   { value: "history", label: "History" },
   { value: "fills", label: "Fills" },
+  { value: "settlement", label: "Settlement" },
 ] as const;
 
 type Tab = (typeof TABS)[number]["value"];
@@ -49,6 +51,7 @@ export default function PortfolioPage() {
       {tab === "positions" && <PositionsTable />}
       {tab === "history" && <OrderHistoryTable />}
       {tab === "fills" && <FillsTable />}
+      {tab === "settlement" && <SettlementHistoryTable />}
     </div>
   );
 }

@@ -3,7 +3,7 @@
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { formatAmount, formatDateTime, formatExactAmount } from "../../lib/format";
-import { useMyFills } from "../../lib/trading/hooks";
+import { useMarkets, useMyFills } from "../../lib/trading/hooks";
 import { Badge } from "../ui/Badge";
 import { Card, CardBody, CardHeader, CardTitle } from "../ui/Card";
 import { Skeleton } from "../ui/Skeleton";
@@ -13,6 +13,11 @@ const PAGE_SIZE = 10;
 export function FillsTable() {
   const [page, setPage] = useState(1);
   const { data, isLoading, isError, isPlaceholderData, refetch } = useMyFills({ page, pageSize: PAGE_SIZE });
+  // Fills only carry raw marketId/outcomeId (see FillSchema's docblock) —
+  // this is a purely cosmetic label lookup against already-public market
+  // data, never a source of any financial figure shown below.
+  const marketsQuery = useMarkets();
+  const marketById = new Map((marketsQuery.data ?? []).map((m) => [m.id, m]));
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.pageSize)) : 1;
 
@@ -50,23 +55,28 @@ export function FillsTable() {
       {data && !isLoading && data.items.length > 0 && (
         <div className={isPlaceholderData ? "opacity-60 transition-opacity" : "transition-opacity"}>
           <div className="divide-y divide-vault-border">
-            {data.items.map((fill) => (
-              <div key={fill.fillId} className="flex items-center justify-between gap-3 px-5 py-3">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className={fill.side === "BUY" ? "text-xs font-semibold text-vault-up" : "text-xs font-semibold text-vault-down"}>
-                      {fill.side}
-                    </span>
-                    <span className="text-xs text-white/40">{formatDateTime(fill.executedAt)}</span>
-                    {fill.isMaker && <Badge tone="neutral">Maker</Badge>}
+            {data.items.map((fill) => {
+              const market = marketById.get(fill.marketId);
+              const outcomeLabel = market?.outcomes.find((o) => o.id === fill.outcomeId)?.label ?? fill.outcomeId;
+              return (
+                <div key={fill.fillId} className="flex items-center justify-between gap-3 px-5 py-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className={fill.side === "BUY" ? "text-xs font-semibold text-vault-up" : "text-xs font-semibold text-vault-down"}>
+                        {fill.side}
+                      </span>
+                      <span className="truncate text-sm text-white">{market?.title ?? fill.marketId}</span>
+                      <span className="shrink-0 text-xs text-white/40">{outcomeLabel}</span>
+                      {fill.isMaker && <Badge tone="neutral">Maker</Badge>}
+                    </div>
+                    <p className="mt-1 text-xs text-white/40">
+                      {formatAmount(fill.quantity)} @ {formatExactAmount(fill.price)}
+                      {Number(fill.fee) > 0 && <> · fee {formatAmount(fill.fee)}</>} · {formatDateTime(fill.executedAt)}
+                    </p>
                   </div>
-                  <p className="mt-1 text-xs text-white/40">
-                    {formatAmount(fill.quantity)} @ {formatExactAmount(fill.price)}
-                    {Number(fill.fee) > 0 && <> · fee {formatAmount(fill.fee)}</>}
-                  </p>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           <div className="flex items-center justify-between border-t border-vault-border px-5 py-3">

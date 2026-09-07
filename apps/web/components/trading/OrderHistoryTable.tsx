@@ -99,6 +99,7 @@ export function OrderHistoryTable() {
                       {order.side}
                     </span>
                     <span className="truncate text-sm text-white">{order.market?.title ?? order.marketId}</span>
+                    <span className="shrink-0 text-xs text-white/40">{order.outcome?.label ?? order.outcomeId}</span>
                     <OrderStatusBadge status={order.status} />
                   </div>
                   <p className="mt-1 text-xs text-white/40">
