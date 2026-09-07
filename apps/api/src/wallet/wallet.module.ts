@@ -22,11 +22,16 @@ import { DepositsService } from "./deposits/deposits.service";
 import { ManualBroadcastExecutor } from "./executors/manual-broadcast.executor";
 import { ProductionCustodyExecutor } from "./executors/production-custody.executor";
 import { WithdrawalExecutorFactory } from "./executors/withdrawal-executor.factory";
+import { DeferredComplianceGate } from "./withdrawals/compliance/deferred-compliance-gate";
+import { WITHDRAWAL_COMPLIANCE_GATE } from "./withdrawals/compliance/withdrawal-compliance-gate.interface";
+import { WITHDRAWAL_FEE_CALCULATOR } from "./withdrawals/fees/withdrawal-fee-calculator.interface";
+import { ZeroWithdrawalFeeCalculator } from "./withdrawals/fees/zero-withdrawal-fee.calculator";
 import { WithdrawalsController } from "./withdrawals/withdrawals.controller";
 import { WithdrawalsService } from "./withdrawals/withdrawals.service";
 import { ReconciliationService } from "./reconciliation/reconciliation.service";
 import { DepositReprocessingService } from "./watchers/deposit-reprocessing.service";
 import { DepositWatcherService } from "./watchers/deposit-watcher.service";
+import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service";
 
 @Module({
   imports: [LedgerModule],
@@ -55,6 +60,9 @@ import { DepositWatcherService } from "./watchers/deposit-watcher.service";
     CustodyProviderFactory,
     DepositWatcherService,
     DepositReprocessingService,
+    WithdrawalWatcherService,
+    { provide: WITHDRAWAL_FEE_CALCULATOR, useClass: ZeroWithdrawalFeeCalculator },
+    { provide: WITHDRAWAL_COMPLIANCE_GATE, useClass: DeferredComplianceGate },
   ],
   exports: [
     AssetsNetworksService,

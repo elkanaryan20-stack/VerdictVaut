@@ -182,12 +182,20 @@ export class AdminController {
     return this.withdrawalsService.listAll();
   }
 
+  // Registered before "withdrawals/:id/approve" etc. is unnecessary —
+  // those are POST, this is GET, so there's no literal-segment ordering
+  // conflict — but kept adjacent to listWithdrawals for readability.
+  @Get("withdrawals/:id")
+  getWithdrawal(@Param("id") id: string) {
+    return this.withdrawalsService.getById(id);
+  }
+
   @Post("withdrawals/:id/approve")
   @Roles(UserRole.SUPER_ADMIN)
   @Throttle(ADMIN_MUTATION_THROTTLE)
   async approveWithdrawal(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
     const before = await this.withdrawalsService.getById(id);
-    const updated = await this.withdrawalsService.approve(id);
+    const updated = await this.withdrawalsService.approve(id, admin.id);
     await this.auditLogService.record({
       actorId: admin.id,
       action: "withdrawal.approve",
@@ -209,7 +217,7 @@ export class AdminController {
     @Body() dto: RejectWithdrawalDto,
   ) {
     const before = await this.withdrawalsService.getById(id);
-    const updated = await this.withdrawalsService.reject(id, dto.reason);
+    const updated = await this.withdrawalsService.reject(id, dto.reason, admin.id);
     await this.auditLogService.record({
       actorId: admin.id,
       action: "withdrawal.reject",
@@ -221,6 +229,18 @@ export class AdminController {
       idempotencyKey: id,
     });
     return updated;
+  }
+
+  // Read + audit only — never mutates the withdrawal, reservation, or
+  // ledger. See WithdrawalsService.reconcile's docblock; this endpoint
+  // is intentionally the ONLY way to compare a withdrawal's internal
+  // state against fresh on-chain evidence, and it never auto-corrects
+  // anything it finds.
+  @Post("withdrawals/:id/reconcile")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  reconcileWithdrawal(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    return this.withdrawalsService.reconcile(id, admin.id);
   }
 
   @Post("withdrawals/:id/broadcast")

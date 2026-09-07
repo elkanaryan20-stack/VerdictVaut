@@ -9,6 +9,8 @@ import {
   DepositSchema,
   PaginatedDeposits,
   PaginatedDepositsSchema,
+  Withdrawal,
+  WithdrawalSchema,
 } from "@verdictvaut/shared-types";
 import { z } from "zod";
 import { apiFetch } from "../api-client";
@@ -48,4 +50,34 @@ export async function fetchDeposits(page: number, pageSize: number): Promise<Pag
 export async function fetchDeposit(depositId: string): Promise<Deposit> {
   const data = await apiFetch<unknown>(`/wallet/deposits/${depositId}`);
   return parseOrThrow(DepositSchema, data, "GET /wallet/deposits/:id");
+}
+
+export interface RequestWithdrawalInput {
+  assetSymbol: string;
+  networkCode: string;
+  amount: string;
+  destinationAddress: string;
+  destinationTag?: string;
+  /** Idempotency key — supply your own to make a retried submission safe; the server generates one if omitted. */
+  clientWithdrawalId?: string;
+}
+
+export async function requestWithdrawal(input: RequestWithdrawalInput): Promise<Withdrawal> {
+  const data = await apiFetch<unknown>("/wallet/withdrawals", { method: "POST", body: JSON.stringify(input) });
+  return parseOrThrow(WithdrawalSchema, data, "POST /wallet/withdrawals");
+}
+
+export async function fetchWithdrawals(): Promise<Withdrawal[]> {
+  const data = await apiFetch<unknown>("/wallet/withdrawals");
+  return parseOrThrow(z.array(WithdrawalSchema), data, "GET /wallet/withdrawals");
+}
+
+export async function fetchWithdrawal(withdrawalId: string): Promise<Withdrawal> {
+  const data = await apiFetch<unknown>(`/wallet/withdrawals/${withdrawalId}`);
+  return parseOrThrow(WithdrawalSchema, data, "GET /wallet/withdrawals/:id");
+}
+
+export async function cancelWithdrawal(withdrawalId: string): Promise<Withdrawal> {
+  const data = await apiFetch<unknown>(`/wallet/withdrawals/${withdrawalId}/cancel`, { method: "POST" });
+  return parseOrThrow(WithdrawalSchema, data, "POST /wallet/withdrawals/:id/cancel");
 }

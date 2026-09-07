@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import {
   Activity,
   ArrowDownToLine,
+  ArrowUpFromLine,
   Briefcase,
   CircleUserRound,
   HelpCircle,
@@ -31,6 +32,9 @@ const PRIMARY_NAV_ITEMS = [
 const SECONDARY_NAV_ITEMS = [
   { href: "/wallet/deposit", label: "Deposit", icon: ArrowDownToLine, exact: false },
   { href: "/wallet/deposits", label: "Deposit history", icon: History, exact: false },
+  // exact: true so viewing /wallet/withdrawals/* never lights up "Withdraw" too (both share the "/wallet/withdraw" prefix).
+  { href: "/wallet/withdraw", label: "Withdraw", icon: ArrowUpFromLine, exact: true },
+  { href: "/wallet/withdrawals", label: "Withdrawal history", icon: History, exact: false },
   { href: "/help", label: "Help & FAQ", icon: HelpCircle, exact: false },
 ];
 

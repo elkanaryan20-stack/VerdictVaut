@@ -99,6 +99,63 @@ describe("Database-level financial invariants (real Postgres)", () => {
     ).rejects.toThrow(/deposits_credited_consistency_check/);
   });
 
+  it("rejects a withdrawal inserted directly as BROADCAST with no txHash (Phase 9 hardening)", async () => {
+    const user = await createTestUser();
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+
+    await expect(
+      prisma.$executeRaw`
+        INSERT INTO "withdrawals" ("id", "userId", "assetNetworkId", "destinationAddress", "amount", "status", "clientWithdrawalId", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid()::text, ${user.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 'BROADCAST', ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
+      `,
+    ).rejects.toThrow(/withdrawals_broadcast_requires_txhash_check/);
+  });
+
+  it("allows a withdrawal inserted as BROADCAST when a txHash is present (Phase 9 hardening)", async () => {
+    const user = await createTestUser();
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+
+    await expect(
+      prisma.$executeRaw`
+        INSERT INTO "withdrawals" ("id", "userId", "assetNetworkId", "destinationAddress", "amount", "status", "txHash", "clientWithdrawalId", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid()::text, ${user.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 'BROADCAST', '0xrealhash', ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
+      `,
+    ).resolves.toBeDefined();
+  });
+
+  it("rejects a withdrawal whose fee is not strictly less than its amount (Phase 9 hardening)", async () => {
+    const user = await createTestUser();
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+
+    await expect(
+      prisma.$executeRaw`
+        INSERT INTO "withdrawals" ("id", "userId", "assetNetworkId", "destinationAddress", "amount", "fee", "clientWithdrawalId", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid()::text, ${user.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 10, ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
+      `,
+    ).rejects.toThrow(/withdrawals_fee_less_than_amount_check/);
+  });
+
+  it("enforces uniqueness of (userId, clientWithdrawalId) at the database level (Phase 9 hardening)", async () => {
+    const user = await createTestUser();
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+    const clientWithdrawalId = "dup-ck-" + Date.now();
+
+    await prisma.withdrawal.create({
+      data: { userId: user.id, assetNetworkId: assetNetwork.id, destinationAddress: "0x000000000000000000000000000000000000dEaD", amount: "10", clientWithdrawalId },
+    });
+
+    // Matches this file's own established pattern for unique-constraint
+    // assertions (see "enforces the idempotencyKey uniqueness on
+    // ledger_transactions") — a plain Prisma Client P2002, not a raw-SQL
+    // message regex, which for a unique (as opposed to CHECK) violation
+    // doesn't surface the constraint name in the same way.
+    await expect(
+      prisma.withdrawal.create({
+        data: { userId: user.id, assetNetworkId: assetNetwork.id, destinationAddress: "0x000000000000000000000000000000000000dEaD", amount: "20", clientWithdrawalId },
+      }),
+    ).rejects.toThrow(Prisma.PrismaClientKnownRequestError);
+  });
+
   it("rejects a non-positive order quantity", async () => {
     const user = await createTestUser();
     const category = await prisma.marketCategory.create({

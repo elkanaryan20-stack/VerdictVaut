@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AssetNetworkRefSchema, DepositSchema } from "./wallet";
+import { AssetNetworkRefSchema, DepositSchema, WithdrawalSchema } from "./wallet";
 
 /**
  * Shapes mirroring the backend's actual API responses for the Phase 7
@@ -30,6 +30,14 @@ export const StaleDepositSchema = z.object({
 });
 export type StaleDeposit = z.infer<typeof StaleDepositSchema>;
 export const StaleDepositListSchema = z.array(StaleDepositSchema);
+
+/** GET /admin/withdrawals and GET /admin/withdrawals/:id — always carries the withdrawing user and the asset/network, unlike the user-facing withdrawal views. */
+export const AdminWithdrawalSchema = WithdrawalSchema.extend({
+  user: z.object({ id: z.string(), email: z.string() }),
+  assetNetwork: AssetNetworkRefSchema,
+});
+export type AdminWithdrawal = z.infer<typeof AdminWithdrawalSchema>;
+export const AdminWithdrawalListSchema = z.array(AdminWithdrawalSchema);
 
 export const AUDIT_ACTOR_TYPES = ["USER", "ADMIN", "SYSTEM"] as const;
 export const AuditActorTypeSchema = z.enum(AUDIT_ACTOR_TYPES);

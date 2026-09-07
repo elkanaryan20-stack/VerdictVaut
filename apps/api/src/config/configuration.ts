@@ -18,6 +18,14 @@ export interface AppConfig {
     enabled: boolean;
     pollIntervalMs: number;
   };
+  // Same off-by-default reasoning as chainWatcher — polls
+  // BROADCAST/CONFIRMING withdrawals via CustodyProvider's read-only
+  // chain queries and calls WithdrawalsService.recordConfirmation() with
+  // real observed data (see WithdrawalWatcherService).
+  withdrawalWatcher: {
+    enabled: boolean;
+    pollIntervalMs: number;
+  };
 }
 
 export default (): AppConfig => ({
@@ -44,5 +52,9 @@ export default (): AppConfig => ({
   chainWatcher: {
     enabled: process.env.CHAIN_WATCHER_ENABLED === "true",
     pollIntervalMs: parseInt(process.env.CHAIN_WATCHER_POLL_INTERVAL_MS ?? "30000", 10),
+  },
+  withdrawalWatcher: {
+    enabled: process.env.WITHDRAWAL_WATCHER_ENABLED === "true",
+    pollIntervalMs: parseInt(process.env.WITHDRAWAL_WATCHER_POLL_INTERVAL_MS ?? "30000", 10),
   },
 });

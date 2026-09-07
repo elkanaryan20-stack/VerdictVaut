@@ -12,13 +12,15 @@ export function AssetSelector({
   assets,
   selected,
   onSelect,
+  ariaLabel = "Select an asset to deposit",
 }: {
   assets: AssetOption[];
   selected: string | null;
   onSelect: (symbol: string) => void;
+  ariaLabel?: string;
 }) {
   return (
-    <div role="radiogroup" aria-label="Select an asset to deposit" className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+    <div role="radiogroup" aria-label={ariaLabel} className="grid grid-cols-2 gap-2 sm:grid-cols-3">
       {assets.map((asset) => {
         const isSelected = asset.symbol === selected;
         return (

@@ -1,7 +1,18 @@
 "use client";
 
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { fetchAdminDeposits, fetchAuditLogs, fetchStaleDeposits, ListAuditLogsOptions, reprocessDeposit } from "./api";
+import {
+  approveWithdrawal,
+  fetchAdminDeposits,
+  fetchAdminWithdrawal,
+  fetchAdminWithdrawals,
+  fetchAuditLogs,
+  fetchStaleDeposits,
+  ListAuditLogsOptions,
+  reconcileWithdrawal,
+  rejectWithdrawal,
+  reprocessDeposit,
+} from "./api";
 import { fetchMarketResolutionStatus, fetchMarkets } from "../trading/api";
 
 export const adminKeys = {
@@ -9,6 +20,8 @@ export const adminKeys = {
   staleDeposits: ["admin", "deposits", "stale"] as const,
   auditLogs: (options: ListAuditLogsOptions) => ["admin", "audit-logs", options.resourceType ?? null, options.actorId ?? null] as const,
   resolvingMarkets: ["admin", "resolving-markets"] as const,
+  withdrawals: ["admin", "withdrawals"] as const,
+  withdrawal: (id: string) => ["admin", "withdrawal", id] as const,
 };
 
 export function useAdminDeposits() {
@@ -40,6 +53,48 @@ export function useReprocessDeposit() {
       queryClient.invalidateQueries({ queryKey: adminKeys.deposits });
       queryClient.invalidateQueries({ queryKey: adminKeys.staleDeposits });
     },
+  });
+}
+
+export function useAdminWithdrawals() {
+  return useQuery({
+    queryKey: adminKeys.withdrawals,
+    queryFn: fetchAdminWithdrawals,
+  });
+}
+
+export function useAdminWithdrawal(withdrawalId: string | null) {
+  return useQuery({
+    queryKey: adminKeys.withdrawal(withdrawalId ?? ""),
+    queryFn: () => fetchAdminWithdrawal(withdrawalId!),
+    enabled: Boolean(withdrawalId),
+  });
+}
+
+function invalidateAfterWithdrawalMutation(queryClient: ReturnType<typeof useQueryClient>, withdrawalId: string) {
+  queryClient.invalidateQueries({ queryKey: adminKeys.withdrawals });
+  queryClient.invalidateQueries({ queryKey: adminKeys.withdrawal(withdrawalId) });
+}
+
+export function useApproveWithdrawal() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (withdrawalId: string) => approveWithdrawal(withdrawalId),
+    onSuccess: (_result, withdrawalId) => invalidateAfterWithdrawalMutation(queryClient, withdrawalId),
+  });
+}
+
+export function useRejectWithdrawal() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ withdrawalId, reason }: { withdrawalId: string; reason: string }) => rejectWithdrawal(withdrawalId, reason),
+    onSuccess: (_result, { withdrawalId }) => invalidateAfterWithdrawalMutation(queryClient, withdrawalId),
+  });
+}
+
+export function useReconcileWithdrawal() {
+  return useMutation({
+    mutationFn: (withdrawalId: string) => reconcileWithdrawal(withdrawalId),
   });
 }
 

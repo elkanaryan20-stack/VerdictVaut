@@ -10,12 +10,20 @@ export default function WalletOverviewPage() {
           <h1 className="font-display text-2xl font-semibold text-white">Wallet</h1>
           <p className="mt-1 text-sm text-white/50">Your real ledger balances — never simulated, always as reported by VerdictVaut.</p>
         </div>
-        <Link
-          href="/wallet/deposits"
-          className="rounded-md border border-vault-border px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-vault-gold"
-        >
-          View deposit history
-        </Link>
+        <div className="flex flex-wrap gap-2">
+          <Link
+            href="/wallet/deposits"
+            className="rounded-md border border-vault-border px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-vault-gold"
+          >
+            View deposit history
+          </Link>
+          <Link
+            href="/wallet/withdraw"
+            className="rounded-md border border-vault-border px-3 py-1.5 text-xs font-medium text-white/70 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-vault-gold"
+          >
+            Withdraw
+          </Link>
+        </div>
       </div>
 
       <BalanceSummaryCards />

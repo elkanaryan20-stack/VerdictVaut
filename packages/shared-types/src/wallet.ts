@@ -141,6 +141,90 @@ export type PaginatedDeposits = z.infer<typeof PaginatedDepositsSchema>;
  * conversion exists in this system) — "total" here means this asset's
  * own total, not a portfolio-wide number.
  */
+/**
+ * Withdrawal lifecycle — see apps/api WithdrawalsService's own docblock
+ * for the full state-machine diagram. REQUESTED never actually persists
+ * as an externally-observable status (reservation happens atomically
+ * with creation — see request()); CANCELLED is user-initiated (only
+ * reachable before SUPER_ADMIN review begins), REJECTED/FAILED are
+ * admin/system-initiated.
+ */
+export const WITHDRAWAL_STATUSES = [
+  "REQUESTED",
+  "VALIDATED",
+  "RISK_REVIEW",
+  "APPROVED",
+  "PENDING_MANUAL_BROADCAST",
+  "BROADCASTING",
+  "BROADCAST",
+  "CONFIRMING",
+  "CONFIRMED",
+  "CREDITED",
+  "REJECTED",
+  "FAILED",
+  "CANCELLED",
+] as const;
+export const WithdrawalStatusSchema = z.enum(WITHDRAWAL_STATUSES);
+export type WithdrawalStatus = z.infer<typeof WithdrawalStatusSchema>;
+
+/**
+ * The honest result of the backend's WithdrawalComplianceGate at request
+ * time — DEFERRED (the current default) means no real KYC/AML/sanctions
+ * system is wired up yet; it is never rendered as "approved".
+ */
+export const WithdrawalComplianceDecisionSchema = z.enum(["PASS", "BLOCKED", "DEFERRED"]);
+export type WithdrawalComplianceDecision = z.infer<typeof WithdrawalComplianceDecisionSchema>;
+
+export const WithdrawalSchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  assetNetworkId: z.string(),
+  destinationAddress: z.string(),
+  destinationTag: z.string().nullable(),
+  amount: z.string(),
+  fee: z.string(),
+  status: WithdrawalStatusSchema,
+  txHash: z.string().nullable(),
+  custodyReference: z.string().nullable(),
+  broadcastByAdminId: z.string().nullable(),
+  broadcastAt: z.string().nullable(),
+  confirmedAt: z.string().nullable(),
+  failureReason: z.string().nullable(),
+  complianceDecision: WithdrawalComplianceDecisionSchema.nullable(),
+  complianceNote: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  // Populated on every user- and admin-facing read endpoint (never on
+  // the raw row alone) — see WithdrawalsService.getById/getOwned/listMine.
+  assetNetwork: AssetNetworkRefSchema.optional(),
+});
+export type Withdrawal = z.infer<typeof WithdrawalSchema>;
+
+/**
+ * GET /admin/withdrawals/:id/reconcile's result — a fresh, real
+ * comparison of internal state against on-chain evidence via
+ * CustodyProvider, never a cached figure. Read + audit only: this never
+ * represents a mutation, and `discrepancy` is the one honest, narrow
+ * signal the backend computes (see WithdrawalsService.reconcile's
+ * docblock) — never an auto-fix.
+ */
+export const ChainTransactionStatusSchema = z.object({
+  txHash: z.string(),
+  assetNetworkId: z.string(),
+  confirmations: z.number().int().nonnegative(),
+  amount: z.string(),
+  status: z.enum(["not_found", "pending", "confirmed"]),
+});
+export type ChainTransactionStatus = z.infer<typeof ChainTransactionStatusSchema>;
+
+export const WithdrawalReconcileResultSchema = z.object({
+  withdrawal: WithdrawalSchema,
+  chainStatus: ChainTransactionStatusSchema.nullable(),
+  discrepancy: z.boolean(),
+  note: z.string().nullable(),
+});
+export type WithdrawalReconcileResult = z.infer<typeof WithdrawalReconcileResultSchema>;
+
 export const AssetBalanceSchema = z.object({
   assetId: z.string(),
   symbol: z.enum(SUPPORTED_ASSET_SYMBOLS),

@@ -1,4 +1,5 @@
 import { AdminDepositsTable } from "../../components/admin/AdminDepositsTable";
+import { AdminWithdrawalsTable } from "../../components/admin/AdminWithdrawalsTable";
 import { AuditLogFeed } from "../../components/admin/AuditLogFeed";
 import { MarketsNeedingAttention } from "../../components/admin/MarketsNeedingAttention";
 
@@ -14,6 +15,7 @@ export default function AdminPage() {
       </div>
 
       <MarketsNeedingAttention />
+      <AdminWithdrawalsTable />
       <AdminDepositsTable />
       <AuditLogFeed />
     </div>

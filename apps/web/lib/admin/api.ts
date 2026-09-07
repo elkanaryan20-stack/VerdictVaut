@@ -1,4 +1,16 @@
-import { AdminDeposit, AdminDepositListSchema, AuditLogEntry, AuditLogEntryListSchema, StaleDeposit, StaleDepositListSchema } from "@verdictvaut/shared-types";
+import {
+  AdminDeposit,
+  AdminDepositListSchema,
+  AdminWithdrawal,
+  AdminWithdrawalListSchema,
+  AdminWithdrawalSchema,
+  AuditLogEntry,
+  AuditLogEntryListSchema,
+  StaleDeposit,
+  StaleDepositListSchema,
+  WithdrawalReconcileResult,
+  WithdrawalReconcileResultSchema,
+} from "@verdictvaut/shared-types";
 import { apiFetch } from "../api-client";
 import { parseOrThrow } from "../api-validation";
 
@@ -35,4 +47,32 @@ export async function fetchAuditLogs(options: ListAuditLogsOptions = {}): Promis
  */
 export async function reprocessDeposit(depositId: string): Promise<void> {
   await apiFetch<unknown>(`/admin/deposits/${encodeURIComponent(depositId)}/reprocess`, { method: "POST" });
+}
+
+export async function fetchAdminWithdrawals(): Promise<AdminWithdrawal[]> {
+  const data = await apiFetch<unknown>("/admin/withdrawals");
+  return parseOrThrow(AdminWithdrawalListSchema, data, "GET /admin/withdrawals");
+}
+
+export async function fetchAdminWithdrawal(withdrawalId: string): Promise<AdminWithdrawal> {
+  const data = await apiFetch<unknown>(`/admin/withdrawals/${encodeURIComponent(withdrawalId)}`);
+  return parseOrThrow(AdminWithdrawalSchema, data, "GET /admin/withdrawals/:id");
+}
+
+/** SUPER_ADMIN only (backend-enforced). The caller refetches the withdrawal afterward — never trusts this call's own response as the source of truth for what happened. */
+export async function approveWithdrawal(withdrawalId: string): Promise<void> {
+  await apiFetch<unknown>(`/admin/withdrawals/${encodeURIComponent(withdrawalId)}/approve`, { method: "POST" });
+}
+
+export async function rejectWithdrawal(withdrawalId: string, reason: string): Promise<void> {
+  await apiFetch<unknown>(`/admin/withdrawals/${encodeURIComponent(withdrawalId)}/reject`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** Read + audit only — never mutates the withdrawal (see WithdrawalsService.reconcile's docblock). Returns the real comparison so a SUPER_ADMIN can decide what, if anything, to do next. */
+export async function reconcileWithdrawal(withdrawalId: string): Promise<WithdrawalReconcileResult> {
+  const data = await apiFetch<unknown>(`/admin/withdrawals/${encodeURIComponent(withdrawalId)}/reconcile`, { method: "POST" });
+  return parseOrThrow(WithdrawalReconcileResultSchema, data, "POST /admin/withdrawals/:id/reconcile");
 }

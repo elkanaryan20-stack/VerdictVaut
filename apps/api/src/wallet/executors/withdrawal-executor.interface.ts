@@ -20,8 +20,8 @@ export interface WithdrawalExecutionRequest {
 }
 
 export type WithdrawalExecutionResult =
-  | { status: "broadcast"; txHash: string }
-  | { status: "awaiting_manual_broadcast" };
+  | { status: "broadcast"; txHash: string; custodyReference?: string }
+  | { status: "awaiting_manual_broadcast"; custodyReference?: string };
 
 /**
  * The one seam between "a withdrawal was approved" and "a transaction

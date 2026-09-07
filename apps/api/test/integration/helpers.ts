@@ -29,6 +29,9 @@ import { ConfirmationPolicyService } from "../../src/wallet/confirmation/confirm
 import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
 import { ProductionCustodyExecutor } from "../../src/wallet/executors/production-custody.executor";
 import { WithdrawalExecutorFactory } from "../../src/wallet/executors/withdrawal-executor.factory";
+import { CustodyProviderFactory } from "../../src/wallet/custody/custody-provider.factory";
+import { DeferredComplianceGate } from "../../src/wallet/withdrawals/compliance/deferred-compliance-gate";
+import { ZeroWithdrawalFeeCalculator } from "../../src/wallet/withdrawals/fees/zero-withdrawal-fee.calculator";
 import { WithdrawalsService } from "../../src/wallet/withdrawals/withdrawals.service";
 import { ReconciliationService } from "../../src/wallet/reconciliation/reconciliation.service";
 import { DepositReprocessingService } from "../../src/wallet/watchers/deposit-reprocessing.service";
@@ -51,13 +54,51 @@ export const balancesService = new BalancesService(prisma);
 // fake factory (implementing the same narrow interface) so real DB
 // behavior (cursors, crediting, reconciliation discrepancies) is
 // exercised against real Postgres without any real network I/O — see
-// deposit-watcher-and-reconciliation.integration-spec.ts.
-export { DepositWatcherService, DepositReprocessingService, ReconciliationService };
+// deposit-watcher-and-reconciliation.integration-spec.ts. WithdrawalsService
+// itself is re-exported the same way, for a reconcile()-specific test to
+// build its own instance with a fake CustodyProviderFactory.
+export { DepositWatcherService, DepositReprocessingService, ReconciliationService, WithdrawalsService };
 
 const manualBroadcastExecutor = new ManualBroadcastExecutor();
 const productionCustodyExecutor = new ProductionCustodyExecutor();
-export const executorFactory = new WithdrawalExecutorFactory(prisma, manualBroadcastExecutor, productionCustodyExecutor);
-export const withdrawalsService = new WithdrawalsService(prisma, ledger, reservations, executorFactory, txRunner, auditLog);
+// Sandbox — matches this whole test harness's environment; the
+// production-fail-closed behavior (WithdrawalExecutorFactory.spec.ts)
+// is covered at the unit level with a fake ConfigService, not here.
+const sandboxConfig = { get: () => "sandbox" } as never;
+export const executorFactory = new WithdrawalExecutorFactory(
+  prisma,
+  sandboxConfig,
+  manualBroadcastExecutor,
+  productionCustodyExecutor,
+);
+
+// The shared withdrawalsService below never reaches
+// CustodyProviderFactory (only WithdrawalsService.reconcile() does) —
+// deliberately not wired to a real one, same reasoning as
+// DepositWatcherService/ReconciliationService above: no real network
+// I/O from importing this module. A reconcile()-specific test
+// constructs its OWN WithdrawalsService with a fake CustodyProvider,
+// the same pattern deposit-watcher-and-reconciliation.integration-spec.ts
+// already established.
+const unreachableCustodyProviderFactory = {
+  resolve: async () => {
+    throw new Error(
+      "CustodyProviderFactory should not be reached via the shared test withdrawalsService — construct a dedicated instance with a fake provider for reconcile()-specific tests.",
+    );
+  },
+} as unknown as CustodyProviderFactory;
+
+export const withdrawalsService = new WithdrawalsService(
+  prisma,
+  ledger,
+  reservations,
+  executorFactory,
+  unreachableCustodyProviderFactory,
+  txRunner,
+  auditLog,
+  new ZeroWithdrawalFeeCalculator(),
+  new DeferredComplianceGate(),
+);
 
 export const positionReservations = new PositionReservationService(prisma);
 export const positionsService = new PositionsService(prisma);

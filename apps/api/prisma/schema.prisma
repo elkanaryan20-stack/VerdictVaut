@@ -166,6 +166,15 @@ enum DepositStatus {
   FAILED
 }
 
+// REQUESTED never persists as an externally-observable state — it is
+// created and immediately advanced to RISK_REVIEW within the SAME
+// SERIALIZABLE transaction as its FundReservation (see
+// WithdrawalsService.request()), so there is never an observable moment
+// where a withdrawal row exists without its reservation already in
+// place. This is a stronger guarantee than an explicit separate
+// "RESERVED" state would give, so none is added.
+// CANCELLED is the user-initiated counterpart to REJECTED (admin-
+// initiated) — reachable only before SUPER_ADMIN review begins.
 enum WithdrawalStatus {
   REQUESTED
   VALIDATED
@@ -179,11 +188,24 @@ enum WithdrawalStatus {
   CREDITED
   REJECTED
   FAILED
+  CANCELLED
 }
 
 enum WithdrawalExecutorType {
   MANUAL_BROADCAST
   PRODUCTION_CUSTODY
+}
+
+// Phase 9: the explicit, honest result of WithdrawalComplianceGate.assess()
+// at request time — never silently treated as "approved". DEFERRED means
+// no real KYC/AML/sanctions system is wired up yet (the current default,
+// see DeferredComplianceGate) — the withdrawal still proceeds to human
+// SUPER_ADMIN review, which remains the one real gate today. BLOCKED
+// stops the request outright with the gate's own reason.
+enum WithdrawalComplianceDecision {
+  PASS
+  BLOCKED
+  DEFERRED
 }
 
 enum ReconciliationStatus {
@@ -866,13 +888,32 @@ model Withdrawal {
   destinationAddress    String
   destinationTag        String?
   amount                Decimal          @db.Decimal(36, 18)
+  // Platform fee, deducted from `amount` (never added on top of the
+  // user's reservation) — see ZeroWithdrawalFeeCalculator's docblock for
+  // why this stays 0 today and how the accounting works once it doesn't.
   fee                   Decimal          @default(0) @db.Decimal(36, 18)
   status                WithdrawalStatus @default(REQUESTED)
+  // Client-supplied (or server-generated when omitted) idempotency key —
+  // the withdrawal counterpart to Order.clientOrderId. Always populated,
+  // so the unique index below is never defeated by NULLs not colliding
+  // under Postgres's default unique-index semantics.
+  clientWithdrawalId    String
   txHash                String?
+  // Provider-side reference for this execution attempt (e.g. a custody
+  // provider's own request/transfer id), DISTINCT from txHash — a real
+  // ProductionCustodyExecutor may receive one before any on-chain
+  // transaction hash exists. Never a secret; safe to expose to the
+  // owning user and to SUPER_ADMIN.
+  custodyReference      String?
   broadcastByAdminId    String?
   broadcastAt           DateTime?
   confirmedAt           DateTime?
   failureReason         String?
+  // WithdrawalComplianceGate.assess()'s result at request time — see
+  // that interface's docblock. Never silently implied to be "passed";
+  // DEFERRED is recorded and surfaced honestly, not hidden.
+  complianceDecision    WithdrawalComplianceDecision?
+  complianceNote        String?
   createdAt             DateTime         @default(now())
   updatedAt             DateTime         @updatedAt
 
@@ -880,6 +921,7 @@ model Withdrawal {
   assetNetwork        AssetNetwork   @relation(fields: [assetNetworkId], references: [id])
   sourceWalletAddress WalletAddress? @relation(fields: [sourceWalletAddressId], references: [id])
 
+  @@unique([userId, clientWithdrawalId])
   @@index([userId, status])
   @@index([assetNetworkId, status])
   @@map("withdrawals")

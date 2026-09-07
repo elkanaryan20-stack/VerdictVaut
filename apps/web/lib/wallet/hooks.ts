@@ -1,14 +1,29 @@
 "use client";
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
-import { assignDepositAddress, fetchAssetNetworks, fetchBalances, fetchDeposit, fetchDeposits, fetchMyDepositAddresses } from "./api";
+import {
+  assignDepositAddress,
+  cancelWithdrawal,
+  fetchAssetNetworks,
+  fetchBalances,
+  fetchDeposit,
+  fetchDeposits,
+  fetchMyDepositAddresses,
+  fetchWithdrawal,
+  fetchWithdrawals,
+  RequestWithdrawalInput,
+  requestWithdrawal,
+} from "./api";
 import { isTerminalDepositStatus } from "./deposit-status";
+import { isTerminalWithdrawalStatus } from "./withdrawal-status";
 
 // Conservative, bounded polling intervals — never sub-second, and only
 // ever active while there is something to actually wait on.
 const DEPOSIT_DETAIL_POLL_MS = 10_000;
 const DEPOSIT_LIST_POLL_MS = 20_000;
+const WITHDRAWAL_DETAIL_POLL_MS = 10_000;
+const WITHDRAWAL_LIST_POLL_MS = 20_000;
 
 export const walletKeys = {
   balances: ["wallet", "balances"] as const,
@@ -16,6 +31,8 @@ export const walletKeys = {
   depositAddresses: ["wallet", "deposit-addresses"] as const,
   deposits: (page: number, pageSize: number) => ["wallet", "deposits", page, pageSize] as const,
   deposit: (id: string) => ["wallet", "deposit", id] as const,
+  withdrawals: ["wallet", "withdrawals"] as const,
+  withdrawal: (id: string) => ["wallet", "withdrawal", id] as const,
 };
 
 /**
@@ -139,4 +156,74 @@ export function useDeposit(depositId: string | null) {
   useInvalidateBalancesOnNewlyCredited(creditedIds);
 
   return query;
+}
+
+/**
+ * A flat list — GET /wallet/withdrawals is not paginated on the backend
+ * (naturally bounded per user), so this never invents client-side
+ * pagination the API doesn't actually provide.
+ */
+export function useWithdrawals() {
+  const query = useQuery({
+    queryKey: walletKeys.withdrawals,
+    queryFn: fetchWithdrawals,
+    refetchInterval: (query) => {
+      const items = query.state.data;
+      if (!items || items.length === 0) return false;
+      const hasUnresolved = items.some((w) => !isTerminalWithdrawalStatus(w.status));
+      return hasUnresolved ? WITHDRAWAL_LIST_POLL_MS : false;
+    },
+  });
+
+  // A withdrawal reaching CREDITED is exactly the moment the user's real
+  // balance changed (the reservation is captured and the ledger posts
+  // the real debit only at that point — see WithdrawalsService
+  // .recordConfirmation) — same reasoning as deposits reaching CREDITED.
+  const creditedIds = (query.data ?? []).filter((w) => w.status === "CREDITED").map((w) => w.id);
+  useInvalidateBalancesOnNewlyCredited(creditedIds);
+
+  return query;
+}
+
+export function useWithdrawal(withdrawalId: string | null) {
+  const query = useQuery({
+    queryKey: walletKeys.withdrawal(withdrawalId ?? ""),
+    queryFn: () => fetchWithdrawal(withdrawalId!),
+    enabled: Boolean(withdrawalId),
+    refetchInterval: (query) => (query.state.data && !isTerminalWithdrawalStatus(query.state.data.status) ? WITHDRAWAL_DETAIL_POLL_MS : false),
+  });
+
+  const creditedIds = query.data?.status === "CREDITED" ? [query.data.id] : [];
+  useInvalidateBalancesOnNewlyCredited(creditedIds);
+
+  return query;
+}
+
+/**
+ * Placing a withdrawal changes reserved balance (via the backend's own
+ * reservation logic) — invalidating balances + the withdrawals list
+ * makes the next read hit the backend again instead of showing a stale
+ * available-balance figure. Never computed client-side.
+ */
+export function useRequestWithdrawal() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: RequestWithdrawalInput) => requestWithdrawal(input),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: walletKeys.balances });
+      queryClient.invalidateQueries({ queryKey: walletKeys.withdrawals });
+    },
+  });
+}
+
+export function useCancelWithdrawal() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (withdrawalId: string) => cancelWithdrawal(withdrawalId),
+    onSuccess: (_result, withdrawalId) => {
+      queryClient.invalidateQueries({ queryKey: walletKeys.balances });
+      queryClient.invalidateQueries({ queryKey: walletKeys.withdrawals });
+      queryClient.invalidateQueries({ queryKey: walletKeys.withdrawal(withdrawalId) });
+    },
+  });
 }

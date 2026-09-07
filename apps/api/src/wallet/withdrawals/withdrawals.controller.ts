@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, UseGuards } from "@nestjs/common";
+import { Controller, Get, Param, Post, Body, UseGuards } from "@nestjs/common";
 import { Throttle } from "@nestjs/throttler";
 import { JwtAuthGuard } from "../../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../../common/decorators/current-user.decorator";
@@ -20,5 +20,21 @@ export class WithdrawalsController {
   @Get()
   listMine(@CurrentUser() user: AuthenticatedUser) {
     return this.withdrawalsService.listMine(user.id);
+  }
+
+  // Registered after the bare listing route above — Nest matches
+  // literal path segments in declaration order, and ":id" would
+  // otherwise swallow nothing here since there's no other literal
+  // sub-path on this controller, but kept consistent with
+  // DepositsController's own ordering convention regardless.
+  @Get(":id")
+  getMine(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string) {
+    return this.withdrawalsService.getOwned(user.id, id);
+  }
+
+  @Post(":id/cancel")
+  @Throttle(WITHDRAWAL_REQUEST_THROTTLE)
+  cancel(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string) {
+    return this.withdrawalsService.cancel(user.id, id);
   }
 }

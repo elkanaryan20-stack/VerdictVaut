@@ -45,6 +45,13 @@ class EnvironmentVariables {
   @IsInt()
   @IsOptional()
   CHAIN_WATCHER_POLL_INTERVAL_MS: number = 30000;
+
+  @IsOptional()
+  WITHDRAWAL_WATCHER_ENABLED: string = "false";
+
+  @IsInt()
+  @IsOptional()
+  WITHDRAWAL_WATCHER_POLL_INTERVAL_MS: number = 30000;
 }
 
 export function validateEnv(config: Record<string, unknown>) {
