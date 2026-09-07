@@ -1,21 +1,29 @@
-import { ConflictException, ForbiddenException, UnauthorizedException } from "@nestjs/common";
+import { ConflictException, ForbiddenException, NotFoundException, UnauthorizedException } from "@nestjs/common";
 import * as bcrypt from "bcryptjs";
 import { PrismaService } from "../prisma/prisma.service";
+import { AuditLogService } from "../audit/audit-log.service";
 import { AuthService } from "./auth.service";
 
 describe("AuthService", () => {
   let service: AuthService;
   let prisma: {
-    user: { findUnique: jest.Mock; create: jest.Mock };
-    refreshToken: { findFirst: jest.Mock; create: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
+    user: { findUnique: jest.Mock; findUniqueOrThrow: jest.Mock; create: jest.Mock; update: jest.Mock };
+    refreshToken: { findFirst: jest.Mock; create: jest.Mock; update: jest.Mock; updateMany: jest.Mock; findMany: jest.Mock };
   };
   let jwt: { signAsync: jest.Mock; verifyAsync: jest.Mock };
   let config: { get: jest.Mock };
+  let auditLog: { record: jest.Mock };
 
   beforeEach(() => {
     prisma = {
-      user: { findUnique: jest.fn(), create: jest.fn() },
-      refreshToken: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
+      user: { findUnique: jest.fn(), findUniqueOrThrow: jest.fn(), create: jest.fn(), update: jest.fn() },
+      refreshToken: {
+        findFirst: jest.fn(),
+        create: jest.fn(),
+        update: jest.fn(),
+        updateMany: jest.fn(),
+        findMany: jest.fn(),
+      },
     };
     jwt = {
       signAsync: jest.fn().mockResolvedValue("signed.jwt.token"),
@@ -29,8 +37,9 @@ describe("AuthService", () => {
         refreshTtl: "7d",
       }),
     };
+    auditLog = { record: jest.fn().mockResolvedValue({}) };
 
-    service = new AuthService(prisma as unknown as PrismaService, jwt as never, config as never);
+    service = new AuthService(prisma as unknown as PrismaService, jwt as never, config as never, auditLog as unknown as AuditLogService);
   });
 
   describe("register", () => {
@@ -96,6 +105,7 @@ describe("AuthService", () => {
 
       const result = await service.login({ email: "a@example.com", password: "correct-password" });
       expect(result.accessToken).toBe("signed.jwt.token");
+      expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ actorId: "user-1", action: "user.login" }));
     });
   });
 
@@ -128,6 +138,65 @@ describe("AuthService", () => {
         where: { id: "stored-token-1" },
         data: { revokedAt: expect.any(Date) },
       });
+    });
+  });
+
+  describe("changePassword", () => {
+    it("rejects an incorrect current password without touching the stored hash", async () => {
+      const passwordHash = await bcrypt.hash("correct-password", 4);
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ id: "user-1", passwordHash });
+
+      await expect(
+        service.changePassword("user-1", { currentPassword: "wrong-password", newPassword: "brand-new-password123" }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("re-hashes the password, revokes every session, and audit-logs the change on success", async () => {
+      const passwordHash = await bcrypt.hash("correct-password", 4);
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ id: "user-1", passwordHash });
+      prisma.user.update.mockResolvedValue({});
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+
+      await service.changePassword("user-1", { currentPassword: "correct-password", newPassword: "brand-new-password123" });
+
+      const newHash = prisma.user.update.mock.calls[0][0].data.passwordHash;
+      expect(newHash).not.toBe(passwordHash);
+      expect(await bcrypt.compare("brand-new-password123", newHash)).toBe(true);
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { userId: "user-1", revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ actorId: "user-1", action: "user.change_password" }));
+    });
+  });
+
+  describe("listSessions", () => {
+    it("scopes the query to the given user id", async () => {
+      prisma.refreshToken.findMany.mockResolvedValue([]);
+      await service.listSessions("user-1");
+      expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: "user-1" }, take: 100 }),
+      );
+    });
+  });
+
+  describe("revokeSession", () => {
+    it("throws NotFound instead of revoking when the session doesn't belong to this user (IDOR protection)", async () => {
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+      await expect(service.revokeSession("user-1", "someone-elses-session")).rejects.toThrow(NotFoundException);
+      expect(auditLog.record).not.toHaveBeenCalled();
+    });
+
+    it("revokes the session and audit-logs it when it belongs to this user", async () => {
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      await service.revokeSession("user-1", "session-1");
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { id: "session-1", userId: "user-1", revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ actorId: "user-1", action: "user.session_revoke", resourceId: "session-1" }));
     });
   });
 });

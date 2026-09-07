@@ -91,7 +91,7 @@ export const DEPOSIT_STATUSES = ["PENDING", "CONFIRMED", "CREDITED", "REJECTED",
 export const DepositStatusSchema = z.enum(DEPOSIT_STATUSES);
 export type DepositStatus = z.infer<typeof DepositStatusSchema>;
 
-const AssetNetworkRefSchema = z.object({
+export const AssetNetworkRefSchema = z.object({
   id: z.string(),
   contractAddress: z.string().nullable().optional(),
   memoRequired: z.boolean().optional(),

@@ -2,15 +2,18 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  NotFoundException,
   UnauthorizedException,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
-import { User } from "@prisma/client";
+import { AuditActorType, User } from "@prisma/client";
 import * as bcrypt from "bcryptjs";
 import * as crypto from "crypto";
+import { AuditLogService } from "../audit/audit-log.service";
 import { AppConfig } from "../config/configuration";
 import { PrismaService } from "../prisma/prisma.service";
+import { ChangePasswordDto } from "./dto/change-password.dto";
 import { LoginDto } from "./dto/login.dto";
 import { RegisterDto } from "./dto/register.dto";
 
@@ -31,6 +34,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService<AppConfig, true>,
+    private readonly auditLog: AuditLogService,
   ) {}
 
   async register(dto: RegisterDto): Promise<TokenPair> {
@@ -43,6 +47,7 @@ export class AuthService {
     const user = await this.prisma.user.create({
       data: { email: dto.email, passwordHash },
     });
+    await this.auditLog.record({ actorId: user.id, actorType: AuditActorType.USER, action: "user.register", resourceType: "User", resourceId: user.id });
 
     return this.issueTokenPair(user);
   }
@@ -62,6 +67,7 @@ export class AuthService {
       throw new ForbiddenException("Account is suspended");
     }
 
+    await this.auditLog.record({ actorId: user.id, actorType: AuditActorType.USER, action: "user.login", resourceType: "User", resourceId: user.id });
     return this.issueTokenPair(user);
   }
 
@@ -103,6 +109,89 @@ export class AuthService {
     await this.prisma.refreshToken.updateMany({
       where: { userId, tokenHash, revokedAt: null },
       data: { revokedAt: new Date() },
+    });
+    await this.auditLog.record({ actorId: userId, actorType: AuditActorType.USER, action: "user.logout", resourceType: "User", resourceId: userId });
+  }
+
+  /**
+   * Self-service password change. Revokes every one of this user's
+   * refresh-token sessions on success — including the one that's about
+   * to keep driving the current browser tab — the same "change your
+   * password, get signed out everywhere" behavior most account systems
+   * use, and simpler/safer here than trying to single out "this session"
+   * from an access-token-only request (nothing ties an access token back
+   * to the specific RefreshToken row that minted it).
+   *
+   * Deliberately Forbidden (403), not Unauthorized (401), for a wrong
+   * currentPassword: this request is already authenticated (it passed
+   * JwtAuthGuard) — the failure is a business-logic check, not an auth
+   * failure. That distinction matters to apiFetch on the frontend, which
+   * treats any 401 as "the access token expired" and silently refreshes
+   * + retries — which would otherwise resubmit the same wrong password a
+   * second time against this endpoint's own throttle for no reason.
+   */
+  async changePassword(userId: string, dto: ChangePasswordDto): Promise<void> {
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+
+    const currentPasswordValid = await bcrypt.compare(dto.currentPassword, user.passwordHash);
+    if (!currentPasswordValid) {
+      throw new ForbiddenException("Current password is incorrect");
+    }
+
+    const passwordHash = await bcrypt.hash(dto.newPassword, PASSWORD_SALT_ROUNDS);
+    await this.prisma.user.update({ where: { id: userId }, data: { passwordHash } });
+    await this.prisma.refreshToken.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    await this.auditLog.record({
+      actorId: userId,
+      actorType: AuditActorType.USER,
+      action: "user.change_password",
+      resourceType: "User",
+      resourceId: userId,
+    });
+  }
+
+  /**
+   * This user's own sessions (one row per issued refresh token — see
+   * RefreshToken's docblock). There is no device/IP/user-agent column on
+   * this table, so that's never shown here — only what's actually
+   * recorded: when it was issued, when it expires, and whether it's been
+   * revoked. Capped the same way AuditLogService.list is (most-recent
+   * first) — a long-lived account accrues a new row on every login and
+   * every refresh-token rotation, so this is unbounded otherwise.
+   */
+  async listSessions(userId: string) {
+    return this.prisma.refreshToken.findMany({
+      where: { userId },
+      select: { id: true, createdAt: true, expiresAt: true, revokedAt: true },
+      orderBy: { createdAt: "desc" },
+      take: 100,
+    });
+  }
+
+  /**
+   * Revokes exactly one of the CALLING user's own sessions — the
+   * `userId` filter in the `where` clause (not just an `id` lookup) is
+   * what makes this IDOR-safe: a user can never revoke another user's
+   * session by guessing/enumerating ids, they just get a 404 either way.
+   */
+  async revokeSession(userId: string, sessionId: string): Promise<void> {
+    const result = await this.prisma.refreshToken.updateMany({
+      where: { id: sessionId, userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    if (result.count === 0) {
+      throw new NotFoundException("Session not found");
+    }
+    await this.auditLog.record({
+      actorId: userId,
+      actorType: AuditActorType.USER,
+      action: "user.session_revoke",
+      resourceType: "RefreshToken",
+      resourceId: sessionId,
     });
   }
 

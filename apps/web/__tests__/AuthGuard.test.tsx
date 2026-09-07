@@ -22,7 +22,7 @@ describe("AuthGuard", () => {
       </AuthGuard>,
     );
     expect(screen.queryByText("Secret wallet data")).not.toBeInTheDocument();
-    expect(screen.getByText(/loading your wallet/i)).toBeInTheDocument();
+    expect(screen.getByText(/loading/i)).toBeInTheDocument();
   });
 
   it("redirects to /login and renders nothing when unauthenticated — never shows wallet content", () => {
@@ -45,5 +45,27 @@ describe("AuthGuard", () => {
     );
     expect(screen.getByText("Secret wallet data")).toBeInTheDocument();
     expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("blocks an authenticated user whose role isn't in `allow`, without redirecting to /login", () => {
+    mockedUseAuth.mockReturnValue({ status: "authenticated", user: { id: "u1", email: "a@b.com", role: "USER" } });
+    render(
+      <AuthGuard allow={["ADMIN", "SUPER_ADMIN"]}>
+        <div>Restricted admin data</div>
+      </AuthGuard>,
+    );
+    expect(screen.queryByText("Restricted admin data")).not.toBeInTheDocument();
+    expect(screen.getByText(/restricted area/i)).toBeInTheDocument();
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("renders children when the user's role is in `allow`", () => {
+    mockedUseAuth.mockReturnValue({ status: "authenticated", user: { id: "u1", email: "a@b.com", role: "SUPER_ADMIN" } });
+    render(
+      <AuthGuard allow={["ADMIN", "SUPER_ADMIN"]}>
+        <div>Restricted admin data</div>
+      </AuthGuard>,
+    );
+    expect(screen.getByText("Restricted admin data")).toBeInTheDocument();
   });
 });

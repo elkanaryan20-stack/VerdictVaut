@@ -1,6 +1,7 @@
-import { Body, Controller, HttpCode, HttpStatus, Post, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, UseGuards } from "@nestjs/common";
 import { Throttle } from "@nestjs/throttler";
 import { AuthService } from "./auth.service";
+import { ChangePasswordDto } from "./dto/change-password.dto";
 import { LoginDto } from "./dto/login.dto";
 import { RegisterDto } from "./dto/register.dto";
 import { JwtAuthGuard } from "./guards/jwt-auth.guard";
@@ -45,5 +46,29 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   logout(@CurrentUser() user: AuthenticatedUser, @Body() dto: RefreshDto) {
     return this.authService.logout(user.id, dto.refreshToken);
+  }
+
+  // Same throttle as login/register — this endpoint's failure mode
+  // (wrong currentPassword) is exactly the credential-guessing surface
+  // those limits exist for.
+  @Post("change-password")
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @UseGuards(JwtAuthGuard)
+  @Throttle(AUTH_THROTTLE)
+  changePassword(@CurrentUser() user: AuthenticatedUser, @Body() dto: ChangePasswordDto) {
+    return this.authService.changePassword(user.id, dto);
+  }
+
+  @Get("sessions")
+  @UseGuards(JwtAuthGuard)
+  listSessions(@CurrentUser() user: AuthenticatedUser) {
+    return this.authService.listSessions(user.id);
+  }
+
+  @Post("sessions/:id/revoke")
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @UseGuards(JwtAuthGuard)
+  revokeSession(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string) {
+    return this.authService.revokeSession(user.id, id);
   }
 }
