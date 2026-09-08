@@ -34,6 +34,14 @@ export class AssetsNetworksService {
     if (!assetNetwork) {
       throw new NotFoundException("Asset/network pair not found");
     }
+    // A non-native asset/network with no contract address would otherwise
+    // only surface as a scan-time failure in the deposit watcher (each
+    // adapter's own validateNetwork throws there — see e.g.
+    // EvmDepositAdapter/SolanaDepositAdapter) — much later and less
+    // actionable than rejecting it immediately here (Phase 11 finding).
+    if (isActive && !assetNetwork.isNative && !assetNetwork.contractAddress) {
+      throw new BadRequestException("Cannot activate a non-native asset/network with no contractAddress configured");
+    }
     return this.prisma.assetNetwork.update({ where: { id: assetNetworkId }, data: { isActive } });
   }
 
@@ -51,6 +59,9 @@ export class AssetsNetworksService {
     const network = await this.prisma.network.findUnique({ where: { code: params.networkCode } });
     if (!asset || !network) {
       throw new BadRequestException("Unknown asset symbol or network code");
+    }
+    if (!params.isNative && !params.contractAddress) {
+      throw new BadRequestException("A non-native asset/network requires a contractAddress");
     }
 
     return this.prisma.assetNetwork.create({

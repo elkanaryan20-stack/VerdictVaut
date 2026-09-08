@@ -1,4 +1,13 @@
+import { Prisma } from "@prisma/client";
 import { DepositWatcherService } from "./deposit-watcher.service";
+
+function makeLeaseRowRaceConflict() {
+  return new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+    code: "P2002",
+    clientVersion: "5.22.0",
+    meta: { target: ["assetNetworkId"] },
+  });
+}
 
 describe("DepositWatcherService", () => {
   let prisma: {
@@ -131,6 +140,26 @@ describe("DepositWatcherService", () => {
     expect(prisma.blockchainWatchCursor.updateMany).not.toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ lastScannedPointer: expect.anything() }) }),
     );
+  });
+
+  it("acquireLease survives a genuine race on a brand-new asset/network's first-ever upsert (Phase 11 fix)", async () => {
+    // Two workers' upserts both attempting the INSERT branch concurrently
+    // — the loser gets a real P2002 here rather than a clean outcome.
+    // The row exists either way, so the scan should proceed normally.
+    prisma.blockchainWatchCursor.upsert.mockRejectedValueOnce(makeLeaseRowRaceConflict());
+
+    await service.scanOne("an-1");
+
+    expect(adapterFactory.resolve).toHaveBeenCalled();
+    expect(depositsService.recordObservedTransaction).toHaveBeenCalled();
+  });
+
+  it("acquireLease re-throws any OTHER upsert failure rather than swallowing it", async () => {
+    prisma.blockchainWatchCursor.upsert.mockRejectedValueOnce(new Error("database unavailable"));
+
+    await expect(service.scanOne("an-1")).rejects.toThrow("database unavailable");
+
+    expect(adapterFactory.resolve).not.toHaveBeenCalled();
   });
 
   it("never regresses a numeric (EVM-style) cursor even if the adapter reports a smaller nextCursor than what's already persisted", async () => {

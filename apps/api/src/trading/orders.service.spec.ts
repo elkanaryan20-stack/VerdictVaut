@@ -285,9 +285,9 @@ describe("OrdersService", () => {
       expect(executionCoordinator.matchAndExecute).not.toHaveBeenCalled();
     });
 
-    it("rejects retrying someone else's order", async () => {
+    it("rejects retrying someone else's order (NotFoundException — see getOwnOrder's IDOR-oracle fix)", async () => {
       prisma.order.findUnique.mockResolvedValue({ id: "order-1", userId: "owner", status: "OPEN", side: "BUY" });
-      await expect(service.retryMatching("someone-else", "order-1")).rejects.toThrow(ForbiddenException);
+      await expect(service.retryMatching("someone-else", "order-1")).rejects.toThrow(NotFoundException);
       expect(executionCoordinator.matchAndExecute).not.toHaveBeenCalled();
     });
 
@@ -353,9 +353,9 @@ describe("OrdersService", () => {
     });
   });
 
-  it("cancel() rejects someone else's order", async () => {
+  it("cancel() rejects someone else's order with NotFoundException, not Forbidden (avoids a 403-vs-404 existence oracle)", async () => {
     prisma.order.findUnique.mockResolvedValue({ id: "order-1", userId: "owner", status: "OPEN", side: "BUY" });
-    await expect(service.cancel("someone-else", "order-1")).rejects.toThrow(ForbiddenException);
+    await expect(service.cancel("someone-else", "order-1")).rejects.toThrow(NotFoundException);
   });
 
   it("cancel() rejects an order that is not cancellable", async () => {
@@ -388,9 +388,9 @@ describe("OrdersService", () => {
     expect(reservations.release).not.toHaveBeenCalled();
   });
 
-  it("getOwnOrder() rejects another user's order", async () => {
+  it("getOwnOrder() rejects another user's order with NotFoundException, not Forbidden (avoids a 403-vs-404 existence oracle)", async () => {
     prisma.order.findUnique.mockResolvedValue({ id: "order-1", userId: "owner" });
-    await expect(service.getOwnOrder("someone-else", "order-1")).rejects.toThrow(ForbiddenException);
+    await expect(service.getOwnOrder("someone-else", "order-1")).rejects.toThrow(NotFoundException);
   });
 
   it("getOwnOrder() throws NotFoundException for a missing order", async () => {

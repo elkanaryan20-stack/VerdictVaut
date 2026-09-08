@@ -17,6 +17,8 @@ import { assertValidDestinationAddress } from "./destination-address.validator";
 import { RequestWithdrawalDto } from "./dto/request-withdrawal.dto";
 import { WITHDRAWAL_FEE_CALCULATOR, WithdrawalFeeCalculator } from "./fees/withdrawal-fee-calculator.interface";
 
+const MAX_PAGE_SIZE = 100;
+
 /** Statuses where a broadcast withdrawal's reservation has NOT yet been released — see reconcile(). */
 const RESERVATION_STILL_HELD_STATUSES = new Set<WithdrawalStatus>([
   WithdrawalStatus.BROADCAST,
@@ -747,9 +749,23 @@ export class WithdrawalsService {
     });
   }
 
-  async listAll() {
+  /**
+   * Admin-facing, so historically had no bound at all — unlike listMine,
+   * which was always paginated. As withdrawal volume grows this becomes
+   * an unbounded-query latency/DoS risk (Phase 11 finding). `page`/
+   * `pageSize` are optional so existing callers keep working unchanged;
+   * the response shape stays a plain array (not { items, total, ... }) to
+   * avoid a breaking API-contract change for a hardening-only fix.
+   */
+  async listAll(page = 1, pageSize = MAX_PAGE_SIZE) {
+    const safePage = Number.isFinite(page) && page >= 1 ? Math.trunc(page) : 1;
+    const requestedPageSize = Number.isFinite(pageSize) && pageSize >= 1 ? Math.trunc(pageSize) : MAX_PAGE_SIZE;
+    const safePageSize = Math.min(MAX_PAGE_SIZE, requestedPageSize);
+
     return this.prisma.withdrawal.findMany({
       orderBy: { createdAt: "desc" },
+      skip: (safePage - 1) * safePageSize,
+      take: safePageSize,
       include: { user: { select: { id: true, email: true } }, assetNetwork: { include: { asset: true, network: true } } },
     });
   }

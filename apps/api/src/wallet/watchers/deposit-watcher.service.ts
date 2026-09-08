@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { WalletAddressStatus } from "@prisma/client";
 import * as crypto from "crypto";
 import { AppConfig } from "../../config/configuration";
+import { isUniqueConstraintViolation } from "../../prisma/idempotent-create.util";
 import { PrismaService } from "../../prisma/prisma.service";
 import { DepositChainAdapterFactory } from "../chain-adapters/deposit-chain-adapter.factory";
 import { WatchedAddress } from "../chain-adapters/deposit-chain-adapter.interface";
@@ -27,12 +28,14 @@ const LEASE_STALE_AFTER_MS = 5 * 60_000;
  * cursor must contain enough information to safely resume" — resuming
  * from a REGRESSED cursor means redundant, wasted re-scanning, not a
  * correctness bug per se, since recordObservedTransaction is idempotent,
- * but it's still worth preventing). Only meaningful for a chain whose
- * cursor is an actual resume point (EVM's is a block number) — the
- * Bitcoin/Solana/XRP adapters' cursors are purely informational
- * timestamps that are never read back as scan input (each poll always
- * re-derives its own recent window fresh from live chain state), so a
- * non-numeric cursor always advances.
+ * but it's still worth preventing). Only meaningful for the EVM adapter,
+ * whose cursor is a single numeric block number. The Bitcoin/Solana/XRP
+ * adapters' cursor is a JSON map of one real per-address resume point
+ * each (Phase 11 — see per-address-cursor.util.ts) rather than a single
+ * number, so it always falls through to `return true` here; those
+ * adapters enforce their own never-lose-history invariant internally
+ * (an address whose walk-back can't fully catch up keeps its OLD
+ * per-address entry rather than advancing past unscanned history).
  */
 function shouldAdvanceCursor(current: string | null, next: string): boolean {
   if (current == null || current === "") return true;
@@ -185,11 +188,21 @@ export class DepositWatcherService implements OnModuleInit, OnModuleDestroy {
    * lock or cursor state).
    */
   private async acquireLease(assetNetworkId: string): Promise<boolean> {
-    await this.prisma.blockchainWatchCursor.upsert({
-      where: { assetNetworkId },
-      create: { assetNetworkId, lastScannedPointer: "" },
-      update: {},
-    });
+    try {
+      await this.prisma.blockchainWatchCursor.upsert({
+        where: { assetNetworkId },
+        create: { assetNetworkId, lastScannedPointer: "" },
+        update: {},
+      });
+    } catch (error) {
+      // A genuine race on the very first-ever scan of a brand-new
+      // asset/network: two workers' upserts can both attempt the INSERT
+      // branch concurrently, and the loser sees a real unique-constraint
+      // violation here rather than a clean "row already exists" outcome.
+      // The row now definitely exists either way, so it's safe to fall
+      // through to the CAS below rather than treat this as a scan failure.
+      if (!isUniqueConstraintViolation(error, "assetNetworkId")) throw error;
+    }
 
     const staleThreshold = new Date(Date.now() - LEASE_STALE_AFTER_MS);
     const result = await this.prisma.blockchainWatchCursor.updateMany({

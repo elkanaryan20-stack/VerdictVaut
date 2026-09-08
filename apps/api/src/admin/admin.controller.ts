@@ -151,8 +151,8 @@ export class AdminController {
   // actions below: SUPER_ADMIN only. There is deliberately no endpoint
   // here that lets an admin directly set a deposit's status or amount.
   @Get("deposits")
-  listDeposits() {
-    return this.depositsService.listAll();
+  listDeposits(@Query("page") page?: string, @Query("pageSize") pageSize?: string) {
+    return this.depositsService.listAll(page ? parseInt(page, 10) : undefined, pageSize ? parseInt(pageSize, 10) : undefined);
   }
 
   // Registered before "deposits/:id" — Nest matches literal path
@@ -180,8 +180,8 @@ export class AdminController {
 
   // ── Withdrawals (approval/broadcast — SUPER_ADMIN only) ───────────────
   @Get("withdrawals")
-  listWithdrawals() {
-    return this.withdrawalsService.listAll();
+  listWithdrawals(@Query("page") page?: string, @Query("pageSize") pageSize?: string) {
+    return this.withdrawalsService.listAll(page ? parseInt(page, 10) : undefined, pageSize ? parseInt(pageSize, 10) : undefined);
   }
 
   // Registered before "withdrawals/:id/approve" etc. is unnecessary —

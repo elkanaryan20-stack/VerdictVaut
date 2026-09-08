@@ -394,7 +394,12 @@ export class OrdersService {
         throw new NotFoundException("Order not found");
       }
       if (order.userId !== userId) {
-        throw new ForbiddenException("Not your order");
+        // NotFoundException, not Forbidden — matches the IDOR convention
+        // used everywhere else in this codebase (withdrawals, deposits):
+        // "not yours" and "doesn't exist" must look identical to the
+        // caller, or the response code itself becomes an existence oracle
+        // for a guessed/leaked order id (Phase 11 finding).
+        throw new NotFoundException("Order not found");
       }
 
       const result = await tx.order.updateMany({
@@ -427,7 +432,9 @@ export class OrdersService {
       throw new NotFoundException("Order not found");
     }
     if (order.userId !== userId) {
-      throw new ForbiddenException("Not your order");
+      // NotFoundException, not Forbidden — see the matching comment in
+      // cancel() (Phase 11 finding: avoid a 403-vs-404 existence oracle).
+      throw new NotFoundException("Order not found");
     }
     return order;
   }

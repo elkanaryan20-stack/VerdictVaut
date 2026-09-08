@@ -16,12 +16,19 @@ export class CreateOrderDto {
   @IsEnum(OrderType)
   type!: OrderType;
 
+  // MaxLength bounds the string BEFORE it ever reaches new Prisma.Decimal(...)
+  // — no real price/quantity needs anywhere near 40 digits, and without a
+  // bound an attacker-supplied digit string of unbounded length costs CPU
+  // to validate/parse on every submission to an authenticated endpoint
+  // (Phase 11 finding; TRADING_THROTTLE already rate-limits this route).
   @IsString()
+  @MaxLength(40)
   @Matches(DECIMAL_STRING, { message: "quantity must be a positive decimal string" })
   quantity!: string;
 
   @IsOptional()
   @IsString()
+  @MaxLength(40)
   @Matches(DECIMAL_STRING, { message: "price must be a positive decimal string" })
   price?: string;
 

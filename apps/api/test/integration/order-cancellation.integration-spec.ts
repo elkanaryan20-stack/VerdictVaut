@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException } from "@nestjs/common";
+import { BadRequestException, NotFoundException } from "@nestjs/common";
 import {
   createTestMarket,
   createTestUser,
@@ -21,7 +21,7 @@ async function placeOrder(traderId: string, marketId: string, outcomeId: string)
 }
 
 describe("Order cancellation (real Postgres)", () => {
-  it("rejects cancellation by a non-owner", async () => {
+  it("rejects cancellation by a non-owner with NotFoundException (avoids a 403-vs-404 existence oracle — Phase 11 fix)", async () => {
     const admin = await createTestUser();
     const trader = await createTestUser();
     const stranger = await createTestUser();
@@ -31,7 +31,7 @@ describe("Order cancellation (real Postgres)", () => {
     await fundUserForTest(trader.id, "USDC", "100");
 
     const order = await placeOrder(trader.id, market.id, yes.id);
-    await expect(ordersService.cancel(stranger.id, order.id)).rejects.toThrow(ForbiddenException);
+    await expect(ordersService.cancel(stranger.id, order.id)).rejects.toThrow(NotFoundException);
   });
 
   it("rejects cancelling an already-terminal order", async () => {
