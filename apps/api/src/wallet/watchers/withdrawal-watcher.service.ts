@@ -101,6 +101,22 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // A "failed" status (requirement #12) means the chain has a final,
+    // immutable record of this transaction but it did NOT deliver value
+    // (an EVM revert, an XRPL tec-class result, a Solana `err`) — this
+    // must never be silently ignored (which would leave the withdrawal
+    // stuck CONFIRMING forever with a reservation nothing ever resolves)
+    // nor treated as a reason to broadcast again (WithdrawalsService has
+    // no re-broadcast path from BROADCAST/CONFIRMING at all — see its own
+    // state-machine docblock). fail() releases the reservation and moves
+    // the withdrawal to the terminal FAILED state, exactly the outcome a
+    // genuinely failed broadcast deserves.
+    if (status.status === "failed") {
+      this.logger.error(`Withdrawal ${withdrawalId}'s broadcast transaction ${txHash} failed on-chain — marking the withdrawal FAILED.`);
+      await this.withdrawalsService.fail(withdrawalId, `Broadcast transaction ${txHash} failed on-chain.`);
+      return;
+    }
+
     const requiredConfirmations = await this.confirmationPolicy.getRequiredConfirmations(assetNetworkId);
     await this.withdrawalsService.recordConfirmation(withdrawalId, status.confirmations, requiredConfirmations);
   }

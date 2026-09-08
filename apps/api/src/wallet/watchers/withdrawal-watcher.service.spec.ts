@@ -4,7 +4,7 @@ describe("WithdrawalWatcherService", () => {
   let prisma: { withdrawal: { findMany: jest.Mock } };
   let custodyProviderFactory: { resolve: jest.Mock };
   let confirmationPolicy: { getRequiredConfirmations: jest.Mock };
-  let withdrawalsService: { recordConfirmation: jest.Mock };
+  let withdrawalsService: { recordConfirmation: jest.Mock; fail: jest.Mock };
   let configService: { get: jest.Mock };
   let getTransactionStatus: jest.Mock;
   let service: WithdrawalWatcherService;
@@ -18,7 +18,7 @@ describe("WithdrawalWatcherService", () => {
     getTransactionStatus = jest.fn().mockResolvedValue({ status: "confirmed", confirmations: 6, amount: "10", txHash: "0xhash1", assetNetworkId: "an-1" });
     custodyProviderFactory = { resolve: jest.fn().mockResolvedValue({ getTransactionStatus }) };
     confirmationPolicy = { getRequiredConfirmations: jest.fn().mockResolvedValue(12) };
-    withdrawalsService = { recordConfirmation: jest.fn().mockResolvedValue({}) };
+    withdrawalsService = { recordConfirmation: jest.fn().mockResolvedValue({}), fail: jest.fn().mockResolvedValue({}) };
     configService = { get: jest.fn().mockReturnValue({ enabled: false, pollIntervalMs: 30000 }) };
 
     service = new WithdrawalWatcherService(
@@ -47,6 +47,13 @@ describe("WithdrawalWatcherService", () => {
   it("never mutates withdrawal state itself when the chain reports the transaction not_found — leaves it for admin reconciliation", async () => {
     getTransactionStatus.mockResolvedValue({ status: "not_found", confirmations: 0, amount: "0", txHash: "0xhash1", assetNetworkId: "an-1" });
     await service.pollOnce();
+    expect(withdrawalsService.recordConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("marks the withdrawal FAILED (never recordConfirmation) when the chain reports the broadcast transaction as genuinely failed (e.g. an EVM revert)", async () => {
+    getTransactionStatus.mockResolvedValue({ status: "failed", confirmations: 0, amount: "0", txHash: "0xhash1", assetNetworkId: "an-1" });
+    await service.pollOnce();
+    expect(withdrawalsService.fail).toHaveBeenCalledWith("wd-1", expect.stringContaining("0xhash1"));
     expect(withdrawalsService.recordConfirmation).not.toHaveBeenCalled();
   });
 

@@ -73,6 +73,7 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     DepositChainAdapterFactory,
     ConfirmationPolicyService,
     DepositReprocessingService,
+    DepositWatcherService,
   ],
 })
 export class WalletModule {}

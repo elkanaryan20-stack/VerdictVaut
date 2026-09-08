@@ -4,7 +4,7 @@ describe("DepositWatcherService", () => {
   let prisma: {
     assetNetwork: { findMany: jest.Mock };
     walletAddress: { findMany: jest.Mock };
-    blockchainWatchCursor: { findUnique: jest.Mock; upsert: jest.Mock };
+    blockchainWatchCursor: { findUnique: jest.Mock; upsert: jest.Mock; updateMany: jest.Mock };
   };
   let adapterFactory: { resolve: jest.Mock };
   let confirmationPolicy: { getRequiredConfirmations: jest.Mock };
@@ -23,7 +23,13 @@ describe("DepositWatcherService", () => {
           { id: "wa-2", address: "rAddr2", destinationTag: null, assignment: null }, // unassigned — must be filtered out
         ]),
       },
-      blockchainWatchCursor: { findUnique: jest.fn().mockResolvedValue({ lastScannedPointer: "cursor-0" }), upsert: jest.fn().mockResolvedValue({}) },
+      blockchainWatchCursor: {
+        findUnique: jest.fn().mockResolvedValue({ lastScannedPointer: "cursor-0" }),
+        upsert: jest.fn().mockResolvedValue({}),
+        // Both the lease-acquire CAS and the lease-release CAS go through
+        // updateMany — default to "won the lease" / "release applied".
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
     };
 
     adapterFactory = {
@@ -68,12 +74,14 @@ describe("DepositWatcherService", () => {
     expect(scanArgs.addresses[0].walletAddressId).toBe("wa-1");
   });
 
-  it("passes the persisted cursor into the scan and persists the returned nextCursor", async () => {
+  it("passes the persisted cursor into the scan and persists the returned nextCursor on lease release", async () => {
     await service.scanOne("an-1");
     const scanArgs = (await adapterFactory.resolve.mock.results[0].value).adapter.scanForDeposits.mock.calls[0][0];
     expect(scanArgs.cursor).toBe("cursor-0");
-    expect(prisma.blockchainWatchCursor.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({ create: expect.objectContaining({ lastScannedPointer: "cursor-1" }) }),
+    expect(prisma.blockchainWatchCursor.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ lastScannedPointer: "cursor-1", lockedAt: null, lockedBy: null }),
+      }),
     );
   });
 
@@ -98,6 +106,45 @@ describe("DepositWatcherService", () => {
     prisma.walletAddress.findMany.mockResolvedValue([]);
     await service.scanOne("an-1");
     expect(adapterFactory.resolve).not.toHaveBeenCalled();
+  });
+
+  it("never calls the adapter (or advances the cursor) when another worker already holds the scan lease", async () => {
+    prisma.blockchainWatchCursor.updateMany.mockResolvedValueOnce({ count: 0 }); // lease acquisition loses the race
+    await service.scanOne("an-1");
+    expect(adapterFactory.resolve).not.toHaveBeenCalled();
+  });
+
+  it("releases the lease and records the error, WITHOUT advancing the cursor, when the scan itself fails", async () => {
+    adapterFactory.resolve.mockResolvedValue({
+      adapter: { scanForDeposits: jest.fn().mockRejectedValue(new Error("provider unreachable")) },
+      network,
+    });
+
+    await expect(service.scanOne("an-1")).rejects.toThrow("provider unreachable");
+
+    expect(prisma.blockchainWatchCursor.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ lockedAt: null, lockedBy: null, lastError: "provider unreachable" }),
+      }),
+    );
+    // Never called with a `lastScannedPointer` update — the cursor must never move on a failed scan.
+    expect(prisma.blockchainWatchCursor.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ lastScannedPointer: expect.anything() }) }),
+    );
+  });
+
+  it("never regresses a numeric (EVM-style) cursor even if the adapter reports a smaller nextCursor than what's already persisted", async () => {
+    prisma.blockchainWatchCursor.findUnique.mockResolvedValue({ lastScannedPointer: "500" });
+    adapterFactory.resolve.mockResolvedValue({
+      adapter: { scanForDeposits: jest.fn().mockResolvedValue({ deposits: [], nextCursor: "480" }) },
+      network,
+    });
+
+    await service.scanOne("an-1");
+
+    expect(prisma.blockchainWatchCursor.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ lastScannedPointer: "500" }) }),
+    );
   });
 
   it("pollOnce continues to the next asset/network when one fails, rather than aborting the whole pass", async () => {

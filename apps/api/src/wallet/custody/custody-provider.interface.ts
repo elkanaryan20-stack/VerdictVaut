@@ -17,7 +17,29 @@ export interface ChainTransactionStatus {
   assetNetworkId: string;
   confirmations: number;
   amount: string;
-  status: "not_found" | "pending" | "confirmed";
+  /**
+   * "failed" is distinct from "not_found": the chain has a final,
+   * immutable record of this transaction (it was mined/validated), but
+   * it did NOT successfully deliver value — an EVM revert, an XRPL
+   * `tec*`-class result, a Solana `err`-carrying signature status. This
+   * is never folded into "not_found" (a chain having no record at all)
+   * or "confirmed" (economically successful and final) — see requirement
+   * #12 ("verify transaction success") and the explicit "EVM transaction
+   * reverted" adversarial test case. A caller must never advance a
+   * withdrawal toward CREDITED on a "failed" status.
+   */
+  status: "not_found" | "pending" | "confirmed" | "failed";
+  /**
+   * The single unambiguous on-chain recipient, when this chain's
+   * transaction model has one (EVM: `to`; XRP: `Destination`). Left
+   * undefined for Bitcoin (a transaction can pay multiple outputs, with
+   * no single "the" destination without external context) and Solana (no
+   * single-recipient concept either) — destination verification for
+   * those two is not attempted (requirement #12: "verify destination
+   * WHERE PRACTICAL"), a deliberate, documented limitation, not an
+   * oversight.
+   */
+  destinationAddress?: string;
 }
 
 export interface CustodyProvider {

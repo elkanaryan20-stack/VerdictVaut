@@ -47,8 +47,18 @@ export class SolanaCustodyProvider implements CustodyProvider {
       { searchTransactionHistory: true },
     ]);
     const status = statuses.value[0];
-    if (!status || status.err) {
+    if (!status) {
       return { txHash, assetNetworkId, confirmations: 0, amount: "0", status: "not_found" };
+    }
+    // A signature the RPC actually returned a status for is a real,
+    // final record on-chain — `err` (Solana's failed-transaction signal,
+    // e.g. a program error) is a DIFFERENT condition from "no such
+    // signature at all" and must be reported distinctly (requirement
+    // #12, "verify transaction success") rather than folded into
+    // "not_found", which previously made a genuinely-failed withdrawal
+    // broadcast indistinguishable from one that simply never happened.
+    if (status.err) {
+      return { txHash, assetNetworkId, confirmations: 0, amount: "0", status: "failed" };
     }
 
     const currentSlot = await fetchJsonRpc<number>(url, "getSlot", []);

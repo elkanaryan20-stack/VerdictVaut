@@ -144,6 +144,55 @@ describe("Deposit watcher, reprocessing, and reconciliation (real Postgres, fake
       expect(scannedIds).toContain(assigned.walletAddressId);
       expect(scannedIds).not.toContain(unassigned.id);
     });
+
+    it("two concurrently-running DepositWatcherService instances scanning the same asset/network: only one acquires the scan lease and calls the adapter", async () => {
+      const assetNetwork = await getAssetNetwork("XRP", "xrpl-testnet");
+      const marker = `${Date.now()}-${Math.random()}`;
+      const user = await createTestUser();
+      await assignXrpAddress(user.id, `rConcurrent${marker}`, "999");
+
+      let scanCallCount = 0;
+      let releaseFirstScan!: () => void;
+      const firstScanBlocked = new Promise<void>((resolve) => (releaseFirstScan = resolve));
+
+      const adapter: BlockchainDepositAdapter = {
+        family: "XRPL" as never,
+        validateNetwork: async () => undefined,
+        scanForDeposits: async () => {
+          scanCallCount += 1;
+          // Holds the lease open long enough for the second worker's
+          // acquisition attempt to genuinely race against the first
+          // worker's still-in-progress scan, rather than trivially
+          // running after it completes.
+          await firstScanBlocked;
+          return { deposits: [], nextCursor: `cursor-${marker}` };
+        },
+        inspectTransaction: async () => null,
+      };
+
+      const makeWatcher = () =>
+        new DepositWatcherService(
+          prisma,
+          fakeAdapterFactory(adapter) as never,
+          confirmationPolicyService,
+          depositsService,
+          { get: () => ({ enabled: false, pollIntervalMs: 30000 }) } as never,
+        );
+
+      const workerA = makeWatcher();
+      const workerB = makeWatcher();
+
+      const scanA = workerA.scanOne(assetNetwork.id);
+      // Give worker A's scan a chance to actually acquire the lease and
+      // enter the (blocked) adapter call before worker B attempts its own.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await workerB.scanOne(assetNetwork.id); // must return immediately — lease held by A
+
+      releaseFirstScan();
+      await scanA;
+
+      expect(scanCallCount).toBe(1);
+    });
   });
 
   describe("XRP destination tag validation via the real crediting path", () => {
@@ -389,6 +438,47 @@ describe("Deposit watcher, reprocessing, and reconciliation (real Postgres, fake
       const run = await reconciliation.run(assetNetwork.id);
 
       expect(run.status).toBe("DISCREPANCY_FOUND");
+    });
+
+    it("flags a CRITICAL discrepancy (real Postgres) when a CREDITED deposit's ledger-transaction reference has gone missing", async () => {
+      const user = await createTestUser();
+      const marker = `${Date.now()}-${Math.random()}`;
+      const assignment = await assignXrpAddress(user.id, `rLedgerGap${marker}`, "333");
+      const assetNetwork = await getAssetNetwork("XRP", "xrpl-testnet");
+
+      const deposit = await depositsService.recordObservedTransaction({
+        userId: user.id,
+        assetSymbol: "XRP",
+        assetNetworkId: assetNetwork.id,
+        walletAddressId: assignment.walletAddressId,
+        txHash: `HASH-LEDGERGAP-${marker}`,
+        amount: "8",
+        confirmations: 5,
+        requiredConfirmations: 1,
+        destinationTag: "333",
+      });
+      expect(deposit.status).toBe("CREDITED");
+      expect(deposit.ledgerTransactionId).not.toBeNull();
+
+      // Simulate the exact inconsistency this check exists to catch —
+      // a CREDITED deposit whose ledger-transaction reference no longer
+      // resolves (never produced by any real code path in this app; the
+      // credit path sets both atomically — see DepositsService
+      // .creditDeposit — this directly injects the anomaly via raw SQL).
+      await prisma.$executeRaw`UPDATE "deposits" SET "ledgerTransactionId" = 'does-not-exist' WHERE "id" = ${deposit.id}`;
+
+      const fakeProvider: CustodyProvider = {
+        getAddressBalance: async () => ({ address: "irrelevant", assetNetworkId: assetNetwork.id, balance: "8", asOf: new Date() }),
+        getTransactionStatus: async () => ({ txHash: "x", assetNetworkId: assetNetwork.id, confirmations: 0, amount: "0", status: "not_found" }),
+      };
+      const reconciliation = new ReconciliationService(prisma, { resolve: async () => fakeProvider } as never);
+      const run = await reconciliation.run(assetNetwork.id);
+
+      expect(run.status).toBe("DISCREPANCY_FOUND");
+      const payload = (run as unknown as { discrepancies: { findings: Array<{ type: string; severity: string; details: { depositId?: string } }> } }).discrepancies;
+      expect(payload.findings).toContainEqual(
+        expect.objectContaining({ type: "credited_deposit_missing_ledger_transaction", severity: "CRITICAL", details: expect.objectContaining({ depositId: deposit.id }) }),
+      );
     });
   });
 

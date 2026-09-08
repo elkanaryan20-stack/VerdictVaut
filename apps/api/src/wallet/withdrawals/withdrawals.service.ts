@@ -28,6 +28,23 @@ const RESERVATION_STILL_HELD_STATUSES = new Set<WithdrawalStatus>([
 /** Statuses where the reservation has already been released back to the user — see reconcile(). */
 const RESERVATION_RELEASED_STATUSES = new Set<WithdrawalStatus>([WithdrawalStatus.REJECTED, WithdrawalStatus.FAILED]);
 
+// Pure floating/rounding slack, not a real discrepancy allowance — mirrors ReconciliationService's own RECONCILIATION_TOLERANCE.
+const WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE = new Prisma.Decimal("0.000000000000000001");
+
+/**
+ * EVM hex addresses are case-insensitive (EIP-55 checksum casing is a
+ * display convention, not a distinct address) — compared lowercased.
+ * XRP base58 addresses ARE case-sensitive; compared exactly. Detecting
+ * "looks like an EVM address" by its 0x prefix avoids needing to thread
+ * the network family into reconcile() just for this comparison.
+ */
+function destinationsMatch(observed: string, recorded: string): boolean {
+  if (observed.startsWith("0x") && recorded.startsWith("0x")) {
+    return observed.toLowerCase() === recorded.toLowerCase();
+  }
+  return observed === recorded;
+}
+
 /**
  * Explicit withdrawal state machine:
  *
@@ -592,13 +609,24 @@ export class WithdrawalsService {
     const provider = await this.custodyProviderFactory.resolve(withdrawal.assetNetworkId);
     const chainStatus = await provider.getTransactionStatus(withdrawal.txHash, withdrawal.assetNetworkId);
 
-    // Two honest, narrow discrepancy signals, in the two directions that
-    // actually matter for fund safety — reached this line, txHash is
-    // guaranteed set, so a real broadcast was at least attempted either
-    // way. Subtler mismatches (e.g. a confirmation-count that looks
-    // stale) are deliberately NOT auto-classified as a "discrepancy" here
-    // — that judgment is left to the SUPER_ADMIN reviewer, who sees the
-    // raw comparison either way.
+    // Several honest, narrow discrepancy signals, checked in priority
+    // order (only the first that applies is reported — the return shape
+    // carries one note, matching the existing frontend/API contract).
+    // Subtler mismatches (e.g. a confirmation-count that looks stale) are
+    // deliberately NOT auto-classified as a "discrepancy" here — that
+    // judgment is left to the SUPER_ADMIN reviewer, who sees the raw
+    // comparison either way.
+    //
+    // "chain shows real activity" deliberately excludes both "not_found"
+    // (no chain record at all) AND "failed" (the chain DOES have a
+    // record, but it's a final, unsuccessful one, e.g. an EVM revert or
+    // XRPL tec-class result) — an internally-FAILED withdrawal whose
+    // chain transaction also genuinely failed is the CORRECT, consistent
+    // outcome, not a discrepancy (see WithdrawalWatcherService, which is
+    // what drives a withdrawal to FAILED from real chain evidence in the
+    // first place).
+    const chainShowsRealActivity = chainStatus.status === "confirmed" || chainStatus.status === "pending";
+
     let discrepancy = false;
     let note: string | null = null;
 
@@ -608,14 +636,31 @@ export class WithdrawalsService {
       // the chain shows no trace of it. Maybe it never really went out.
       discrepancy = true;
       note = "Internal state claims this transaction broadcast, but it was not found on-chain.";
-    } else if (RESERVATION_RELEASED_STATUSES.has(withdrawal.status) && chainStatus.status !== "not_found") {
+    } else if (RESERVATION_RELEASED_STATUSES.has(withdrawal.status) && chainShowsRealActivity) {
       // The more dangerous direction: this withdrawal's reservation was
       // already released back to the user (REJECTED/FAILED), but the
-      // chain shows the transaction genuinely exists (pending or
-      // confirmed) — real funds may already have left while the user's
+      // chain shows the transaction genuinely exists and is succeeding or
+      // in flight — real funds may already have left while the user's
       // balance was also restored internally.
       discrepancy = true;
       note = "This withdrawal's reservation was released, but the chain shows the transaction actually exists — funds may already have left.";
+    } else if (chainShowsRealActivity && chainStatus.destinationAddress && !destinationsMatch(chainStatus.destinationAddress, withdrawal.destinationAddress)) {
+      // Requirement #12/#13: "verify destination where practical". Only
+      // checked when the provider actually reports one (EVM/XRP today —
+      // see ChainTransactionStatus's own docblock for why Bitcoin/Solana
+      // don't) — a genuine mismatch here would mean the broadcast paid a
+      // DIFFERENT address than the one this withdrawal recorded.
+      discrepancy = true;
+      note = "The broadcast transaction's on-chain destination does not match this withdrawal's recorded destination address.";
+    } else if (chainShowsRealActivity) {
+      // The amount actually delivered on-chain should equal amount - fee
+      // (see request()'s own accounting docblock) — never `amount` alone.
+      const expectedNet = withdrawal.amount.minus(withdrawal.fee);
+      const observed = new Prisma.Decimal(chainStatus.amount);
+      if (observed.minus(expectedNet).abs().greaterThan(WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE)) {
+        discrepancy = true;
+        note = `The broadcast transaction's on-chain amount (${chainStatus.amount}) does not match the expected net amount (${expectedNet.toString()}).`;
+      }
     }
 
     await this.auditLog.record({
@@ -643,14 +688,34 @@ export class WithdrawalsService {
     ]);
   }
 
+  /**
+   * System-initiated (no admin HTTP caller wraps this — see
+   * WithdrawalWatcherService, which calls this when a chain adapter
+   * reports a withdrawal's broadcast transaction as genuinely "failed",
+   * e.g. an EVM revert or an XRPL tec-class result), so unlike
+   * reject()/recordManualBroadcast (whose audit rows the *caller*
+   * records — see those methods' own docblocks), this method audits
+   * itself, the same reasoning approve()'s own "withdrawal.broadcast"
+   * branch already uses for a system-side outcome with no controller to
+   * do it instead.
+   */
   async fail(withdrawalId: string, reason: string) {
-    return this.releaseReservation(withdrawalId, reason, WithdrawalStatus.FAILED, [
+    const withdrawal = await this.releaseReservation(withdrawalId, reason, WithdrawalStatus.FAILED, [
       WithdrawalStatus.APPROVED,
       WithdrawalStatus.PENDING_MANUAL_BROADCAST,
       WithdrawalStatus.BROADCASTING,
       WithdrawalStatus.BROADCAST,
       WithdrawalStatus.CONFIRMING,
     ]);
+    await this.auditLog.record({
+      actorType: "SYSTEM",
+      action: "withdrawal.failed",
+      resourceType: "Withdrawal",
+      resourceId: withdrawalId,
+      after: { status: withdrawal.status, reason },
+      idempotencyKey: `withdrawal-fail:${withdrawalId}`,
+    });
+    return withdrawal;
   }
 
   private async releaseReservation(

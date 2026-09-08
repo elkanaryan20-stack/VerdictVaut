@@ -946,10 +946,27 @@ model WithdrawalExecutionConfig {
 // ────────────────────────────────────────────────────────────────────────
 
 model BlockchainWatchCursor {
-  id                 String   @id @default(uuid())
-  assetNetworkId     String   @unique
+  id                 String    @id @default(uuid())
+  assetNetworkId     String    @unique
   lastScannedPointer String
-  updatedAt          DateTime @updatedAt
+  // Worker-concurrency lease (Phase 10) -- a CAS-acquired, time-bounded
+  // lock so multiple concurrently-running watcher instances never scan
+  // (and duplicate RPC work / race to advance) the same asset/network at
+  // once. lockedBy is an opaque per-process worker id, never a secret. A
+  // lease older than the configured staleness window is treated as
+  // abandoned (a crashed worker) and may be reacquired by another
+  // worker -- see DepositWatcherService.
+  lockedAt           DateTime?
+  lockedBy           String?
+  // Distinct from `updatedAt` (which changes on every write, including a
+  // lease acquire/release with no actual progress) -- set only when a
+  // scan pass actually completed without error, so admin operational
+  // visibility (requirement #15) can tell "healthy, just nothing new"
+  // apart from "has been failing" via lastError/lastErrorAt below.
+  lastSuccessAt      DateTime?
+  lastError          String?
+  lastErrorAt        DateTime?
+  updatedAt          DateTime  @updatedAt
 
   assetNetwork AssetNetwork @relation(fields: [assetNetworkId], references: [id])
 

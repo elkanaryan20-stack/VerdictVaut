@@ -213,7 +213,14 @@ export const ChainTransactionStatusSchema = z.object({
   assetNetworkId: z.string(),
   confirmations: z.number().int().nonnegative(),
   amount: z.string(),
-  status: z.enum(["not_found", "pending", "confirmed"]),
+  // "failed" (Phase 10): the chain has a final record of this transaction
+  // but it did not successfully deliver value (e.g. an EVM revert) —
+  // distinct from "not_found" (no chain record at all).
+  status: z.enum(["not_found", "pending", "confirmed", "failed"]),
+  // Only populated for chains with one unambiguous on-chain recipient
+  // (EVM/XRP) — see the backend ChainTransactionStatus interface's own
+  // docblock for why Bitcoin/Solana never set this.
+  destinationAddress: z.string().optional(),
 });
 export type ChainTransactionStatus = z.infer<typeof ChainTransactionStatusSchema>;
 

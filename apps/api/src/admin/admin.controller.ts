@@ -11,6 +11,7 @@ import { DepositAddressService } from "../wallet/addresses/deposit-address.servi
 import { DepositsService } from "../wallet/deposits/deposits.service";
 import { ReconciliationService } from "../wallet/reconciliation/reconciliation.service";
 import { DepositReprocessingService } from "../wallet/watchers/deposit-reprocessing.service";
+import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
 import { WithdrawalsService } from "../wallet/withdrawals/withdrawals.service";
 import { BroadcastWithdrawalDto } from "../wallet/withdrawals/dto/broadcast-withdrawal.dto";
 import { AuditLogService } from "../audit/audit-log.service";
@@ -46,6 +47,7 @@ export class AdminController {
     private readonly withdrawalsService: WithdrawalsService,
     private readonly reconciliationService: ReconciliationService,
     private readonly reprocessingService: DepositReprocessingService,
+    private readonly depositWatcherService: DepositWatcherService,
     private readonly auditLogService: AuditLogService,
   ) {}
 
@@ -284,6 +286,15 @@ export class AdminController {
   @Get("reconciliation/:assetNetworkId")
   listReconciliationRuns(@Param("assetNetworkId") assetNetworkId: string) {
     return this.reconciliationService.listRuns(assetNetworkId);
+  }
+
+  // ── Watcher / cursor operational visibility (requirement #15) ────────
+  // Read-only for both ADMIN and SUPER_ADMIN (class-level default) — this
+  // exposes cursor/lease/error state, never a control to force a scan,
+  // mark something confirmed, or credit/complete anything.
+  @Get("watchers")
+  listWatcherStatus() {
+    return this.depositWatcherService.listCursorStatus();
   }
 
   // ── Audit log ────────────────────────────────────────────────────────

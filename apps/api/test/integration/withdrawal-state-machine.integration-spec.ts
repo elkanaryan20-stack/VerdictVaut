@@ -414,6 +414,15 @@ describe("Withdrawal state machine (real Postgres)", () => {
       const admin = await createTestSuperAdmin();
       await fundUserForTest(user.id, "USDC", "1000");
 
+      // Read BEFORE, assert the DELTA after — FEE_REVENUE(USDC) is a
+      // single process-wide house account shared by every test in this
+      // run that posts a USDC fee (trading fills included), not reset
+      // between test files, so an absolute-value assertion here would be
+      // order-dependent on whatever else already ran in this same suite.
+      const usdcAssetBefore = await prisma.asset.findUniqueOrThrow({ where: { symbol: "USDC" } });
+      const feeAccountBefore = await prisma.ledgerAccount.findFirst({ where: { houseAccountKey: "FEE_REVENUE", assetId: usdcAssetBefore.id } });
+      const feeBalanceBefore = feeAccountBefore?.cachedBalance ?? new Prisma.Decimal(0);
+
       const flatFeeGate = new DeferredComplianceGate();
       const flatFeeCalculator = { calculateWithdrawalFee: () => ({ fee: new Prisma.Decimal("5") }) };
       const feeAwareService = new WithdrawalsService(
@@ -455,7 +464,8 @@ describe("Withdrawal state machine (real Postgres)", () => {
       // to the same houseAccountKey, so an unscoped findFirst() can
       // nondeterministically return a different asset's account.
       const feeAccount = await prisma.ledgerAccount.findFirst({ where: { houseAccountKey: "FEE_REVENUE", assetId: usdcAsset.id } });
-      expect(feeAccount?.cachedBalance.toString()).toBe("5");
+      const feeBalanceAfter = feeAccount?.cachedBalance ?? new Prisma.Decimal(0);
+      expect(feeBalanceAfter.minus(feeBalanceBefore).toString()).toBe("5");
     });
   });
 

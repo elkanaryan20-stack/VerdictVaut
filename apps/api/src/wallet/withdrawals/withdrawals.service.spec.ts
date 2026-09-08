@@ -425,6 +425,34 @@ describe("WithdrawalsService", () => {
     });
   });
 
+  describe("fail", () => {
+    it("releases the reservation, transitions to FAILED, and records a SYSTEM-actor audit row (no admin HTTP caller wraps this — see WithdrawalWatcherService)", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", status: "CONFIRMING" });
+
+      const result = await service.fail("wd-1", "Broadcast transaction 0xabc failed on-chain.");
+
+      expect(result.status).toBe("FAILED");
+      expect(reservations.release).toHaveBeenCalledWith(prisma, "res-1");
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorType: "SYSTEM",
+          action: "withdrawal.failed",
+          resourceType: "Withdrawal",
+          resourceId: "wd-1",
+          after: expect.objectContaining({ status: "FAILED" }),
+        }),
+      );
+    });
+
+    it("rejects a withdrawal already in a terminal state (e.g. already CREDITED) via CAS, never double-releasing a reservation", async () => {
+      prisma.withdrawal.updateMany.mockResolvedValue({ count: 0 });
+      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", status: "CREDITED" });
+
+      await expect(service.fail("wd-1", "some reason")).rejects.toThrow(ConflictException);
+      expect(reservations.release).not.toHaveBeenCalled();
+    });
+  });
+
   describe("reconcile", () => {
     it("rejects a non-SUPER_ADMIN actor", async () => {
       prisma.user.findUnique.mockResolvedValue({ id: "admin-1", role: "ADMIN" });
@@ -452,9 +480,80 @@ describe("WithdrawalsService", () => {
     });
 
     it("reports no discrepancy when the chain confirms what internal state expects", async () => {
-      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", txHash: "0xabc", assetNetworkId: "an-1", status: "CONFIRMING" });
+      prisma.withdrawal.findUnique.mockResolvedValue({
+        id: "wd-1",
+        txHash: "0xabc",
+        assetNetworkId: "an-1",
+        status: "CONFIRMING",
+        amount: new Prisma.Decimal(100),
+        fee: new Prisma.Decimal(0),
+        destinationAddress: "0x000000000000000000000000000000000000dEaD",
+      });
       custodyProviderFactory.resolve.mockResolvedValue({
         getTransactionStatus: jest.fn().mockResolvedValue({ status: "confirmed", confirmations: 3, amount: "100", txHash: "0xabc", assetNetworkId: "an-1" }),
+      });
+
+      const report = await service.reconcile("wd-1", "admin-1");
+      expect(report.discrepancy).toBe(false);
+    });
+
+    it("flags a discrepancy when the chain-observed destination does not match the withdrawal's recorded destination", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue({
+        id: "wd-1",
+        txHash: "0xabc",
+        assetNetworkId: "an-1",
+        status: "CONFIRMING",
+        amount: new Prisma.Decimal(100),
+        fee: new Prisma.Decimal(0),
+        destinationAddress: "0x000000000000000000000000000000000000dEaD",
+      });
+      custodyProviderFactory.resolve.mockResolvedValue({
+        getTransactionStatus: jest.fn().mockResolvedValue({
+          status: "confirmed",
+          confirmations: 3,
+          amount: "100",
+          txHash: "0xabc",
+          assetNetworkId: "an-1",
+          destinationAddress: "0x000000000000000000000000000000000000BEEF",
+        }),
+      });
+
+      const report = await service.reconcile("wd-1", "admin-1");
+
+      expect(report.discrepancy).toBe(true);
+      expect(report.note).toMatch(/destination does not match/i);
+    });
+
+    it("flags a discrepancy when the chain-observed amount does not match the withdrawal's expected net amount", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue({
+        id: "wd-1",
+        txHash: "0xabc",
+        assetNetworkId: "an-1",
+        status: "CONFIRMING",
+        amount: new Prisma.Decimal(100),
+        fee: new Prisma.Decimal(5),
+        destinationAddress: "0x000000000000000000000000000000000000dEaD",
+      });
+      custodyProviderFactory.resolve.mockResolvedValue({
+        getTransactionStatus: jest.fn().mockResolvedValue({
+          status: "confirmed",
+          confirmations: 3,
+          amount: "100", // should have been 95 (amount - fee)
+          txHash: "0xabc",
+          assetNetworkId: "an-1",
+        }),
+      });
+
+      const report = await service.reconcile("wd-1", "admin-1");
+
+      expect(report.discrepancy).toBe(true);
+      expect(report.note).toMatch(/on-chain amount.*does not match/i);
+    });
+
+    it("never flags a discrepancy for a FAILED withdrawal whose broadcast transaction the chain also reports as genuinely failed — that's the correct, consistent outcome", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", txHash: "0xabc", assetNetworkId: "an-1", status: "FAILED" });
+      custodyProviderFactory.resolve.mockResolvedValue({
+        getTransactionStatus: jest.fn().mockResolvedValue({ status: "failed", confirmations: 0, amount: "0", txHash: "0xabc", assetNetworkId: "an-1" }),
       });
 
       const report = await service.reconcile("wd-1", "admin-1");

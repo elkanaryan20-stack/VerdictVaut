@@ -56,13 +56,25 @@ export class XrpCustodyProvider implements CustodyProvider {
     const amount = typeof amountRaw === "string" ? rawUnitsToDecimalString(amountRaw, network.assetDecimals) : "0";
 
     if (!tx.validated) {
-      return { txHash, assetNetworkId, confirmations: 0, amount, status: "pending" };
+      return { txHash, assetNetworkId, confirmations: 0, amount, status: "pending", destinationAddress: tx.Destination };
+    }
+
+    // A transaction landing in a validated (immutable) ledger is not the
+    // same as it succeeding — XRPL's `tec*`-class result codes ("claimed
+    // cost only": e.g. tecPATH_DRY, tecUNFUNDED_PAYMENT) are validated
+    // and final but did NOT deliver funds; only tesSUCCESS did. The
+    // deposit-side mapper (xrp-tx.mapper.ts) already checks this before
+    // ever recording a deposit — this is the same check on the
+    // withdrawal-confirmation side, previously missing (requirement #12,
+    // "verify transaction success").
+    if (tx.meta.TransactionResult !== "tesSUCCESS") {
+      return { txHash, assetNetworkId, confirmations: 0, amount: "0", status: "failed", destinationAddress: tx.Destination };
     }
 
     const info = await callRippled<XrplServerInfoResult>(url, "server_info", {});
     const currentLedger = info.status === "error" ? tx.ledger_index : info.info.validated_ledger?.seq ?? tx.ledger_index;
     const confirmations = Math.max(currentLedger - tx.ledger_index + 1, 0);
 
-    return { txHash, assetNetworkId, confirmations, amount, status: "confirmed" };
+    return { txHash, assetNetworkId, confirmations, amount, status: "confirmed", destinationAddress: tx.Destination };
   }
 }

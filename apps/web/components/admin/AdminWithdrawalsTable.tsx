@@ -120,7 +120,9 @@ export function AdminWithdrawalsTable() {
                     {reconcileReport.discrepancy
                       ? reconcileReport.note
                       : reconcileReport.chainStatus
-                        ? `Chain confirms: ${reconcileReport.chainStatus.status}, ${reconcileReport.chainStatus.confirmations} confirmations.`
+                        ? reconcileReport.chainStatus.status === "failed"
+                          ? "Chain agrees: this transaction failed on-chain, consistent with this withdrawal's FAILED status."
+                          : `Chain status: ${reconcileReport.chainStatus.status}, ${reconcileReport.chainStatus.confirmations} confirmations.`
                         : "No transaction hash recorded yet — nothing to check on-chain."}
                   </div>
                 )}

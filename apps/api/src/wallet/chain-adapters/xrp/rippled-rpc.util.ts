@@ -1,4 +1,5 @@
 import { ServiceUnavailableException } from "@nestjs/common";
+import { withRetry } from "../retry.util";
 
 /**
  * `rippled`'s HTTP JSON-RPC always responds 200 with a `{"result": ...}`
@@ -7,8 +8,21 @@ import { ServiceUnavailableException } from "@nestjs/common";
  * never as an HTTP error status or a top-level JSON-RPC `error` field.
  * Every rippled call (the deposit adapter and the custody provider both)
  * goes through here so that distinction is handled in exactly one place.
+ * Wrapped in withRetry (bounded exponential backoff + jitter —
+ * requirement #8): a legitimate "not found" (txnNotFound/actNotFound)
+ * comes back inside a 200 response and is never thrown from here, so
+ * everything this function can throw is a genuine transport/provider
+ * failure, safe to retry.
  */
 export async function callRippled<T extends object>(
+  url: string,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<T & { error?: string; status?: string }> {
+  return withRetry(() => callRippledOnce<T>(url, method, params));
+}
+
+async function callRippledOnce<T extends object>(
   url: string,
   method: string,
   params: Record<string, unknown>,
