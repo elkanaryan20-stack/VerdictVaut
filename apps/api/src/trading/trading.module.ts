@@ -6,6 +6,8 @@ import { OrderBookService } from "./order-book/order-book.service";
 import { OrdersService } from "./orders.service";
 import { FEE_CALCULATOR } from "./fees/fee-calculator.interface";
 import { ZeroFeeCalculator } from "./fees/zero-fee.calculator";
+import { COMPLETE_SET_MINT_ENGINE } from "./matching/complete-set-mint-engine.interface";
+import { PriceTimePriorityCompleteSetMintEngine } from "./matching/complete-set-mint-engine";
 import { MATCHING_ENGINE } from "./matching/matching-engine.interface";
 import { PriceTimePriorityMatchingEngine } from "./matching/price-time-priority-matching-engine";
 import { PositionReservationService } from "./positions/position-reservation.service";
@@ -26,6 +28,7 @@ import { TradingController } from "./trading.controller";
     FillsService,
     { provide: FEE_CALCULATOR, useClass: ZeroFeeCalculator },
     { provide: MATCHING_ENGINE, useClass: PriceTimePriorityMatchingEngine },
+    { provide: COMPLETE_SET_MINT_ENGINE, useClass: PriceTimePriorityCompleteSetMintEngine },
   ],
   exports: [OrdersService, PositionReservationService, PositionsService, ExecutionCoordinator, FillsService],
 })

@@ -5,7 +5,9 @@ import {
   createTestUser,
   fundUserForTest,
   getUserAccount,
+  grantMarketCollateralForTest,
   grantPositionForTest,
+  ledger,
   marketsService,
   openMarketForTest,
   prisma,
@@ -128,6 +130,7 @@ describe("Market resolution & settlement (real Postgres)", () => {
       await fundUserForTest(loser.id, "USDC", "50");
       await grantPositionForTest(winner.id, market.id, yes.id, "10");
       await grantPositionForTest(loser.id, market.id, no.id, "20");
+      await grantMarketCollateralForTest(market.id, "USDC", "10");
 
       await resolutionService.resolve(market.id, admin.id, yes.id);
 
@@ -157,31 +160,42 @@ describe("Market resolution & settlement (real Postgres)", () => {
       expect(loserSettlement.ledgerTransactionId).toBeNull(); // no cash moved, no ledger entry posted
     });
 
-    it("ledger: the SETTLEMENT_POOL house account is debited exactly the sum of every winning payout", async () => {
+    it(
+      "ledger (Phase 12A): the market's OWN collateral account is debited exactly the sum of every winning payout, " +
+        "and never goes negative — real collateral, not a house account",
+      async () => {
+        const { admin, market, yes } = await setupClosedMarket();
+        const winnerA = await createTestUser();
+        const winnerB = await createTestUser();
+        await grantPositionForTest(winnerA.id, market.id, yes.id, "10");
+        await grantPositionForTest(winnerB.id, market.id, yes.id, "25");
+        await grantMarketCollateralForTest(market.id, "USDC", "35"); // exactly enough — no surplus
+
+        const before = await ledger.getMarketCollateralBalance(market.id, "USDC");
+        expect(before.toString()).toBe("35");
+
+        await resolutionService.resolve(market.id, admin.id, yes.id);
+
+        const after = await ledger.getMarketCollateralBalance(market.id, "USDC");
+        expect(after.toString()).toBe("0"); // fully consumed by the two winning payouts, never negative
+      },
+    );
+
+    it("settlement refuses to pay out a position with no real collateral behind it — never fabricates a negative balance", async () => {
       const { admin, market, yes } = await setupClosedMarket();
-      const winnerA = await createTestUser();
-      const winnerB = await createTestUser();
-      await grantPositionForTest(winnerA.id, market.id, yes.id, "10");
-      await grantPositionForTest(winnerB.id, market.id, yes.id, "25");
+      const winner = await createTestUser();
+      await grantPositionForTest(winner.id, market.id, yes.id, "10");
+      // Deliberately NOT calling grantMarketCollateralForTest — this
+      // market has zero real collateral backing the position above.
 
-      // SETTLEMENT_POOL is a single shared house account (one per asset,
-      // not per market/test) — other tests in this same run also debit
-      // it, so only the DELTA this resolution causes is meaningful, not
-      // an absolute balance.
-      const asset = await prisma.asset.findFirstOrThrow({ where: { isSettlementCurrency: true } });
-      const before = await prisma.ledgerAccount.upsert({
-        where: { houseAccountKey_assetId: { houseAccountKey: "SETTLEMENT_POOL", assetId: asset.id } },
-        create: { ownerType: "HOUSE", houseAccountKey: "SETTLEMENT_POOL", assetId: asset.id, cachedBalance: 0, reservedBalance: 0 },
-        update: {},
+      await expect(resolutionService.resolve(market.id, admin.id, yes.id)).rejects.toThrow();
+
+      // The position must NOT have been silently settled anyway.
+      const position = await prisma.position.findUniqueOrThrow({
+        where: { userId_marketId_outcomeId: { userId: winner.id, marketId: market.id, outcomeId: yes.id } },
       });
-
-      await resolutionService.resolve(market.id, admin.id, yes.id);
-
-      const after = await prisma.ledgerAccount.findUniqueOrThrow({
-        where: { houseAccountKey_assetId: { houseAccountKey: "SETTLEMENT_POOL", assetId: asset.id } },
-      });
-      const delta = after.cachedBalance.minus(before.cachedBalance);
-      expect(delta.toString()).toBe("-35"); // 10 + 25, negative — funds winners, never collateralized
+      expect(position.settledAt).toBeNull();
+      expect(await getUserAccount(winner.id, "USDC")).toBeNull(); // no fabricated payout
     });
 
     it("multiple positions across multiple users for the same market settle independently and correctly", async () => {
@@ -191,6 +205,7 @@ describe("Market resolution & settlement (real Postgres)", () => {
       await grantPositionForTest(users[1].id, market.id, yes.id, "8");
       await grantPositionForTest(users[2].id, market.id, no.id, "5");
       await grantPositionForTest(users[3].id, market.id, no.id, "12");
+      await grantMarketCollateralForTest(market.id, "USDC", "11"); // only the YES side ever pays out
 
       await resolutionService.resolve(market.id, admin.id, yes.id);
 
@@ -207,6 +222,7 @@ describe("Market resolution & settlement (real Postgres)", () => {
       const { admin, market, yes } = await setupClosedMarket();
       const winner = await createTestUser();
       await grantPositionForTest(winner.id, market.id, yes.id, "10.123456789012345678");
+      await grantMarketCollateralForTest(market.id, "USDC", "10.123456789012345678");
 
       await resolutionService.resolve(market.id, admin.id, yes.id);
 
@@ -234,6 +250,7 @@ describe("Market resolution & settlement (real Postgres)", () => {
       const { admin, market, yes } = await setupClosedMarket();
       const winner = await createTestUser();
       await grantPositionForTest(winner.id, market.id, yes.id, "10");
+      await grantMarketCollateralForTest(market.id, "USDC", "10");
       await resolutionService.resolve(market.id, admin.id, yes.id);
 
       const result = await settlementService.settleMarket(market.id);
@@ -252,6 +269,7 @@ describe("Market resolution & settlement (real Postgres)", () => {
         const { admin, market, yes } = await setupClosedMarket();
         const winners = await Promise.all(Array.from({ length: 6 }, () => createTestUser()));
         await Promise.all(winners.map((w) => grantPositionForTest(w.id, market.id, yes.id, "10")));
+        await grantMarketCollateralForTest(market.id, "USDC", "60");
 
         await resolveWithoutAutoSettle(market.id, yes.id, admin.id);
 
@@ -284,6 +302,7 @@ describe("Market resolution & settlement (real Postgres)", () => {
         await grantPositionForTest(good1.id, market.id, yes.id, "10");
         await grantPositionForTest(bad.id, market.id, yes.id, "5");
         await grantPositionForTest(good2.id, market.id, yes.id, "7");
+        await grantMarketCollateralForTest(market.id, "USDC", "22");
 
         // Simulate a corrupted position (e.g. a hypothetical bug
         // elsewhere left a reservation active) — settlement must refuse

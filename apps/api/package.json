@@ -15,7 +15,9 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:migrate:deploy": "prisma migrate deploy",
-    "prisma:migrate:diff": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url \"$DATABASE_URL\" --script"
+    "prisma:migrate:diff": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url \"$DATABASE_URL\" --script",
+    "backup:drill": "node scripts/backup-restore-drill.js",
+    "check:integrity": "node scripts/financial-integrity-checks.js"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.15",

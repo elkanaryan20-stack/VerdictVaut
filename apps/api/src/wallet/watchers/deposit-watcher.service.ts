@@ -1,19 +1,14 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { WalletAddressStatus } from "@prisma/client";
 import * as crypto from "crypto";
 import { AppConfig } from "../../config/configuration";
 import { isUniqueConstraintViolation } from "../../prisma/idempotent-create.util";
 import { PrismaService } from "../../prisma/prisma.service";
 import { DepositChainAdapterFactory } from "../chain-adapters/deposit-chain-adapter.factory";
-import { WatchedAddress } from "../chain-adapters/deposit-chain-adapter.interface";
+import { loadWatchedAddresses, WatchedAddressWithOwner } from "../chain-adapters/watched-addresses.util";
 import { ConfirmationPolicyService } from "../confirmation/confirmation-policy.service";
 import { DepositsService } from "../deposits/deposits.service";
 import { STALE_CURSOR_THRESHOLD_MS } from "../reconciliation/reconciliation.service";
-
-interface WatchedAddressWithOwner extends WatchedAddress {
-  userId: string;
-}
 
 // A lease older than this is treated as an abandoned/crashed worker's and
 // may be reclaimed by another instance (requirement #7: prevent
@@ -275,18 +270,6 @@ export class DepositWatcherService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async loadWatchedAddresses(assetNetworkId: string): Promise<WatchedAddressWithOwner[]> {
-    const rows = await this.prisma.walletAddress.findMany({
-      where: { assetNetworkId, status: WalletAddressStatus.ASSIGNED },
-      include: { assignment: true },
-    });
-
-    return rows
-      .filter((row) => row.assignment != null)
-      .map((row) => ({
-        walletAddressId: row.id,
-        address: row.address,
-        destinationTag: row.destinationTag,
-        userId: row.assignment!.userId,
-      }));
+    return loadWatchedAddresses(this.prisma, assetNetworkId);
   }
 }

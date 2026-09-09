@@ -37,5 +37,11 @@ apps/api/prisma/*.db
 apps/api/.integration-pgdata/
 apps/api/.devpg/
 
+# embedded postgres (used by the Phase 12A backup/restore drill — see
+# apps/api/scripts/backup-restore-drill.js; cleaned up automatically on
+# a normal run, ignored defensively in case a run is interrupted)
+apps/api/.backup-drill-primary/
+apps/api/.backup-drill-restored/
+
 # misc
 .turbo/

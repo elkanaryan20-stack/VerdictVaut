@@ -69,11 +69,30 @@ enum LedgerTransactionType {
   SETTLEMENT
   ADJUSTMENT
   REVERSAL
+  // Phase 12A: locks real collateral for a newly-minted complete set — see
+  // CompleteSetMint and ExecutionCoordinator.applyMintExecution, the sole
+  // writer. Purpose: fund a market's own MARKET-owned LedgerAccount with
+  // exactly 1 unit of settlement currency per share minted, so a later
+  // SETTLEMENT payout is never unbacked. Debit: both buyers' USER
+  // accounts (their own priceA/priceB share of the $1). Credit: the
+  // market's MARKET-owned collateral account, +1 per unit quantity.
+  // Idempotency key: `mint:${completeSetMint.id}`. Lifecycle: posted
+  // exactly once per CompleteSetMint row, in the same transaction that
+  // creates it; never reversed by any code path today (a future
+  // redeem/burn-before-resolution mechanism, if built, would be the one
+  // legitimate reversal path — deliberately out of scope this phase).
+  MINT
 }
 
 enum LedgerAccountOwnerType {
   USER
   HOUSE
+  // Phase 12A: a market's own locked collateral, real cash already
+  // debited from users at complete-set mint time — never a house
+  // account, never fabricated. One row per (marketId, assetId), never
+  // negative (see ledger_accounts_user_balance_check, which already
+  // exempts only HOUSE). See CompleteSetMint / SettlementService.
+  MARKET
 }
 
 // House/omnibus counterparties. EXTERNAL_CHAIN is the mirror of the outside
@@ -84,21 +103,24 @@ enum LedgerAccountOwnerType {
 enum HouseAccountKey {
   EXTERNAL_CHAIN
   FEE_REVENUE
-  // Counterparty for market-resolution payouts (see SettlementService).
-  // DELIBERATE ACCOUNTING BOUNDARY: this system has no complete-set /
-  // collateral-minting mechanism for outcome shares — a share's cash
-  // counterpart is never escrowed at trade time (a BUY's reserved cash
-  // is simply transferred to the matched SELL's own cash balance at
-  // execution, per ExecutionCoordinator.postTradeLedger; nothing is set
-  // aside against future settlement). So a winning position's payout at
-  // resolution is not backed by pre-collateralized platform funds — this
-  // account funds it directly and is expected to run persistently
-  // negative, exactly like EXTERNAL_CHAIN. Losing positions receive a
-  // zero payout and post no ledger entry at all, so nothing ever flows
-  // the other way to offset this. Replacing this with real
-  // collateralization (e.g. locking BUY-side cash into this pool at
-  // trade time, or a complete-set mint/split mechanism) is out of scope
-  // for this phase and should happen before real funds are on the line.
+  // HISTORICAL / NO LONGER USED FOR NEW SETTLEMENTS as of Phase 12A.
+  // Originally the counterparty for every market-resolution payout, back
+  // when this system had no complete-set/collateral-minting mechanism
+  // for outcome shares (a BUY's reserved cash was simply transferred to
+  // the matched SELL's own cash balance at execution, with nothing ever
+  // escrowed against future settlement) — this account funded payouts
+  // directly and was expected to run persistently negative, exactly like
+  // EXTERNAL_CHAIN. Phase 12A replaced this with real collateralization:
+  // SettlementService now debits the resolving market's own MARKET-owned
+  // LedgerAccount (funded at complete-set mint time — see
+  // CompleteSetMint, LedgerAccountOwnerType.MARKET), which is provably
+  // sufficient to cover every winning payout because minting always
+  // locks exactly 1 unit of settlement currency per share created. This
+  // enum value is retained, unused by any current code path, purely so
+  // historical LedgerAccount/LedgerEntry rows from before Phase 12A
+  // remain queryable — never repurposed or hidden under a different
+  // name. A future cleanup migration could remove it once no such
+  // historical data needs to be read.
   SETTLEMENT_POOL
 }
 
@@ -214,6 +236,25 @@ enum ReconciliationStatus {
   ERROR
 }
 
+// Phase 12A: distinguishes the original cursor-adjacent checks
+// (ReconciliationService.run — address-balance vs. internal-ledger
+// consistency, stale-cursor detection) from the new independent rescan
+// (IndependentReconciliationService — re-derives chain observations
+// fresh, deliberately never trusting BlockchainWatchCursor).
+enum ReconciliationRunType {
+  CURSOR_BASED_CHECKS
+  INDEPENDENT_RESCAN
+}
+
+// SUPER_ADMIN-controlled resolution lifecycle for one
+// ReconciliationDiscrepancy row — see that model's own docblock.
+enum DiscrepancyStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+  FALSE_POSITIVE
+}
+
 enum AuditActorType {
   USER
   ADMIN
@@ -258,6 +299,10 @@ model User {
   fillsAsSeller             Fill[]                     @relation("FillSeller")
   marketResolutions         MarketResolution[]
   positionSettlements       PositionSettlement[]
+  mintsAsBuyerA             CompleteSetMint[]          @relation("MintBuyerA")
+  mintsAsBuyerB             CompleteSetMint[]          @relation("MintBuyerB")
+  initiatedReconciliationRuns   ReconciliationRun[]
+  resolvedDiscrepancies         ReconciliationDiscrepancy[]
 
   @@map("users")
 }
@@ -320,6 +365,11 @@ model Market {
   settlements Settlement[]
   resolution  MarketResolution?
   positionSettlements PositionSettlement[]
+  // Phase 12A: this market's own collateral LedgerAccount(s) — in
+  // practice exactly one, for the platform's single settlement-currency
+  // asset (see ledger_accounts_marketId_assetId_key).
+  ledgerAccounts      LedgerAccount[]
+  completeSetMints    CompleteSetMint[]
 
   @@index([categoryId])
   @@index([status])
@@ -344,6 +394,8 @@ model MarketOutcome {
   settlements Settlement[]
   resolutionWins      MarketResolution[]
   positionSettlements PositionSettlement[]
+  mintsAsOutcomeA     CompleteSetMint[] @relation("MintOutcomeA")
+  mintsAsOutcomeB     CompleteSetMint[] @relation("MintOutcomeB")
 
   @@unique([marketId, key])
   @@map("market_outcomes")
@@ -388,6 +440,8 @@ model Order {
   sellFills Fill[]        @relation("SellOrder")
   makerFills Fill[]       @relation("MakerOrder")
   takerFills Fill[]       @relation("TakerOrder")
+  mintsAsA  CompleteSetMint[] @relation("MintBuyOrderA")
+  mintsAsB  CompleteSetMint[] @relation("MintBuyOrderB")
 
   @@unique([userId, clientOrderId])
   // Primary order-book / price-time-priority lookup path: resting
@@ -601,6 +655,53 @@ model PositionSettlement {
   @@map("position_settlements")
 }
 
+// Phase 12A: the ONLY mechanism that ever increases the total float of an
+// outcome's shares (see ExecutionCoordinator.applyMintExecution, the sole
+// writer) — every other position change is a transfer between existing
+// holders (see ExecutionCoordinator.updatePositions), never a creation.
+// A complete-set mint is one BUY order on outcome A crossing a
+// complementary resting BUY order on outcome B, where priceA + priceB =
+// 1 exactly (complete_set_mints_price_sum_check) — the whole reason
+// settlement stays fully collateralized: `quantity` new shares of EACH
+// outcome are created, and exactly `quantity` units of settlement
+// currency are simultaneously locked in the market's own MARKET-owned
+// LedgerAccount (see the paired LedgerTransactionType.MINT posting).
+// Restricted to exactly-binary (2-outcome) markets — see
+// CompleteSetMintEngine's own docblock for why a 3+-outcome market's
+// SELL orders still require pre-existing inventory, unchanged.
+model CompleteSetMint {
+  id            String   @id @default(uuid())
+  marketId      String
+  outcomeAId    String
+  outcomeBId    String
+  buyOrderAId   String
+  buyOrderBId   String
+  buyerAUserId  String
+  buyerBUserId  String
+  priceA        Decimal  @db.Decimal(18, 6)
+  priceB        Decimal  @db.Decimal(18, 6)
+  quantity      Decimal  @db.Decimal(36, 18)
+  // Deterministic, derived from the (makerOrderId, takerOrderId)
+  // identity pair by CompleteSetMintEngine — the same idempotency
+  // primitive Fill.idempotencyKey uses, guarding against the same mint
+  // being applied twice (retry, concurrent re-derivation).
+  idempotencyKey String  @unique
+  mintedAt      DateTime @default(now())
+
+  market    Market        @relation(fields: [marketId], references: [id])
+  outcomeA  MarketOutcome @relation("MintOutcomeA", fields: [outcomeAId], references: [id])
+  outcomeB  MarketOutcome @relation("MintOutcomeB", fields: [outcomeBId], references: [id])
+  buyOrderA Order         @relation("MintBuyOrderA", fields: [buyOrderAId], references: [id])
+  buyOrderB Order         @relation("MintBuyOrderB", fields: [buyOrderBId], references: [id])
+  buyerA    User          @relation("MintBuyerA", fields: [buyerAUserId], references: [id])
+  buyerB    User          @relation("MintBuyerB", fields: [buyerBUserId], references: [id])
+
+  @@index([marketId])
+  @@index([buyOrderAId])
+  @@index([buyOrderBId])
+  @@map("complete_set_mints")
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Ledger — true double-entry accounting.
 //
@@ -631,18 +732,26 @@ model LedgerAccount {
   ownerType       LedgerAccountOwnerType @default(USER)
   userId          String?
   houseAccountKey HouseAccountKey?
+  // Phase 12A: populated iff ownerType = MARKET — see
+  // ledger_accounts_owner_ref_check for the DB-level guarantee that
+  // exactly one of userId/houseAccountKey/marketId is set, matching
+  // ownerType. Never a house account: this is real collateral, locked
+  // from real user cash at complete-set mint time (see CompleteSetMint).
+  marketId        String?
   assetId         String
   cachedBalance   Decimal                @default(0) @db.Decimal(36, 18)
   reservedBalance Decimal                @default(0) @db.Decimal(36, 18)
   updatedAt       DateTime               @updatedAt
 
   user         User?             @relation(fields: [userId], references: [id])
+  market       Market?           @relation(fields: [marketId], references: [id])
   asset        Asset             @relation(fields: [assetId], references: [id])
   entries      LedgerEntry[]
   reservations FundReservation[]
 
   @@unique([userId, assetId])
   @@unique([houseAccountKey, assetId])
+  @@unique([marketId, assetId])
   @@map("ledger_accounts")
 }
 
@@ -763,6 +872,7 @@ model AssetNetwork {
   executionConfig    WithdrawalExecutionConfig?
   watchCursor        BlockchainWatchCursor?
   reconciliationRuns ReconciliationRun[]
+  discrepancies      ReconciliationDiscrepancy[]
 
   @@unique([assetId, networkId])
   @@map("asset_networks")
@@ -978,13 +1088,79 @@ model ReconciliationRun {
   assetNetworkId String
   runAt          DateTime             @default(now())
   status         ReconciliationStatus
+  // Embedded-JSON findings — the original, pre-Phase-12A shape, still
+  // used by ReconciliationService.run's cursor-adjacent checks. The new
+  // IndependentReconciliationService instead writes first-class
+  // ReconciliationDiscrepancy rows (discrepancyRecords below), which
+  // carry a real SUPER_ADMIN resolution lifecycle these JSON blobs never
+  // had — kept separate rather than migrating the old checks onto the
+  // new model, to avoid an unrelated, riskier refactor of a working
+  // system in the same phase that introduces the new capability.
   discrepancies  Json?
   notes          String?
+  runType           ReconciliationRunType @default(CURSOR_BASED_CHECKS)
+  // Who triggered this run — always populated for INDEPENDENT_RESCAN
+  // (SUPER_ADMIN-only, see admin.controller.ts); nullable because
+  // pre-Phase-12A CURSOR_BASED_CHECKS rows never recorded this.
+  initiatedByUserId String?
+  // The independently-derived rescan window actually used — e.g. an EVM
+  // block range. Null for CURSOR_BASED_CHECKS (that path re-derives its
+  // own window internally per check and was never asked to report it).
+  fromPointer       String?
+  toPointer         String?
 
-  assetNetwork AssetNetwork @relation(fields: [assetNetworkId], references: [id])
+  assetNetwork       AssetNetwork                @relation(fields: [assetNetworkId], references: [id])
+  initiatedBy        User?                       @relation(fields: [initiatedByUserId], references: [id])
+  discrepancyRecords ReconciliationDiscrepancy[]
 
   @@index([assetNetworkId, runAt])
   @@map("reconciliation_runs")
+}
+
+// First-class, individually-resolvable discrepancy record — the
+// independent rescan's counterpart to the old checks' embedded-JSON
+// findings (see ReconciliationRun.discrepancies). `idempotencyKey` is
+// deterministic (assetNetworkId + type + the chain identity that proves
+// it), so re-running an independent rescan that re-observes the SAME
+// still-open real-world discrepancy never creates a duplicate row —
+// only a genuinely new instance of a given (type, chainIdentity) pair
+// after the prior one was resolved creates a new one.
+//
+// This table is an OBSERVATION/CONTROL record only — nothing in this
+// codebase ever reads a row here and automatically credits/debits a
+// user, releases/completes a withdrawal, or reverses a deposit. Every
+// resolution is a deliberate SUPER_ADMIN action (see
+// IndependentReconciliationService.acknowledge/resolve).
+model ReconciliationDiscrepancy {
+  id             String            @id @default(uuid())
+  runId          String
+  assetNetworkId String
+  // Stable, machine-matchable slug — e.g.
+  // "chain_event_missing_internal_deposit". Never a vague free-text blob.
+  type           String
+  severity       String
+  // The independent evidence key that proves this discrepancy's
+  // identity — e.g. a txHash, or "txHash:eventIndex" for a chain whose
+  // transactions can carry multiple events (see Deposit.eventIndex).
+  chainIdentity      String
+  internalEntityType String?
+  internalEntityId   String?
+  expectedState      Json
+  observedState      Json
+  status         DiscrepancyStatus @default(OPEN)
+  createdAt      DateTime          @default(now())
+  resolvedAt     DateTime?
+  resolvedByUserId String?
+  notes          String?
+  idempotencyKey String            @unique
+
+  run          ReconciliationRun @relation(fields: [runId], references: [id])
+  assetNetwork AssetNetwork      @relation(fields: [assetNetworkId], references: [id])
+  resolvedBy   User?             @relation(fields: [resolvedByUserId], references: [id])
+
+  @@index([assetNetworkId, status])
+  @@index([runId])
+  @@map("reconciliation_discrepancies")
 }
 
 // ────────────────────────────────────────────────────────────────────────

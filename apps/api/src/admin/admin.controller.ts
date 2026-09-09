@@ -1,6 +1,6 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
 import { Throttle } from "@nestjs/throttler";
-import { UserRole } from "@prisma/client";
+import { DiscrepancyStatus, UserRole } from "@prisma/client";
 import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
 import { Roles } from "../common/decorators/roles.decorator";
@@ -10,12 +10,20 @@ import { AssetsNetworksService } from "../wallet/assets-networks/assets-networks
 import { DepositAddressService } from "../wallet/addresses/deposit-address.service";
 import { DepositsService } from "../wallet/deposits/deposits.service";
 import { ReconciliationService } from "../wallet/reconciliation/reconciliation.service";
+import { IndependentReconciliationService } from "../wallet/reconciliation/independent-reconciliation.service";
 import { DepositReprocessingService } from "../wallet/watchers/deposit-reprocessing.service";
 import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
 import { WithdrawalsService } from "../wallet/withdrawals/withdrawals.service";
 import { BroadcastWithdrawalDto } from "../wallet/withdrawals/dto/broadcast-withdrawal.dto";
 import { AuditLogService } from "../audit/audit-log.service";
-import { CreateAssetNetworkDto, ProvisionAddressDto, RejectWithdrawalDto, SetActiveDto } from "./dto/admin.dto";
+import {
+  CreateAssetNetworkDto,
+  ProvisionAddressDto,
+  RejectWithdrawalDto,
+  ResolveDiscrepancyDto,
+  SetActiveDto,
+  StartIndependentRescanDto,
+} from "./dto/admin.dto";
 
 /**
  * Class-level @Roles(ADMIN, SUPER_ADMIN) is the baseline for read-only
@@ -46,6 +54,7 @@ export class AdminController {
     private readonly depositsService: DepositsService,
     private readonly withdrawalsService: WithdrawalsService,
     private readonly reconciliationService: ReconciliationService,
+    private readonly independentReconciliationService: IndependentReconciliationService,
     private readonly reprocessingService: DepositReprocessingService,
     private readonly depositWatcherService: DepositWatcherService,
     private readonly auditLogService: AuditLogService,
@@ -283,9 +292,59 @@ export class AdminController {
     return run;
   }
 
+  // Registered before "reconciliation/:assetNetworkId" — Nest matches
+  // literal path segments in declaration order, so "discrepancies" must
+  // come first or it would be swallowed as an :assetNetworkId value
+  // (same literal-vs-param ordering rule as deposits/stale above).
+  @Get("reconciliation/discrepancies")
+  listDiscrepancies(@Query("assetNetworkId") assetNetworkId?: string, @Query("status") status?: DiscrepancyStatus) {
+    return this.independentReconciliationService.listDiscrepancies({ assetNetworkId, status });
+  }
+
   @Get("reconciliation/:assetNetworkId")
   listReconciliationRuns(@Param("assetNetworkId") assetNetworkId: string) {
     return this.reconciliationService.listRuns(assetNetworkId);
+  }
+
+  // ── Independent blockchain rescan (Phase 12A — SUPER_ADMIN only to
+  // start; ADMIN+SUPER_ADMIN may read discrepancies, matching the
+  // existing read/mutate split above) ────────────────────────────────
+  @Post("reconciliation/:assetNetworkId/independent-rescan")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  runIndependentRescan(
+    @CurrentUser() admin: AuthenticatedUser,
+    @Param("assetNetworkId") assetNetworkId: string,
+    @Body() dto: StartIndependentRescanDto,
+  ) {
+    return this.independentReconciliationService.runIndependentRescan(assetNetworkId, admin.id, dto.fromPointer);
+  }
+
+  @Get("reconciliation/:assetNetworkId/independent-rescan")
+  listIndependentRescanRuns(@Param("assetNetworkId") assetNetworkId: string) {
+    return this.independentReconciliationService.listRuns(assetNetworkId);
+  }
+
+  @Post("reconciliation/discrepancies/:id/acknowledge")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async acknowledgeDiscrepancy(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    const acknowledged = await this.independentReconciliationService.acknowledge(id, admin.id);
+    if (!acknowledged) {
+      throw new BadRequestException("Discrepancy not found or not currently OPEN");
+    }
+    return { acknowledged: true };
+  }
+
+  @Post("reconciliation/discrepancies/:id/resolve")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async resolveDiscrepancy(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string, @Body() dto: ResolveDiscrepancyDto) {
+    const resolved = await this.independentReconciliationService.resolve(id, admin.id, dto.notes, dto.outcome ?? "RESOLVED");
+    if (!resolved) {
+      throw new BadRequestException("Discrepancy not found or already resolved");
+    }
+    return { resolved: true };
   }
 
   // ── Watcher / cursor operational visibility (requirement #15) ────────

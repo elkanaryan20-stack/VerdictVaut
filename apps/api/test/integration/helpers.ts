@@ -14,6 +14,7 @@ import { PrismaService } from "../../src/prisma/prisma.service";
 import { SerializableTransactionRunner } from "../../src/prisma/serializable-transaction-runner";
 import { ExecutionCoordinator } from "../../src/trading/execution/execution-coordinator.service";
 import { ZeroFeeCalculator } from "../../src/trading/fees/zero-fee.calculator";
+import { PriceTimePriorityCompleteSetMintEngine } from "../../src/trading/matching/complete-set-mint-engine";
 import { PriceTimePriorityMatchingEngine } from "../../src/trading/matching/price-time-priority-matching-engine";
 import { OrderBookService } from "../../src/trading/order-book/order-book.service";
 import { OrdersService } from "../../src/trading/orders.service";
@@ -106,6 +107,7 @@ export const orderRiskValidator = new OrderRiskValidator(prisma);
 export const feeCalculator = new ZeroFeeCalculator();
 export const orderBookService = new OrderBookService(prisma);
 export const matchingEngine = new PriceTimePriorityMatchingEngine();
+export const mintEngine = new PriceTimePriorityCompleteSetMintEngine();
 export const executionCoordinator = new ExecutionCoordinator(
   prisma,
   txRunner,
@@ -114,6 +116,7 @@ export const executionCoordinator = new ExecutionCoordinator(
   reservations,
   positionReservations,
   matchingEngine,
+  mintEngine,
   feeCalculator,
 );
 export const ordersService = new OrdersService(
@@ -208,12 +211,45 @@ export async function getUserAccount(userId: string, assetSymbol: string) {
 }
 
 /**
- * Test-fixture helper only. There is no real position-crediting mechanism
- * in this phase — that is the (not-yet-built) matching engine's job — so
- * this directly sets a Position's quantity via Prisma to test SELL-order
- * share-reservation without a matcher. This never runs in the shipped
- * app and never represents fabricated real trading activity; it exists
- * solely so PositionReservationService can be exercised deterministically.
+ * Test-fixture helper only (Phase 12A) — grants a market's collateral
+ * LedgerAccount real backing via the actual LedgerService.postTransaction
+ * path (a balanced double-entry posting against EXTERNAL_CHAIN), exactly
+ * mirroring fundUserForTest's own reasoning. Used together with
+ * grantPositionForTest: that helper fabricates a Position directly
+ * (bypassing the real minting flow this phase introduced), so a
+ * settlement test that expects a payout to succeed must separately
+ * ensure the market's collateral account actually has enough real
+ * backing — settlement now correctly refuses to pay out from an
+ * under-collateralized market, exactly as production should.
+ */
+export async function grantMarketCollateralForTest(marketId: string, assetSymbol: string, amount: string) {
+  const unique = `${marketId}:${assetSymbol}:${Date.now()}:${Math.random()}`;
+  return txRunner.run((tx) =>
+    ledger.postTransaction(tx, {
+      assetSymbol,
+      type: "MINT",
+      referenceType: "TestFixture",
+      referenceId: unique,
+      idempotencyKey: `fixture-collateral:${unique}`,
+      postings: [
+        { account: { type: "MARKET", marketId }, amount },
+        { account: { type: "HOUSE", key: "EXTERNAL_CHAIN" }, amount: new Prisma.Decimal(amount).negated() },
+      ],
+    }),
+  );
+}
+
+/**
+ * Test-fixture helper only. Directly sets a Position's quantity via
+ * Prisma, bypassing the real complete-set-minting mechanism (Phase 12A)
+ * that is the only production path to a genuine, collateral-backed
+ * position — this exists purely for tests that want a deterministic
+ * starting position without exercising the full mint/match flow (e.g.
+ * SELL-order share-reservation tests). Never runs in the shipped app and
+ * never represents fabricated real trading activity. A settlement test
+ * that expects a payout to succeed must separately call
+ * grantMarketCollateralForTest to back it — settlement correctly refuses
+ * to pay out a position with no real collateral behind it.
  */
 export async function grantPositionForTest(userId: string, marketId: string, outcomeId: string, quantity: string) {
   return prisma.position.upsert({

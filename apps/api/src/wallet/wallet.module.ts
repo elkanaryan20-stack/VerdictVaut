@@ -29,6 +29,7 @@ import { ZeroWithdrawalFeeCalculator } from "./withdrawals/fees/zero-withdrawal-
 import { WithdrawalsController } from "./withdrawals/withdrawals.controller";
 import { WithdrawalsService } from "./withdrawals/withdrawals.service";
 import { ReconciliationService } from "./reconciliation/reconciliation.service";
+import { IndependentReconciliationService } from "./reconciliation/independent-reconciliation.service";
 import { DepositReprocessingService } from "./watchers/deposit-reprocessing.service";
 import { DepositWatcherService } from "./watchers/deposit-watcher.service";
 import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service";
@@ -46,6 +47,7 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     ProductionCustodyExecutor,
     WithdrawalExecutorFactory,
     ReconciliationService,
+    IndependentReconciliationService,
     ChainRpcConfigService,
     ConfirmationPolicyService,
     BitcoinDepositAdapter,
@@ -70,6 +72,7 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     DepositsService,
     WithdrawalsService,
     ReconciliationService,
+    IndependentReconciliationService,
     DepositChainAdapterFactory,
     ConfirmationPolicyService,
     DepositReprocessingService,

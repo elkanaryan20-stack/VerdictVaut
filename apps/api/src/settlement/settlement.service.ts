@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, Logger } from "@nestjs/common";
-import { MarketStatus, Prisma } from "@prisma/client";
+import { MarketStatus } from "@prisma/client";
 import { LedgerService } from "../ledger/ledger.service";
 import { createIdempotent } from "../prisma/idempotent-create.util";
 import { PrismaService } from "../prisma/prisma.service";
@@ -133,6 +133,17 @@ export class SettlementService {
       let ledgerTransactionId: string | null = null;
       if (!payoutAmount.isZero()) {
         const settlementAsset = await tx.asset.findFirstOrThrow({ where: { isSettlementCurrency: true } });
+        // Phase 12A: funded by the market's OWN collateral account, not
+        // the historical HOUSE:SETTLEMENT_POOL — real cash locked at
+        // complete-set mint time (see CompleteSetMint), never a
+        // fabricated/negative house balance. This is provably sufficient:
+        // total collateral ever minted for this market equals the total
+        // share float of each outcome (minting always creates equal
+        // quantities of both), and a winning outcome's total payout
+        // equals exactly that same float * payoutPerShare(1) — see the
+        // Phase 12A audit report's economic-model analysis for the full
+        // proof. A losing position pays 0 and posts nothing, so nothing
+        // is ever drawn from collateral on that side.
         const { transactionId } = await this.ledger.postTransaction(tx, {
           assetSymbol: settlementAsset.symbol,
           type: "SETTLEMENT",
@@ -141,7 +152,7 @@ export class SettlementService {
           idempotencyKey: `settlement-payout:${position.id}`,
           postings: [
             { account: { type: "USER", userId: position.userId }, amount: payoutAmount },
-            { account: { type: "HOUSE", key: "SETTLEMENT_POOL" }, amount: payoutAmount.negated() },
+            { account: { type: "MARKET", marketId: position.marketId }, amount: payoutAmount.negated() },
           ],
         });
         ledgerTransactionId = transactionId;

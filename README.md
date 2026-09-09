@@ -7,10 +7,13 @@ this phase; production custody is not implemented yet).
 
 This repository includes authentication, the ledger, the asset/network/
 wallet model (deposit watchers, withdrawal confirmation, reconciliation —
-see below), a price-time-priority matching engine, market resolution/
-settlement, trading/wallet/admin frontends, and role-guarded admin
-tooling, tested where practical. Production custody integration is the
-main remaining piece — see [Next recommended implementation steps](#next-recommended-implementation-steps).
+see below), a price-time-priority matching engine with real,
+collateral-backed complete-set minting (see
+[Settlement collateralization](#settlement-collateralization-complete-set-minting)
+below), market resolution/settlement, trading/wallet/admin frontends,
+and role-guarded admin tooling, tested where practical. Production
+custody integration is the main remaining piece — see
+[Next recommended implementation steps](#next-recommended-implementation-steps).
 
 ## Repository layout
 
@@ -22,6 +25,10 @@ packages/
   shared-types/   Types/schemas shared between web and api (assets, order DTOs)
 infra/
   docker-compose.yml   Local PostgreSQL for development
+  backup.sh            Real pg_dump-based backup for the docker-compose Postgres
+  restore.sh           Restores a backup/backup.sh dump into a new database
+docs/
+  database-backup-recovery.md   Backup/DR architecture, RPO/RTO status, restore test results
 ```
 
 ### Backend module boundaries (`apps/api/src`)
@@ -29,9 +36,12 @@ infra/
 - **auth** — registration/login, JWT access + refresh tokens, refresh rotation.
 - **users** — user profile lookups.
 - **markets** — market/category CRUD and discovery reads.
-- **trading** — order intake and cancellation, positions read. No matching
-  engine yet (see Next steps) — orders are validated and persisted, not
-  matched or filled.
+- **trading** — order intake, cancellation, and a real price-time-priority
+  matching engine (`PriceTimePriorityMatchingEngine`) producing `Fill`
+  rows. `BUY` orders that find no matching resting inventory fall back to
+  complementary complete-set minting against the market's other outcome
+  (`PriceTimePriorityCompleteSetMintEngine`) — see
+  [Settlement collateralization](#settlement-collateralization-complete-set-minting).
 - **ledger** — the single authoritative path (`LedgerService.postEntry`) for
   every balance mutation. Runs at `SERIALIZABLE` isolation; never allows a
   balance to go negative; every entry is immutable and auditable.
@@ -39,9 +49,11 @@ infra/
   the deposit crediting path, the withdrawal state machine, the
   `WithdrawalExecutor` abstraction (`ManualBroadcastExecutor` for sandbox,
   `ProductionCustodyExecutor` as an unimplemented, fail-closed placeholder),
-  per-chain deposit-watcher/withdrawal-confirmation background workers, and
-  a reconciliation framework comparing internal state against live chain
-  data — see [Blockchain watcher & reconciliation architecture](#blockchain-watcher--reconciliation-architecture) below.
+  per-chain deposit-watcher/withdrawal-confirmation background workers, a
+  cursor-adjacent reconciliation framework, and an independent
+  rescan-and-diff reconciliation pass that never trusts the watcher
+  cursor (Phase 12A) — see
+  [Blockchain watcher & reconciliation architecture](#blockchain-watcher--reconciliation-architecture) below.
 - **admin** — role-guarded configuration and operational endpoints
   (asset/network management, address provisioning, withdrawal
   approval/broadcast, reconciliation trigger, audit log reads). Every
@@ -230,16 +242,87 @@ and SUPER_ADMIN) — every asset/network's current cursor, scan lease
 state, and last success/error, so an operator can see watcher health
 without reading server logs.
 
-**Known limitations, explicitly not implemented**: no independent
-"rescan the chain and diff against internal deposit records" check (the
-watcher's own idempotent detection is the one deposit-detection system —
-see Worker concurrency above for why a second one isn't necessary for
-correctness); destination verification for Bitcoin/Solana withdrawals
-(no single unambiguous on-chain recipient to compare against without
-deeper transaction analysis); no distributed lock beyond the DB-row CAS
-lease described above (no new infra dependency introduced); no
-configurable per-network RPC timeout (fixed at 10s). See the Phase 10
-final report for the full list.
+**Independent reconciliation** (Phase 12A —
+`IndependentReconciliationService`, `POST
+/admin/reconciliation/:assetNetworkId/independent-rescan`, SUPER_ADMIN
+only) is a SEPARATE rescan-and-diff pass that deliberately never reads
+`BlockchainWatchCursor` — its resume point is either an explicit
+SUPER_ADMIN-supplied `fromPointer` or `null` (each chain adapter's own
+bounded default backfill), so a bug or manipulation of the persisted
+watcher cursor can never hide a real discrepancy from it. It reuses the
+same per-chain adapters (never a second chain-reading implementation)
+to compare freshly-observed chain events against internal
+Deposit/Withdrawal records in both directions, and against
+`CustodyProvider.getTransactionStatus` for in-flight withdrawals.
+Findings become first-class `ReconciliationDiscrepancy` rows (`GET
+/admin/reconciliation/discrepancies`, `OPEN → ACKNOWLEDGED →
+RESOLVED/FALSE_POSITIVE`, SUPER_ADMIN-resolved) — this service NEVER
+auto-credits, auto-debits, or otherwise mutates a balance/deposit/
+withdrawal; every finding is purely observational.
+
+**Known limitations, explicitly not implemented**: destination
+verification for Bitcoin/Solana withdrawals (no single unambiguous
+on-chain recipient to compare against without deeper transaction
+analysis); no distributed lock beyond the DB-row CAS lease described
+above (no new infra dependency introduced); no configurable per-network
+RPC timeout (fixed at 10s). See the Phase 10/12A final reports for the
+full list.
+
+## Settlement collateralization (complete-set minting)
+
+Phase 12A replaced the `SETTLEMENT_POOL` accounting shortcut (a house
+account that funded every winning payout directly, with no real
+collateral behind it — see its own docblock in `schema.prisma`, kept for
+historical/audit purposes but no longer written to by any code path)
+with real, provable collateralization.
+
+**The mechanism**: a `BUY` order on one outcome and a complementary
+resting `BUY` order on the market's OTHER outcome (binary markets only —
+see below), whose prices sum to exactly `1`, mint a **complete set**:
+`quantity` new shares of EACH outcome are created, and exactly
+`quantity` units of settlement currency are locked in the market's own
+collateral `LedgerAccount` (`LedgerAccountOwnerType.MARKET`, one real
+account per market, funded by real cash debited from both buyers — see
+`CompleteSetMint`, `ExecutionCoordinator.applyMintExecution`, and the
+new `LedgerTransactionType.MINT`). This is the ONLY mechanism that ever
+increases the total float of an outcome's shares; ordinary same-outcome
+`BUY`/`SELL` matching remains an unchanged pure transfer between
+existing holders, and same-outcome matching is always attempted FIRST —
+minting only ever fills the "no seller exists yet" gap.
+
+Because minting always locks exactly `1` unit of currency per unit of
+quantity created (`priceA + priceB = 1`, enforced by
+`complete_set_mints_price_sum_check`), and transfers never change the
+total float, a market's collateral account balance always exactly
+equals the total shares ever minted for it — which is exactly enough to
+fund every winning payout at settlement (`SettlementService` now debits
+the resolving market's OWN collateral account, never a house account)
+and reach precisely zero once every position is settled, with no
+leftover and no shortfall. Restricted to exactly-binary (2-outcome)
+markets — a 3+-outcome market's "complete set" would require an atomic
+N-way match this pairwise engine doesn't attempt; such markets'
+`SELL` orders still require pre-existing inventory, unchanged (this
+platform's actual markets are binary YES/NO today).
+
+## Independent blockchain reconciliation
+
+See [Blockchain watcher & reconciliation architecture](#blockchain-watcher--reconciliation-architecture)
+above — Phase 12A's independent rescan-and-diff pass is documented there
+alongside the pre-existing cursor-adjacent checks it deliberately never
+trusts.
+
+## Backup & disaster recovery
+
+See [`docs/database-backup-recovery.md`](docs/database-backup-recovery.md)
+for the full, honest backup/recovery architecture — what real tooling
+exists today (`infra/backup.sh`/`restore.sh`,
+`apps/api/scripts/backup-restore-drill.js`, an ACTUAL restore test that
+was run and passed), what a real production deployment still requires
+(a chosen managed-provider/self-hosted strategy, WAL archiving for true
+PITR, off-site encrypted storage, explicit RPO/RTO targets), and the
+reusable financial integrity checks (`apps/api/scripts/financial-integrity-checks.js`,
+`npm run check:integrity`) usable during development, after a restore,
+or during an incident.
 
 ## Next recommended implementation steps
 
@@ -264,12 +347,22 @@ remains, roughly in priority order:
    real, exercised integration seam (`DeferredComplianceGate` is its only
    implementation today, always returning `DEFERRED`) for whenever a real
    provider is selected.
-4. **Deeper reconciliation** — an independent "rescan the chain and diff
-   against internal deposit records" pass, and Bitcoin/Solana withdrawal
-   destination verification, are explicitly not implemented — see
+4. **Deeper reconciliation, remaining gap** — the independent
+   rescan-and-diff pass (Phase 12A) is now implemented; Bitcoin/Solana
+   withdrawal destination verification is still explicitly not (no
+   single unambiguous on-chain recipient to compare against without
+   deeper transaction analysis) — see
    [Blockchain watcher & reconciliation architecture](#blockchain-watcher--reconciliation-architecture)'s
-   own "known limitations" note for why and what a real implementation
-   would need.
+   "known limitations" note.
 5. **Load testing** — scan batch sizes, DB query patterns, and RPC
    request counts are bounded by design (see above), but have not been
    load-tested against realistic production traffic volumes.
+6. **Production-grade backup infrastructure** — Phase 12A documents the
+   full architecture and ships real, tested tooling (`infra/backup.sh`,
+   an actual passing restore drill — see
+   [Backup & disaster recovery](#backup--disaster-recovery)), but a
+   managed-provider or self-hosted HA strategy, WAL archiving for true
+   point-in-time recovery, off-site encrypted storage, and explicit
+   RPO/RTO targets are all still undecided/unimplemented — see
+   `docs/database-backup-recovery.md` §7 for the exact prerequisite
+   list. **Do not hold real funds in production until this is resolved.**

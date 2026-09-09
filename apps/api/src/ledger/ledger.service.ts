@@ -5,7 +5,12 @@ import { PrismaService } from "../prisma/prisma.service";
 import { computeAvailableBalance, computeBalanceAfter, isNegative, sumAmounts } from "./balance.util";
 import { InsufficientBalanceError, UnbalancedTransactionError } from "./ledger.errors";
 
-export type AccountRef = { type: "USER"; userId: string } | { type: "HOUSE"; key: HouseAccountKey };
+export type AccountRef =
+  | { type: "USER"; userId: string }
+  | { type: "HOUSE"; key: HouseAccountKey }
+  // Phase 12A: a market's own locked collateral — see
+  // LedgerAccountOwnerType.MARKET and CompleteSetMint.
+  | { type: "MARKET"; marketId: string };
 
 export interface PostTransactionInput {
   assetSymbol: string;
@@ -58,6 +63,18 @@ export class LedgerService {
     return this.prisma.ledgerAccount.findUnique({ where: { userId_assetId: { userId, assetId: asset.id } } });
   }
 
+  /**
+   * Phase 12A: a market's own locked collateral balance — real cash,
+   * never a house account. Zero (not merely "no row yet") for a market
+   * that has never had a complete set minted, exactly like getBalance's
+   * USER-account equivalent.
+   */
+  async getMarketCollateralBalance(marketId: string, assetSymbol: string): Promise<Prisma.Decimal> {
+    const asset = await this.prisma.asset.findUniqueOrThrow({ where: { symbol: assetSymbol } });
+    const account = await this.prisma.ledgerAccount.findUnique({ where: { marketId_assetId: { marketId, assetId: asset.id } } });
+    return account?.cachedBalance ?? new Prisma.Decimal(0);
+  }
+
   async postTransaction(tx: Prisma.TransactionClient, input: PostTransactionInput): Promise<PostTransactionResult> {
     if (input.postings.length < 2) {
       throw new UnbalancedTransactionError("n/a", "a transaction needs at least two postings");
@@ -98,7 +115,13 @@ export class LedgerService {
       const account = await this.resolveAccount(tx, asset.id, posting.account);
 
       const balanceAfter = computeBalanceAfter(account.cachedBalance, amount);
-      if (account.ownerType === "USER" && isNegative(balanceAfter)) {
+      // Every owner type except HOUSE must stay non-negative — matches
+      // ledger_accounts_user_balance_check's actual DB-level semantics
+      // exactly (originally written as `ownerType === "USER"` before
+      // Phase 12A added the MARKET owner type; a MARKET-owned account
+      // going negative would otherwise skip this friendly error and hit
+      // the raw DB constraint instead).
+      if (account.ownerType !== "HOUSE" && isNegative(balanceAfter)) {
         throw new InsufficientBalanceError(account.id, account.cachedBalance.toString(), amount.toString());
       }
 
@@ -120,6 +143,14 @@ export class LedgerService {
       return tx.ledgerAccount.upsert({
         where: { userId_assetId: { userId: ref.userId, assetId } },
         create: { ownerType: "USER", userId: ref.userId, assetId, cachedBalance: 0, reservedBalance: 0 },
+        update: {},
+      });
+    }
+
+    if (ref.type === "MARKET") {
+      return tx.ledgerAccount.upsert({
+        where: { marketId_assetId: { marketId: ref.marketId, assetId } },
+        create: { ownerType: "MARKET", marketId: ref.marketId, assetId, cachedBalance: 0, reservedBalance: 0 },
         update: {},
       });
     }

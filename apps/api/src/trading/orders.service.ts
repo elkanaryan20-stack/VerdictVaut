@@ -350,16 +350,38 @@ export class OrdersService {
   async getPlacementSummary(userId: string, orderId: string): Promise<OrderPlacementResult> {
     const order = await this.getOwnOrder(userId, orderId);
 
-    const fills = await this.prisma.fill.findMany({
-      where: { OR: [{ buyOrderId: orderId }, { sellOrderId: orderId }] },
-      orderBy: { executedAt: "asc" },
-    });
+    const [fills, mints] = await Promise.all([
+      this.prisma.fill.findMany({
+        where: { OR: [{ buyOrderId: orderId }, { sellOrderId: orderId }] },
+        orderBy: { executedAt: "asc" },
+      }),
+      // Phase 12A: a complete-set mint executes this order just as
+      // genuinely as a Fill does (it consumes the same reservation,
+      // advances the same filledQuantity/remainingQuantity) — omitting it
+      // here would make a minted order's own execution history look
+      // incomplete even though nothing is actually missing from its
+      // accounting.
+      this.prisma.completeSetMint.findMany({
+        where: { OR: [{ buyOrderAId: orderId }, { buyOrderBId: orderId }] },
+        orderBy: { mintedAt: "asc" },
+      }),
+    ]);
 
-    const totalFillQuantity = fills.reduce((sum, f) => sum.plus(f.quantity), new Prisma.Decimal(0));
+    const executions = [
+      ...fills.map((f) => ({ id: f.id, price: f.price, quantity: f.quantity, at: f.executedAt })),
+      ...mints.map((m) => ({
+        id: m.id,
+        price: m.buyOrderAId === orderId ? m.priceA : m.priceB,
+        quantity: m.quantity,
+        at: m.mintedAt,
+      })),
+    ].sort((a, b) => a.at.getTime() - b.at.getTime());
+
+    const totalFillQuantity = executions.reduce((sum, e) => sum.plus(e.quantity), new Prisma.Decimal(0));
     const averageExecutionPrice = totalFillQuantity.isZero()
       ? null
-      : fills
-          .reduce((sum, f) => sum.plus(f.price.times(f.quantity)), new Prisma.Decimal(0))
+      : executions
+          .reduce((sum, e) => sum.plus(e.price.times(e.quantity)), new Prisma.Decimal(0))
           .dividedBy(totalFillQuantity)
           .toString();
 
@@ -376,11 +398,11 @@ export class OrdersService {
       quantity: order.quantity.toString(),
       filledQuantity: order.filledQuantity.toString(),
       remainingQuantity: order.remainingQuantity.toString(),
-      fills: fills.map((f) => ({
-        fillId: f.id,
-        price: f.price.toString(),
-        quantity: f.quantity.toString(),
-        executedAt: f.executedAt.toISOString(),
+      fills: executions.map((e) => ({
+        fillId: e.id,
+        price: e.price.toString(),
+        quantity: e.quantity.toString(),
+        executedAt: e.at.toISOString(),
       })),
       averageExecutionPrice,
       reservedAmountRemaining,

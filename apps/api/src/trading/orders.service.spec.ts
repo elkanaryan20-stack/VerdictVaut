@@ -29,6 +29,7 @@ describe("OrdersService", () => {
     asset: { findFirstOrThrow: jest.Mock };
     order: { create: jest.Mock; findUnique: jest.Mock; findMany: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock; count: jest.Mock };
     fill: { findMany: jest.Mock };
+    completeSetMint: { findMany: jest.Mock };
     fundReservation: { findFirst: jest.Mock };
   };
   let reservations: { reserve: jest.Mock; release: jest.Mock; findActiveByReference: jest.Mock };
@@ -63,6 +64,7 @@ describe("OrdersService", () => {
         count: jest.fn().mockResolvedValue(0),
       },
       fill: { findMany: jest.fn().mockResolvedValue([]) },
+      completeSetMint: { findMany: jest.fn().mockResolvedValue([]) },
       fundReservation: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     reservations = {
