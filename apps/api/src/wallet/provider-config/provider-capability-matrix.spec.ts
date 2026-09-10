@@ -30,6 +30,12 @@ describe("PROVIDER_CAPABILITY_MATRIX", () => {
     expect(xrplFireblocks?.status).toBe("UNSUPPORTED");
   });
 
+  it("Fireblocks custody execution is UNVERIFIED (not VERIFIED) for every network family it is not UNSUPPORTED for — documentation covers most, but not all, of the real request shape", () => {
+    for (const entry of PROVIDER_CAPABILITY_MATRIX.filter((e) => e.provider === "fireblocks" && e.status !== "UNSUPPORTED")) {
+      expect(entry.status).toBe("UNVERIFIED");
+    }
+  });
+
   it("matches the real, coded fail-closed behavior: Elliptic address-risk screening is VERIFIED only for EVM", () => {
     for (const entry of PROVIDER_CAPABILITY_MATRIX.filter((e) => e.provider === "elliptic")) {
       if (entry.networkFamily === NetworkFamily.EVM) {
@@ -37,6 +43,20 @@ describe("PROVIDER_CAPABILITY_MATRIX", () => {
       } else {
         expect(entry.status).toBe("UNSUPPORTED");
       }
+    }
+  });
+
+  it("Phase 14B.1: no row is liveVerified — nothing in this matrix has ever been exercised against a real provider sandbox account", () => {
+    for (const entry of PROVIDER_CAPABILITY_MATRIX) {
+      expect(entry.liveVerified).toBe(false);
+    }
+  });
+
+  it("a VERIFIED (documentation-level) row can still be liveVerified:false — the two are independent facts", () => {
+    const verifiedRows = PROVIDER_CAPABILITY_MATRIX.filter((e) => e.status === "VERIFIED");
+    expect(verifiedRows.length).toBeGreaterThan(0);
+    for (const entry of verifiedRows) {
+      expect(entry.liveVerified).toBe(false);
     }
   });
 });

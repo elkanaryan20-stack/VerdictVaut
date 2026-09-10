@@ -82,7 +82,8 @@ production needs — that remains a real business decision.
   account-model terminology.
 
 **Both of these MUST be smoke-tested against a real Fireblocks sandbox
-account before this adapter is trusted operationally — see §10.**
+account before this adapter is trusted operationally — see §10 and
+`docs/fireblocks-sandbox-smoke-test.md`.**
 
 ### EXPLICITLY UNVERIFIED — fails closed, never guessed
 
@@ -164,14 +165,22 @@ Summary:
 
 | Network family | Fireblocks custody execution | Elliptic address-risk screening | Chainalysis |
 |---|---|---|---|
-| EVM (ETH, USDC, USDT-on-Ethereum) | VERIFIED* | VERIFIED | UNSUPPORTED |
-| Bitcoin (BTC) | VERIFIED* | UNSUPPORTED | UNSUPPORTED |
-| Solana (SOL) | VERIFIED* | UNSUPPORTED | UNSUPPORTED |
+| EVM (ETH, USDC, USDT-on-Ethereum) | UNVERIFIED* | VERIFIED* | UNSUPPORTED |
+| Bitcoin (BTC) | UNVERIFIED* | UNSUPPORTED | UNSUPPORTED |
+| Solana (SOL) | UNVERIFIED* | UNSUPPORTED | UNSUPPORTED |
 | XRPL (XRP) | UNSUPPORTED (destination-tag shape unverified) | UNSUPPORTED | UNSUPPORTED |
 
-\* "VERIFIED" here means the request shape and status-interpretation
-are verified — the per-asset `providerAssetId` is still a required,
-admin-verified, never-inferred configuration value (§3).
+\* As of Phase 14B.1, every row's `liveVerified` field is `false` —
+"VERIFIED"/"UNVERIFIED" above are both **documentation-level**
+classifications (see `provider-capability-matrix.ts`'s own docblock for
+the exact distinction). Fireblocks custody execution moved from
+VERIFIED to UNVERIFIED in Phase 14B.1: the literal
+`source.type`/`destination.type` enum strings and the `/transactions`
+path were never independently confirmed against a worked example, only
+inferred — see §3. The per-asset `providerAssetId` is, separately,
+always a required, admin-verified, never-inferred configuration value.
+**Nothing in this table has been exercised against a real provider
+sandbox account** — see §10 and `docs/fireblocks-sandbox-smoke-test.md`.
 
 ## 6. Withdrawal lifecycle with a real provider
 
@@ -255,10 +264,38 @@ Production remains fully fail-closed:
   directly from source and fails P0 until a real provider is
   deliberately wired into production — see that script's own output.
 
-## 10. Staging/sandbox setup
+## 10. Environments: local development, staging/sandbox, production
 
-No real credentials exist anywhere in this repository. To exercise
-these adapters against a real Fireblocks/Elliptic sandbox account:
+**A successful unit/integration test suite is NOT a live Fireblocks (or
+Elliptic) verification.** Every automated test in this repository
+proves this codebase's own request-construction and response-
+interpretation logic against a *mocked* HTTP layer — it does not, and
+cannot, prove the real provider API accepts the request, uses the field
+names/values this adapter assumes, or behaves as its documentation
+describes. **A live Fireblocks sandbox transaction, producing a genuine
+provider reference, is required before claiming end-to-end custody
+verification** — see `provider-capability-matrix.ts`'s `liveVerified`
+field (`false` for every row as of this phase) and
+`docs/fireblocks-sandbox-smoke-test.md` for the exact operator
+checklist.
+
+### LOCAL DEVELOPMENT
+
+No provider is configured by default. `WithdrawalExecutorFactory`
+resolves every asset/network to `ManualBroadcastExecutor` (a no-op
+sandbox stand-in) unless a `WithdrawalExecutionConfig` row explicitly
+selects `PRODUCTION_CUSTODY`. Nothing below is required to run the app,
+its unit tests, or its real-Postgres integration tests locally.
+
+### STAGING / SANDBOX
+
+This is where a REAL Fireblocks/Elliptic sandbox account gets exercised
+for the first time. Full checklist: `docs/fireblocks-sandbox-smoke-test.md`.
+Preflight verification (read-only, never prints a secret, never
+mutates data): `node scripts/staging-preflight-check.js`. Summary:
+
+No real credentials exist anywhere in this repository — set them in
+your own untracked `.env` or secret manager, never committed:
 
 ```
 # Fireblocks (JSON: {"apiKey": "...", "privateKey": "-----BEGIN PRIVATE KEY-----..."})
@@ -277,6 +314,19 @@ Then, as SUPER_ADMIN:
 4. `POST /admin/compliance/providers` — `{category: "SANCTIONS_KYT", providerName: "Elliptic", environment: "SANDBOX", apiBaseUrl: "https://aml-api.elliptic.co/v2", credentialsSecretRef: "env:ELLIPTIC_SANDBOX_CREDENTIALS", riskScoreMediumThreshold: 0.3, riskScoreHighThreshold: 0.7}` — pick real thresholds deliberately, not these placeholder values.
 5. `POST /admin/compliance/providers/:id/enable`.
 
+`WithdrawalExecutorFactory`, `FireblocksCustodyAdapter`, and
+`FireblocksWebhookController` each independently verify that any
+`CustodyProviderConfig` used here is flagged `environment: "SANDBOX"` —
+a `PRODUCTION`-flagged config (real production credentials) is refused
+at three separate layers even while `APP_ENVIRONMENT=sandbox` (security
+review finding A1; see `provider-environment.util.ts`).
+
+### PRODUCTION
+
+Unchanged and fully fail-closed — see §9. Nothing in staging/sandbox
+setup above enables, or brings production any closer to, real-money
+custody or compliance automation.
+
 ## 11. Known limitations
 
 - Elliptic address-risk screening does not poll for a still-`running`
@@ -289,9 +339,14 @@ Then, as SUPER_ADMIN:
   implemented — only the legacy RSA-SHA512 scheme.
 - The Fireblocks `source.type`/`destination.type` literal enum values
   and the `/transactions` path itself are high-confidence but not
-  independently re-confirmed this pass — see §3. **Do not treat this
-  adapter as production-trustworthy without a real sandbox smoke
-  test.**
+  independently re-confirmed this pass — see §3, and why the custody
+  rows in §5 are classified UNVERIFIED, not VERIFIED. **Do not treat
+  this adapter as production-trustworthy without a real sandbox smoke
+  test** — `docs/fireblocks-sandbox-smoke-test.md`.
+- No row in `provider-capability-matrix.ts` has `liveVerified: true` —
+  nothing in this integration has ever been exercised against a real
+  provider account (Phase 14B.1 introduced this field specifically to
+  make that fact impossible to overlook).
 - No "provider withdrawal known but absent internally" reverse
   reconciliation check exists — this would require a verified
   "list transactions" capability, which was not confirmed this pass.
