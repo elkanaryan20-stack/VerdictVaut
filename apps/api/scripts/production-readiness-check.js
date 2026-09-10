@@ -124,13 +124,26 @@ function runStructuralChecks() {
       : "could not read production-custody.executor.ts to verify",
   );
 
-  const walletModuleSource = readSourceFile("src/wallet/wallet.module.ts");
-  const usesDeferredGate = walletModuleSource && /WITHDRAWAL_COMPLIANCE_GATE[\s\S]*?DeferredComplianceGate/.test(walletModuleSource);
+  // Phase 14B: WITHDRAWAL_COMPLIANCE_GATE is now bound to
+  // ComplianceGateFactory, which routes to a real provider adapter
+  // (EllipticAddressRiskGate) in SANDBOX only — production always
+  // forces DeferredComplianceGate regardless of any ComplianceProviderConfig,
+  // by design (see that factory's own docblock). Check the factory's
+  // OWN production branch directly, rather than a naive DI-binding grep
+  // against wallet.module.ts, so this stays accurate as the routing
+  // logic evolves.
+  const complianceFactorySource = readSourceFile("src/wallet/withdrawals/compliance/compliance-gate.factory.ts");
+  const productionAlwaysDefers =
+    complianceFactorySource &&
+    /appEnvironment.*===\s*["']production["'][\s\S]*?deferredGate\.assess/.test(complianceFactorySource);
   check(
     "A real KYC/AML/sanctions compliance provider is integrated",
     "P0",
-    Boolean(walletModuleSource) && !usesDeferredGate,
-    usesDeferredGate ? "WITHDRAWAL_COMPLIANCE_GATE is still bound to DeferredComplianceGate — every withdrawal compliance check is DEFERRED to a human, never automated" : "could not confirm",
+    Boolean(complianceFactorySource) && !productionAlwaysDefers,
+    productionAlwaysDefers
+      ? "ComplianceGateFactory forces DeferredComplianceGate in production regardless of configuration — every PRODUCTION withdrawal compliance check is DEFERRED to a human, never automated. " +
+        "A real adapter (EllipticAddressRiskGate) IS wired for SANDBOX address-risk screening only — see docs/provider-integration.md."
+      : "could not confirm",
   );
 
   check("A Dockerfile exists for apps/api", "P1", fs.existsSync(path.join(__dirname, "..", "Dockerfile")), "no containerized deployment artifact exists yet");

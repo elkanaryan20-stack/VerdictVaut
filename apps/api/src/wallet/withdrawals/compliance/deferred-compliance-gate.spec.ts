@@ -1,4 +1,4 @@
-import { Prisma } from "@prisma/client";
+import { NetworkFamily, Prisma } from "@prisma/client";
 import { DeferredComplianceGate } from "./deferred-compliance-gate";
 
 describe("DeferredComplianceGate", () => {
@@ -8,6 +8,7 @@ describe("DeferredComplianceGate", () => {
       userId: "user-1",
       assetSymbol: "USDC",
       networkCode: "ethereum-sepolia",
+      networkFamily: NetworkFamily.EVM,
       amount: new Prisma.Decimal("100"),
       destinationAddress: "0x000000000000000000000000000000000000dEaD",
     });
@@ -21,6 +22,7 @@ describe("DeferredComplianceGate", () => {
       userId: "user-1",
       assetSymbol: "USDC",
       networkCode: "ethereum-sepolia",
+      networkFamily: NetworkFamily.EVM,
       amount: new Prisma.Decimal("100"),
       destinationAddress: "0x000000000000000000000000000000000000dEaD",
     });

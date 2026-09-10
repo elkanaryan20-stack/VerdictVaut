@@ -8,6 +8,7 @@ import { CustodyProviderFactory } from "../custody/custody-provider.factory";
 import { DepositChainAdapterFactory } from "../chain-adapters/deposit-chain-adapter.factory";
 import { RawChainDeposit } from "../chain-adapters/deposit-chain-adapter.interface";
 import { loadWatchedAddresses } from "../chain-adapters/watched-addresses.util";
+import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
 
 const RECONCILIATION_TOLERANCE = new Prisma.Decimal("0.000000000000000001"); // 1 base unit at 18 decimals — rounding slack, not a real discrepancy allowance
 
@@ -74,6 +75,7 @@ export class IndependentReconciliationService {
     private readonly custodyProviderFactory: CustodyProviderFactory,
     private readonly auditLog: AuditLogService,
     private readonly metrics: MetricsService = new LoggingMetricsService(),
+    private readonly executorFactory?: WithdrawalExecutorFactory,
   ) {}
 
   async runIndependentRescan(assetNetworkId: string, initiatedByUserId: string, fromPointer?: string) {
@@ -111,6 +113,7 @@ export class IndependentReconciliationService {
       }
 
       findings.push(...(await this.checkRecentWithdrawals(assetNetworkId)));
+      findings.push(...(await this.checkPendingProviderSubmissions(assetNetworkId)));
     } catch (error) {
       providerErrored = true;
       this.logger.error(`Independent reconciliation rescan failed for assetNetwork ${assetNetworkId}`, error as Error);
@@ -294,6 +297,79 @@ export class IndependentReconciliationService {
           type: "withdrawal_chain_lookup_failed",
           severity: "WARNING",
           chainIdentity: withdrawal.txHash!,
+          internalEntityType: "Withdrawal",
+          internalEntityId: withdrawal.id,
+          expectedState: {},
+          observedState: { error: (error as Error).message },
+        });
+      }
+    }
+    return findings;
+  }
+
+  /**
+   * Phase 14B — the provider-adapter counterpart to checkRecentWithdrawals
+   * above: a withdrawal already SUBMITTED to a real custody provider
+   * (PENDING_MANUAL_BROADCAST with a recorded custodyReference — see
+   * FireblocksCustodyAdapter/WithdrawalWatcherService's own docblocks)
+   * that the provider's own status API no longer recognizes, or reports
+   * as rejected, without VerdictVaut having recorded that outcome yet.
+   * Uses the exact same WithdrawalExecutor.checkStatus() capability the
+   * normal watcher poll relies on — this is a discrepancy-producing,
+   * read-only SECOND look at the same data, never a mutation path; a
+   * real state transition still only ever happens through
+   * WithdrawalsService (recordProviderBroadcast/fail), exactly as
+   * WithdrawalWatcherService itself does.
+   *
+   * executorFactory is optional (constructor param) purely so existing
+   * unit/integration tests that construct this service directly without
+   * the full withdrawal-executor wiring keep working — when absent, this
+   * check is a no-op rather than a hard failure, since it's genuinely
+   * optional extra coverage layered on top of checkRecentWithdrawals.
+   */
+  private async checkPendingProviderSubmissions(assetNetworkId: string): Promise<IndependentDiscrepancyInput[]> {
+    if (!this.executorFactory) return [];
+
+    const pending = await this.prisma.withdrawal.findMany({
+      where: { assetNetworkId, status: WithdrawalStatus.PENDING_MANUAL_BROADCAST, custodyReference: { not: null } },
+      orderBy: { updatedAt: "desc" },
+      take: RECENT_WITHDRAWALS_CHECK_LIMIT,
+    });
+    if (pending.length === 0) return [];
+
+    const findings: IndependentDiscrepancyInput[] = [];
+    for (const withdrawal of pending) {
+      try {
+        const executor = await this.executorFactory.resolve(assetNetworkId);
+        if (!executor.checkStatus) continue;
+        const lookup = await executor.checkStatus(withdrawal.id);
+
+        if (lookup.status === "not_found") {
+          findings.push({
+            type: "withdrawal_missing_from_provider",
+            severity: "CRITICAL",
+            chainIdentity: withdrawal.custodyReference!,
+            internalEntityType: "Withdrawal",
+            internalEntityId: withdrawal.id,
+            expectedState: { internalStatus: withdrawal.status, custodyReference: withdrawal.custodyReference },
+            observedState: { providerStatus: "not_found", reason: lookup.reason },
+          });
+        } else if (lookup.status === "rejected") {
+          findings.push({
+            type: "withdrawal_rejected_by_provider_unrecorded",
+            severity: "CRITICAL",
+            chainIdentity: withdrawal.custodyReference!,
+            internalEntityType: "Withdrawal",
+            internalEntityId: withdrawal.id,
+            expectedState: { internalStatus: withdrawal.status },
+            observedState: { providerStatus: "rejected", reason: lookup.reason },
+          });
+        }
+      } catch (error) {
+        findings.push({
+          type: "withdrawal_provider_lookup_failed",
+          severity: "WARNING",
+          chainIdentity: withdrawal.custodyReference!,
           internalEntityType: "Withdrawal",
           internalEntityId: withdrawal.id,
           expectedState: {},

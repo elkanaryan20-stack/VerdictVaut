@@ -5,6 +5,7 @@ import { AppConfig } from "../../config/configuration";
 import { PrismaService } from "../../prisma/prisma.service";
 import { ConfirmationPolicyService } from "../confirmation/confirmation-policy.service";
 import { CustodyProviderFactory } from "../custody/custody-provider.factory";
+import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
 import { WithdrawalsService } from "../withdrawals/withdrawals.service";
 
 /**
@@ -26,6 +27,20 @@ import { WithdrawalsService } from "../withdrawals/withdrawals.service";
  * reconciliation endpoint (POST /admin/withdrawals/:id/reconcile), which
  * is read+audit only and never silently "fixes" anything either.
  *
+ * Phase 14B addition: ALSO polls withdrawals sitting in
+ * PENDING_MANUAL_BROADCAST whose configured executor is a REAL,
+ * asynchronous provider adapter (one that implements checkStatus()) —
+ * this is the automated counterpart to an admin manually calling
+ * recordManualBroadcast(), converging on the exact same
+ * WithdrawalsService.recordProviderBroadcast()/fail() methods a
+ * verified webhook delivery also uses, so there is exactly one place
+ * (WithdrawalsService) that ever actually changes a withdrawal's state
+ * regardless of which of the three sources (poll, webhook, admin)
+ * learned about it first. ManualBroadcastExecutor implements no
+ * checkStatus(), so sandbox withdrawals with no real provider configured
+ * are entirely unaffected by this addition — an admin's manual broadcast
+ * remains the only way those resolve, exactly as before.
+ *
  * Off by default (WITHDRAWAL_WATCHER_ENABLED) for the same reason the
  * deposit watcher is: importing this module must never cause an app
  * instance — including every unit and integration test — to start
@@ -43,6 +58,7 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     private readonly confirmationPolicy: ConfirmationPolicyService,
     private readonly withdrawalsService: WithdrawalsService,
     private readonly configService: ConfigService<AppConfig, true>,
+    private readonly executorFactory: WithdrawalExecutorFactory,
   ) {}
 
   onModuleInit(): void {
@@ -62,9 +78,10 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * One pass over every withdrawal awaiting on-chain confirmation. Each
-   * withdrawal's check is caught and logged independently so one broken
-   * chain integration or one bad txHash never stalls checking every
+   * One pass over every withdrawal awaiting on-chain confirmation OR
+   * awaiting a real provider's asynchronous broadcast. Each withdrawal's
+   * check is caught and logged independently so one broken chain/
+   * provider integration or one bad txHash never stalls checking every
    * other withdrawal (same observability reasoning as
    * DepositWatcherService.pollOnce).
    */
@@ -72,17 +89,28 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     if (this.polling) return;
     this.polling = true;
     try {
-      const pending = await this.prisma.withdrawal.findMany({
+      const broadcasted = await this.prisma.withdrawal.findMany({
         where: {
           status: { in: [WithdrawalStatus.BROADCAST, WithdrawalStatus.CONFIRMING] },
           txHash: { not: null },
         },
       });
-      for (const withdrawal of pending) {
+      for (const withdrawal of broadcasted) {
         try {
           await this.checkOne(withdrawal.id, withdrawal.assetNetworkId, withdrawal.txHash!);
         } catch (error) {
           this.logger.error(`Confirmation check failed for withdrawal ${withdrawal.id}`, error as Error);
+        }
+      }
+
+      const pendingProvider = await this.prisma.withdrawal.findMany({
+        where: { status: WithdrawalStatus.PENDING_MANUAL_BROADCAST },
+      });
+      for (const withdrawal of pendingProvider) {
+        try {
+          await this.checkPendingProviderSubmission(withdrawal.id, withdrawal.assetNetworkId);
+        } catch (error) {
+          this.logger.error(`Provider status check failed for withdrawal ${withdrawal.id}`, error as Error);
         }
       }
     } finally {
@@ -119,5 +147,39 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
 
     const requiredConfirmations = await this.confirmationPolicy.getRequiredConfirmations(assetNetworkId);
     await this.withdrawalsService.recordConfirmation(withdrawalId, status.confirmations, requiredConfirmations);
+  }
+
+  /**
+   * A withdrawal sitting in PENDING_MANUAL_BROADCAST has no txHash yet
+   * by definition — there is nothing to check on-chain. Instead, this
+   * asks the CONFIGURED EXECUTOR (not the chain) whether it has since
+   * learned more, via the optional checkStatus() capability. An
+   * executor with no such capability (ManualBroadcastExecutor, or a
+   * misconfigured/removed executor) is silently skipped — sandbox
+   * withdrawals genuinely awaiting a human keep waiting for one, exactly
+   * as before this addition.
+   */
+  private async checkPendingProviderSubmission(withdrawalId: string, assetNetworkId: string): Promise<void> {
+    const executor = await this.executorFactory.resolve(assetNetworkId).catch(() => null);
+    if (!executor?.checkStatus) return;
+
+    const lookup = await executor.checkStatus(withdrawalId);
+
+    if (lookup.status === "broadcast" && lookup.txHash) {
+      await this.withdrawalsService.recordProviderBroadcast(withdrawalId, lookup.txHash, lookup.providerReference);
+      return;
+    }
+    if (lookup.status === "rejected") {
+      this.logger.error(`Withdrawal ${withdrawalId}'s provider submission was rejected (${lookup.reason ?? "no reason given"}) — marking the withdrawal FAILED.`);
+      // Security review finding B1: uses the dedicated, narrower
+      // failProviderRejectedSubmission() — never the general-purpose
+      // fail() — so a stale/anomalous "rejected" report can never
+      // release the reservation of a withdrawal that has already
+      // reached BROADCAST/CONFIRMING (a real txHash exists). See that
+      // method's own docblock.
+      await this.withdrawalsService.failProviderRejectedSubmission(withdrawalId, lookup.reason ?? "Provider reported the submission as rejected.");
+      return;
+    }
+    // "pending" or "not_found": nothing new to record — leave untouched, poll again next pass.
   }
 }

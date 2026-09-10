@@ -1103,6 +1103,18 @@ model WithdrawalExecutionConfig {
   // Fireblocks/BitGo account handling several chains), so this is a
   // many-to-one link, not a duplicate of the provider config itself.
   custodyProviderConfigId String?
+  // Phase 14B — the PROVIDER's own identifier for this asset (e.g.
+  // whatever Fireblocks' real asset-id string is for this chain/token).
+  // Deliberately NEVER defaulted/inferred from assetSymbol: the Phase
+  // 14B research verified Fireblocks' request/response field NAMES but
+  // could NOT verify the literal asset-id strings (not even a documented
+  // "XRP" string) from accessible primary sources. Left null until a
+  // human who actually has sandbox/production account access confirms
+  // the real value via the provider's own "list supported assets"
+  // capability — see FireblocksCustodyAdapter.supportsAssetNetwork(),
+  // which returns false (fail closed) while this is null, regardless of
+  // whether everything else is configured.
+  providerAssetId String?
   createdAt      DateTime               @default(now())
   updatedAt      DateTime               @updatedAt
 
@@ -1141,6 +1153,12 @@ model CustodyProviderConfig {
   // Non-secret account/vault identifier (e.g. a Fireblocks vault id) —
   // an identifier, not a credential, so no scheme:path format is required.
   vaultOrAccountRef     String?
+  // Phase 14B — non-secret REST base URL (e.g.
+  // "https://sandbox-api.fireblocks.io/v1", verified against Fireblocks'
+  // own docs). Admin-configurable rather than hardcoded so environment
+  // confusion (sandbox vs. production URL) is a visible config value,
+  // not a compiled-in constant — see FireblocksCustodyAdapter.
+  apiBaseUrl            String?
   createdAt             DateTime           @default(now())
   updatedAt             DateTime           @updatedAt
 
@@ -1168,11 +1186,55 @@ model ComplianceProviderConfig {
   webhookUrl           String?
   webhookSecretRef     String?
   timeoutMs            Int                        @default(10000)
+  // Phase 14B — non-secret REST base URL (e.g.
+  // "https://aml-api.elliptic.co/v2", verified against Elliptic's own
+  // docs). See CustodyProviderConfig.apiBaseUrl for the same reasoning.
+  apiBaseUrl           String?
+  // Phase 14B — a raw provider risk score (e.g. Elliptic's numeric
+  // `risk_score`, which is NOT a VerdictVaut-defined categorical value)
+  // is mapped to AddressRiskStatus via these admin-configured
+  // thresholds: score >= riskScoreHighThreshold => HIGH,
+  // score >= riskScoreMediumThreshold => MEDIUM, else LOW. Nullable and
+  // unused by providers (like a pure KYC provider) that never report a
+  // numeric score at all.
+  riskScoreMediumThreshold Float?
+  riskScoreHighThreshold   Float?
   createdAt            DateTime                   @default(now())
   updatedAt            DateTime                   @updatedAt
 
   @@index([category, environment, isEnabled])
   @@map("compliance_provider_configs")
+}
+
+// Phase 14B — durable, idempotent record of every inbound provider
+// webhook event, independent of whatever mutation (if any) processing
+// it triggered. `externalEventId` is the PROVIDER's own event/delivery
+// id (e.g. Fireblocks' webhook payload doesn't publish a single
+// canonical event id distinct from the transaction id + status +
+// lastUpdated tuple per the Phase 14B verification pass — so
+// `externalEventId` is deliberately DERIVED deterministically from
+// provider + the transaction id + status + lastUpdated, not invented,
+// giving the same real duplicate-delivery and out-of-order protection
+// a true event id would). The unique constraint is what makes
+// re-processing the identical delivery a safe no-op — this table is
+// the ONLY thing a webhook handler ever writes directly; every actual
+// state transition still goes through WithdrawalsService.
+model ProviderWebhookEvent {
+  id               String    @id @default(uuid())
+  provider         String
+  externalEventId  String
+  eventType        String
+  resourceType     String?
+  resourceId       String?
+  payload          Json
+  receivedAt       DateTime  @default(now())
+  processedAt      DateTime?
+  processingNote   String?
+  processingError  String?
+
+  @@unique([provider, externalEventId])
+  @@index([resourceType, resourceId])
+  @@map("provider_webhook_events")
 }
 
 // ────────────────────────────────────────────────────────────────────────

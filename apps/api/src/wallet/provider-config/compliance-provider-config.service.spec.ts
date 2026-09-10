@@ -32,6 +32,30 @@ describe("ComplianceProviderConfigService", () => {
     await expect(service.setComplianceProviderEnabled("missing", true)).rejects.toThrow(NotFoundException);
   });
 
+  it("rejects a non-https apiBaseUrl (SSRF defense-in-depth)", async () => {
+    await expect(
+      service.createComplianceProviderConfig({ category: "SANCTIONS_KYT", providerName: "Elliptic", environment: "SANDBOX", apiBaseUrl: "http://aml-api.elliptic.co/v2" }),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it("rejects setting only one of the two risk-score thresholds", async () => {
+    await expect(
+      service.createComplianceProviderConfig({ category: "SANCTIONS_KYT", providerName: "Elliptic", environment: "SANDBOX", riskScoreMediumThreshold: 0.3 }),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it("rejects a medium threshold that is not strictly less than the high threshold", async () => {
+    await expect(
+      service.createComplianceProviderConfig({
+        category: "SANCTIONS_KYT",
+        providerName: "Elliptic",
+        environment: "SANDBOX",
+        riskScoreMediumThreshold: 0.7,
+        riskScoreHighThreshold: 0.7,
+      }),
+    ).rejects.toThrow(BadRequestException);
+  });
+
   it("lists configs filtered by category and environment", async () => {
     prisma.complianceProviderConfig.findMany.mockResolvedValue([]);
     await service.listComplianceProviderConfigs({ category: "KYC", environment: "PRODUCTION" });

@@ -13,6 +13,7 @@ export interface CreateCustodyProviderConfigInput {
   timeoutMs?: number;
   idempotencyHeaderName?: string;
   vaultOrAccountRef?: string;
+  apiBaseUrl?: string;
 }
 
 /**
@@ -31,6 +32,14 @@ export class CustodyProviderConfigService {
     assertValidSecretRef(input.webhookSecretRef, "webhookSecretRef");
     if (input.timeoutMs != null && input.timeoutMs <= 0) {
       throw new BadRequestException("timeoutMs must be positive");
+    }
+    // SSRF defense-in-depth: this value is only ever settable by
+    // SUPER_ADMIN (the platform's highest-trust actor), so this is not
+    // a broken-access-control concern — but requiring https:// still
+    // rules out an accidental/typo'd http:// or non-HTTP scheme (e.g.
+    // file://) ending up in a real outbound fetch() call.
+    if (input.apiBaseUrl != null && !/^https:\/\//i.test(input.apiBaseUrl)) {
+      throw new BadRequestException("apiBaseUrl must start with https://");
     }
 
     // Always created disabled — enabling is a deliberate, separate,
@@ -69,6 +78,7 @@ export class CustodyProviderConfigService {
     executorType: WithdrawalExecutorType;
     custodyProviderConfigId?: string;
     providerRef?: string;
+    providerAssetId?: string;
   }) {
     const assetNetwork = await this.prisma.assetNetwork.findUnique({ where: { id: input.assetNetworkId } });
     if (!assetNetwork) {
@@ -105,12 +115,14 @@ export class CustodyProviderConfigService {
         executorType: input.executorType,
         custodyProviderConfigId: input.executorType === WithdrawalExecutorType.PRODUCTION_CUSTODY ? input.custodyProviderConfigId : null,
         providerRef: input.providerRef,
+        providerAssetId: input.executorType === WithdrawalExecutorType.PRODUCTION_CUSTODY ? input.providerAssetId : null,
       },
       update: {
         environment: input.environment,
         executorType: input.executorType,
         custodyProviderConfigId: input.executorType === WithdrawalExecutorType.PRODUCTION_CUSTODY ? input.custodyProviderConfigId : null,
         providerRef: input.providerRef,
+        providerAssetId: input.executorType === WithdrawalExecutorType.PRODUCTION_CUSTODY ? input.providerAssetId : null,
       },
     });
   }

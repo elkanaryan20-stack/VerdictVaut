@@ -1,14 +1,23 @@
+import { FireblocksCustodyAdapter } from "../../src/wallet/executors/fireblocks/fireblocks-custody.adapter";
 import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
 import { ProductionCustodyExecutor } from "../../src/wallet/executors/production-custody.executor";
 import { WithdrawalExecutorFactory } from "../../src/wallet/executors/withdrawal-executor.factory";
 import { WithdrawalComplianceGate } from "../../src/wallet/withdrawals/compliance/withdrawal-compliance-gate.interface";
 import { CustodyProviderConfigService } from "../../src/wallet/provider-config/custody-provider-config.service";
 import { ComplianceProviderConfigService } from "../../src/wallet/provider-config/compliance-provider-config.service";
+import { SecretResolverService } from "../../src/wallet/provider-config/secret-resolver.service";
 import { ProductionSafetyGate } from "../../src/wallet/production-safety.gate";
 import { getAssetNetwork, prisma } from "./helpers";
 
 function makeExecutorFactory(appEnvironment: "sandbox" | "production") {
-  return new WithdrawalExecutorFactory(prisma, { get: () => appEnvironment } as never, new ManualBroadcastExecutor(), new ProductionCustodyExecutor());
+  const config = { get: () => appEnvironment } as never;
+  return new WithdrawalExecutorFactory(
+    prisma,
+    config,
+    new ManualBroadcastExecutor(),
+    new ProductionCustodyExecutor(),
+    new FireblocksCustodyAdapter(prisma, new SecretResolverService(), config),
+  );
 }
 
 function makeSafetyGate(appEnvironment: "sandbox" | "production", complianceGate: WithdrawalComplianceGate) {

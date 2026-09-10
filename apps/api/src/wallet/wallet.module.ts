@@ -19,14 +19,20 @@ import { SolanaCustodyProvider } from "./custody/providers/solana-custody.provid
 import { XrpCustodyProvider } from "./custody/providers/xrp-custody.provider";
 import { DepositsController } from "./deposits/deposits.controller";
 import { DepositsService } from "./deposits/deposits.service";
+import { FireblocksCustodyAdapter } from "./executors/fireblocks/fireblocks-custody.adapter";
+import { FireblocksWebhookController } from "./executors/fireblocks/fireblocks-webhook.controller";
+import { FireblocksWebhookService } from "./executors/fireblocks/fireblocks-webhook.service";
 import { ManualBroadcastExecutor } from "./executors/manual-broadcast.executor";
 import { ProductionCustodyExecutor } from "./executors/production-custody.executor";
 import { WithdrawalExecutorFactory } from "./executors/withdrawal-executor.factory";
+import { ComplianceGateFactory } from "./withdrawals/compliance/compliance-gate.factory";
 import { DeferredComplianceGate } from "./withdrawals/compliance/deferred-compliance-gate";
+import { EllipticAddressRiskGate } from "./withdrawals/compliance/elliptic/elliptic-address-risk.gate";
 import { WITHDRAWAL_COMPLIANCE_GATE } from "./withdrawals/compliance/withdrawal-compliance-gate.interface";
 import { ProductionSafetyGate } from "./production-safety.gate";
 import { CustodyProviderConfigService } from "./provider-config/custody-provider-config.service";
 import { ComplianceProviderConfigService } from "./provider-config/compliance-provider-config.service";
+import { SecretResolverService } from "./provider-config/secret-resolver.service";
 import { WITHDRAWAL_FEE_CALCULATOR } from "./withdrawals/fees/withdrawal-fee-calculator.interface";
 import { ZeroWithdrawalFeeCalculator } from "./withdrawals/fees/zero-withdrawal-fee.calculator";
 import { WithdrawalsController } from "./withdrawals/withdrawals.controller";
@@ -39,7 +45,7 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
 
 @Module({
   imports: [LedgerModule],
-  controllers: [AssetsNetworksController, BalancesController, DepositsController, WithdrawalsController],
+  controllers: [AssetsNetworksController, BalancesController, DepositsController, WithdrawalsController, FireblocksWebhookController],
   providers: [
     AssetsNetworksService,
     BalancesService,
@@ -48,6 +54,9 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     WithdrawalsService,
     ManualBroadcastExecutor,
     ProductionCustodyExecutor,
+    FireblocksCustodyAdapter,
+    FireblocksWebhookService,
+    SecretResolverService,
     WithdrawalExecutorFactory,
     ReconciliationService,
     IndependentReconciliationService,
@@ -67,7 +76,9 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     DepositReprocessingService,
     WithdrawalWatcherService,
     { provide: WITHDRAWAL_FEE_CALCULATOR, useClass: ZeroWithdrawalFeeCalculator },
-    { provide: WITHDRAWAL_COMPLIANCE_GATE, useClass: DeferredComplianceGate },
+    DeferredComplianceGate,
+    EllipticAddressRiskGate,
+    { provide: WITHDRAWAL_COMPLIANCE_GATE, useClass: ComplianceGateFactory },
     ProductionSafetyGate,
     CustodyProviderConfigService,
     ComplianceProviderConfigService,
@@ -85,6 +96,7 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     DepositWatcherService,
     CustodyProviderConfigService,
     ComplianceProviderConfigService,
+    FireblocksWebhookService,
   ],
 })
 export class WalletModule {}

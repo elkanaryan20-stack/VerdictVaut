@@ -27,9 +27,11 @@ import { DepositAddressService } from "../../src/wallet/addresses/deposit-addres
 import { BalancesService } from "../../src/wallet/balances/balances.service";
 import { DepositsService } from "../../src/wallet/deposits/deposits.service";
 import { ConfirmationPolicyService } from "../../src/wallet/confirmation/confirmation-policy.service";
+import { FireblocksCustodyAdapter } from "../../src/wallet/executors/fireblocks/fireblocks-custody.adapter";
 import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
 import { ProductionCustodyExecutor } from "../../src/wallet/executors/production-custody.executor";
 import { WithdrawalExecutorFactory } from "../../src/wallet/executors/withdrawal-executor.factory";
+import { SecretResolverService } from "../../src/wallet/provider-config/secret-resolver.service";
 import { CustodyProviderFactory } from "../../src/wallet/custody/custody-provider.factory";
 import { DeferredComplianceGate } from "../../src/wallet/withdrawals/compliance/deferred-compliance-gate";
 import { ZeroWithdrawalFeeCalculator } from "../../src/wallet/withdrawals/fees/zero-withdrawal-fee.calculator";
@@ -62,15 +64,18 @@ export { DepositWatcherService, DepositReprocessingService, ReconciliationServic
 
 const manualBroadcastExecutor = new ManualBroadcastExecutor();
 const productionCustodyExecutor = new ProductionCustodyExecutor();
+export const secretResolverService = new SecretResolverService();
 // Sandbox — matches this whole test harness's environment; the
 // production-fail-closed behavior (WithdrawalExecutorFactory.spec.ts)
 // is covered at the unit level with a fake ConfigService, not here.
 const sandboxConfig = { get: () => "sandbox" } as never;
+export const fireblocksCustodyAdapter = new FireblocksCustodyAdapter(prisma, secretResolverService, sandboxConfig);
 export const executorFactory = new WithdrawalExecutorFactory(
   prisma,
   sandboxConfig,
   manualBroadcastExecutor,
   productionCustodyExecutor,
+  fireblocksCustodyAdapter,
 );
 
 // The shared withdrawalsService below never reaches

@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { Prisma, UserRole, UserStatus, Withdrawal, WithdrawalComplianceDecision, WithdrawalStatus } from "@prisma/client";
 import * as crypto from "crypto";
 import { AuditLogService } from "../../audit/audit-log.service";
@@ -98,6 +98,8 @@ function destinationsMatch(observed: string, recorded: string): boolean {
  */
 @Injectable()
 export class WithdrawalsService {
+  private readonly logger = new Logger(WithdrawalsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly ledger: LedgerService,
@@ -167,6 +169,7 @@ export class WithdrawalsService {
       userId,
       assetSymbol: asset.symbol,
       networkCode: network.code,
+      networkFamily: network.family,
       amount,
       destinationAddress: dto.destinationAddress,
     });
@@ -557,6 +560,125 @@ export class WithdrawalsService {
         broadcastAt: new Date(),
       }),
     );
+  }
+
+  /**
+   * Phase 14B — the SYSTEM-driven counterpart to recordManualBroadcast:
+   * called by WithdrawalWatcherService (polling a real provider
+   * adapter's checkStatus()) or by a signature-verified provider
+   * webhook — never directly from an unauthenticated request, and never
+   * carrying a client-supplied status the caller merely trusts (both
+   * callers only reach this after independently confirming the result
+   * against the provider). Safe to call repeatedly / out of order: a
+   * withdrawal that has already moved past PENDING_MANUAL_BROADCAST
+   * (e.g. a duplicate webhook delivery, or a poll racing a webhook that
+   * already landed) is left untouched — returns null — rather than
+   * erroring, the same "watchers naturally re-poll and redeliver"
+   * reasoning as recordConfirmation below.
+   */
+  async recordProviderBroadcast(withdrawalId: string, txHash: string, providerReference?: string): Promise<Withdrawal | null> {
+    const result = await this.txRunner.run((tx) =>
+      tx.withdrawal.updateMany({
+        where: { id: withdrawalId, status: WithdrawalStatus.PENDING_MANUAL_BROADCAST },
+        data: { status: WithdrawalStatus.BROADCAST, txHash, custodyReference: providerReference, broadcastAt: new Date() },
+      }),
+    );
+    if (result.count === 0) return null;
+
+    const updated = await this.getOrThrow(withdrawalId);
+    await this.auditLog.record({
+      actorType: "SYSTEM",
+      action: "withdrawal.provider_broadcast_recorded",
+      resourceType: "Withdrawal",
+      resourceId: withdrawalId,
+      after: { status: updated.status, txHash, providerReference },
+      idempotencyKey: `withdrawal-provider-broadcast:${withdrawalId}`,
+    });
+    return updated;
+  }
+
+  /**
+   * Security review finding B1 — the ONLY path by which a custody
+   * PROVIDER's own "rejected" report (via WithdrawalWatcherService's
+   * poll or a signature-verified FireblocksWebhookService delivery) may
+   * fail a withdrawal and release its reservation. Deliberately
+   * NARROWER than the general-purpose fail() below (which remains for
+   * admin/chain-observed-failure callers, unchanged): this method
+   * refuses to touch a withdrawal that has already reached BROADCAST or
+   * CONFIRMING — i.e. one that already has a real on-chain txHash.
+   *
+   * Why this matters: honoring a "rejected" report for an
+   * already-broadcast withdrawal would release the ledger reservation
+   * for funds that may have already left the platform externally — a
+   * genuine double-spend risk, not just a state-machine inconsistency.
+   * Fireblocks' own BLOCKED/REJECTED/FAILED/CANCELLED statuses are
+   * documented as PRE-broadcast outcomes; a single real transaction has
+   * exactly one terminal branch (it either broadcasts, or it doesn't —
+   * never both), so a "rejected" report arriving after a genuine
+   * broadcast is either a stale/out-of-order delivery or a provider-side
+   * anomaly. Either way it is surfaced as its own distinct SYSTEM-actor
+   * audit entry for investigation — never silently applied (which would
+   * risk the double-spend above) and never silently dropped (which would
+   * hide a real anomaly worth investigating). This is NOT a generic
+   * "ignore all failures" path: every other case below still fails the
+   * withdrawal and releases the reservation exactly as before.
+   *
+   * Idempotent like recordProviderBroadcast: a withdrawal already
+   * terminal (FAILED, REJECTED, CANCELLED, or any state past
+   * CONFIRMING) is a safe no-op — a duplicate/out-of-order delivery of
+   * an outcome that either already happened or no longer applies.
+   */
+  async failProviderRejectedSubmission(withdrawalId: string, reason: string): Promise<Withdrawal | null> {
+    const PRE_BROADCAST_STATUSES: WithdrawalStatus[] = [WithdrawalStatus.APPROVED, WithdrawalStatus.PENDING_MANUAL_BROADCAST, WithdrawalStatus.BROADCASTING];
+    const POST_BROADCAST_STATUSES: WithdrawalStatus[] = [WithdrawalStatus.BROADCAST, WithdrawalStatus.CONFIRMING];
+
+    const updated = await this.txRunner.run(async (tx) => {
+      const result = await tx.withdrawal.updateMany({
+        where: { id: withdrawalId, status: { in: PRE_BROADCAST_STATUSES } },
+        data: { status: WithdrawalStatus.FAILED, failureReason: reason },
+      });
+      if (result.count === 0) return null;
+
+      const reservation = await this.reservations.findActiveByReference(tx, "Withdrawal", withdrawalId);
+      if (reservation) {
+        await this.reservations.release(tx, reservation.id);
+      }
+      return tx.withdrawal.findUniqueOrThrow({ where: { id: withdrawalId } });
+    });
+
+    if (updated) {
+      await this.auditLog.record({
+        actorType: "SYSTEM",
+        action: "withdrawal.provider_rejected",
+        resourceType: "Withdrawal",
+        resourceId: withdrawalId,
+        after: { status: updated.status },
+        reason,
+        idempotencyKey: `withdrawal-provider-rejected:${withdrawalId}`,
+      });
+      return updated;
+    }
+
+    // The CAS above matched nothing — either this withdrawal is already
+    // terminal (safe no-op) or it has already moved past broadcast (the
+    // anomaly this method exists to refuse rather than silently apply).
+    const current = await this.getOrThrow(withdrawalId);
+    if (POST_BROADCAST_STATUSES.includes(current.status)) {
+      this.logger.error(
+        `Withdrawal ${withdrawalId} received a provider "rejected" report after it had already reached ${current.status} ` +
+          `(txHash ${current.txHash}) — refusing to fail it or release its reservation. This is either a stale/out-of-order ` +
+          "delivery or a genuine provider-side anomaly and requires manual investigation.",
+      );
+      await this.auditLog.record({
+        actorType: "SYSTEM",
+        action: "withdrawal.provider_rejection_after_broadcast_refused",
+        resourceType: "Withdrawal",
+        resourceId: withdrawalId,
+        after: { status: current.status, txHash: current.txHash },
+        reason,
+      });
+    }
+    return null;
   }
 
   /**

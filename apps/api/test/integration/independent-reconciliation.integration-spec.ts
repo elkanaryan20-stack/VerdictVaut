@@ -1,6 +1,12 @@
+import * as crypto from "crypto";
 import { AuditLogService } from "../../src/audit/audit-log.service";
 import { BlockchainDepositAdapter, RawChainDeposit } from "../../src/wallet/chain-adapters/deposit-chain-adapter.interface";
 import { CustodyProvider } from "../../src/wallet/custody/custody-provider.interface";
+import { FireblocksCustodyAdapter } from "../../src/wallet/executors/fireblocks/fireblocks-custody.adapter";
+import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
+import { ProductionCustodyExecutor } from "../../src/wallet/executors/production-custody.executor";
+import { WithdrawalExecutorFactory } from "../../src/wallet/executors/withdrawal-executor.factory";
+import { SecretResolverService } from "../../src/wallet/provider-config/secret-resolver.service";
 import { IndependentReconciliationService } from "../../src/wallet/reconciliation/independent-reconciliation.service";
 import { createTestSuperAdmin, createTestUser, depositAddressService, depositsService, getAssetNetwork, prisma } from "./helpers";
 
@@ -465,5 +471,127 @@ describe("IndependentReconciliationService (real Postgres, fake chain adapters)"
     });
     expect(account).toBeNull();
     expect(await prisma.deposit.count({ where: { walletAddressId: assignment.walletAddressId } })).toBe(0);
+  });
+
+  describe("Phase 14B — checkPendingProviderSubmissions (real provider-adapter mismatch detection)", () => {
+    function makeExecutorFactory() {
+      const config = { get: () => "sandbox" } as never;
+      return new WithdrawalExecutorFactory(
+        prisma,
+        config,
+        new ManualBroadcastExecutor(),
+        new ProductionCustodyExecutor(),
+        new FireblocksCustodyAdapter(prisma, new SecretResolverService(), config),
+      );
+    }
+
+    async function setUpFireblocksWithdrawal(status: "PENDING_MANUAL_BROADCAST" = "PENDING_MANUAL_BROADCAST") {
+      const marker = `${Date.now()}-${Math.random()}`;
+      const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
+      process.env[`FIREBLOCKS_TEST_CREDS_${marker}`] = JSON.stringify({ apiKey: "test-key", privateKey });
+
+      const user = await createTestUser();
+      const superAdmin = await createTestSuperAdmin();
+      const assetNetwork = await getAssetNetwork("ETH", "ethereum-sepolia");
+
+      const providerConfig = await prisma.custodyProviderConfig.create({
+        data: {
+          providerName: "Fireblocks",
+          environment: "SANDBOX",
+          isEnabled: true,
+          apiBaseUrl: "https://sandbox-api.fireblocks.io/v1",
+          credentialsSecretRef: `env:FIREBLOCKS_TEST_CREDS_${marker}`,
+          vaultOrAccountRef: "0",
+        },
+      });
+      await prisma.withdrawalExecutionConfig.upsert({
+        where: { assetNetworkId: assetNetwork.id },
+        create: { assetNetworkId: assetNetwork.id, environment: "SANDBOX", executorType: "PRODUCTION_CUSTODY", custodyProviderConfigId: providerConfig.id, providerAssetId: "ETH_TEST" },
+        update: { executorType: "PRODUCTION_CUSTODY", custodyProviderConfigId: providerConfig.id, providerAssetId: "ETH_TEST" },
+      });
+
+      const withdrawal = await prisma.withdrawal.create({
+        data: {
+          userId: user.id,
+          assetNetworkId: assetNetwork.id,
+          destinationAddress: `0x${marker.replace(/[.-]/g, "").padEnd(40, "0").slice(0, 40)}`,
+          amount: "1",
+          fee: "0",
+          status,
+          custodyReference: `fb-tx-${marker}`,
+          clientWithdrawalId: `ck-${marker}`,
+        },
+      });
+
+      return { superAdmin, assetNetwork, withdrawal };
+    }
+
+    let fetchMock: jest.Mock;
+    const realFetch = global.fetch;
+    beforeEach(() => {
+      fetchMock = jest.fn();
+      global.fetch = fetchMock as never;
+    });
+    afterEach(() => {
+      global.fetch = realFetch;
+    });
+
+    it("flags a PENDING_MANUAL_BROADCAST withdrawal the provider no longer recognizes as CRITICAL — never mutates the withdrawal itself", async () => {
+      const { superAdmin, assetNetwork, withdrawal } = await setUpFireblocksWithdrawal();
+      fetchMock.mockResolvedValue({ ok: false, status: 404, text: async () => JSON.stringify({ message: "not found" }) });
+
+      const service = new IndependentReconciliationService(
+        prisma,
+        fakeAdapterFactory(noopAdapter) as never,
+        fakeCustodyProviderFactory(noopProvider) as never,
+        auditLog,
+        undefined,
+        makeExecutorFactory(),
+      );
+      const { discrepancies } = await service.runIndependentRescan(assetNetwork.id, superAdmin.id);
+
+      const found = discrepancies.find((d) => d.internalEntityId === withdrawal.id);
+      expect(found?.type).toBe("withdrawal_missing_from_provider");
+      expect(found?.severity).toBe("CRITICAL");
+
+      const refreshed = await prisma.withdrawal.findUniqueOrThrow({ where: { id: withdrawal.id } });
+      expect(refreshed.status).toBe("PENDING_MANUAL_BROADCAST"); // untouched — read-only reconciliation, never a mutation path
+    });
+
+    it("flags a provider-rejected submission the internal state has not yet recorded", async () => {
+      const { superAdmin, assetNetwork, withdrawal } = await setUpFireblocksWithdrawal();
+      fetchMock.mockResolvedValue({ ok: true, status: 200, text: async () => JSON.stringify({ id: withdrawal.custodyReference, status: "REJECTED" }) });
+
+      const service = new IndependentReconciliationService(
+        prisma,
+        fakeAdapterFactory(noopAdapter) as never,
+        fakeCustodyProviderFactory(noopProvider) as never,
+        auditLog,
+        undefined,
+        makeExecutorFactory(),
+      );
+      const { discrepancies } = await service.runIndependentRescan(assetNetwork.id, superAdmin.id);
+
+      const found = discrepancies.find((d) => d.internalEntityId === withdrawal.id);
+      expect(found?.type).toBe("withdrawal_rejected_by_provider_unrecorded");
+      expect(found?.severity).toBe("CRITICAL");
+    });
+
+    it("produces no discrepancy when the provider still reports the submission as pending — matches internal expectations", async () => {
+      const { superAdmin, assetNetwork, withdrawal } = await setUpFireblocksWithdrawal();
+      fetchMock.mockResolvedValue({ ok: true, status: 200, text: async () => JSON.stringify({ id: withdrawal.custodyReference, status: "PENDING_SIGNATURE" }) });
+
+      const service = new IndependentReconciliationService(
+        prisma,
+        fakeAdapterFactory(noopAdapter) as never,
+        fakeCustodyProviderFactory(noopProvider) as never,
+        auditLog,
+        undefined,
+        makeExecutorFactory(),
+      );
+      const { discrepancies } = await service.runIndependentRescan(assetNetwork.id, superAdmin.id);
+
+      expect(discrepancies.find((d) => d.internalEntityId === withdrawal.id)).toBeUndefined();
+    });
   });
 });

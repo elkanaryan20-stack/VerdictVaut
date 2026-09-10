@@ -1,4 +1,4 @@
-import { IsBoolean, IsIn, IsInt, IsOptional, IsPositive, IsString, MinLength, ValidateIf } from "class-validator";
+import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsPositive, IsString, MinLength, ValidateIf } from "class-validator";
 
 export class CreateAssetNetworkDto {
   @IsString()
@@ -130,6 +130,13 @@ export class CreateCustodyProviderConfigDto {
   @IsOptional()
   @IsString()
   vaultOrAccountRef?: string;
+
+  // Phase 14B — non-secret REST base URL (e.g.
+  // "https://sandbox-api.fireblocks.io/v1"), verified against the
+  // provider's own docs. Never a place for credentials.
+  @IsOptional()
+  @IsString()
+  apiBaseUrl?: string;
 }
 
 export class SetWithdrawalExecutionConfigDto {
@@ -149,6 +156,15 @@ export class SetWithdrawalExecutionConfigDto {
   @IsOptional()
   @IsString()
   providerRef?: string;
+
+  // Phase 14B — the provider's OWN asset identifier (e.g. a Fireblocks
+  // assetId string), never inferred/guessed by application code. An
+  // admin must explicitly verify this against the real provider account
+  // before setting it — see WithdrawalExecutionConfig.providerAssetId's
+  // own schema docblock.
+  @IsOptional()
+  @IsString()
+  providerAssetId?: string;
 }
 
 // Phase 14A — provider-neutral compliance configuration. See
@@ -182,4 +198,24 @@ export class CreateComplianceProviderConfigDto {
   @IsInt()
   @IsPositive()
   timeoutMs?: number;
+
+  // Phase 14B — non-secret REST base URL (e.g.
+  // "https://aml-api.elliptic.co/v2"), verified against the provider's
+  // own docs.
+  @IsOptional()
+  @IsString()
+  apiBaseUrl?: string;
+
+  // Phase 14B — admin-configured thresholds for mapping a raw numeric
+  // provider risk score (e.g. Elliptic's risk_score) onto
+  // AddressRiskStatus. Both must be set before scores from this
+  // provider can be categorized at all — see
+  // elliptic-risk.mapper.ts/EllipticAddressRiskGate.
+  @IsOptional()
+  @IsNumber()
+  riskScoreMediumThreshold?: number;
+
+  @IsOptional()
+  @IsNumber()
+  riskScoreHighThreshold?: number;
 }

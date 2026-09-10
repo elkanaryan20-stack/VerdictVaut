@@ -12,6 +12,9 @@ export interface CreateComplianceProviderConfigInput {
   webhookUrl?: string;
   webhookSecretRef?: string;
   timeoutMs?: number;
+  apiBaseUrl?: string;
+  riskScoreMediumThreshold?: number;
+  riskScoreHighThreshold?: number;
 }
 
 /**
@@ -33,6 +36,18 @@ export class ComplianceProviderConfigService {
     assertValidSecretRef(input.webhookSecretRef, "webhookSecretRef");
     if (input.timeoutMs != null && input.timeoutMs <= 0) {
       throw new BadRequestException("timeoutMs must be positive");
+    }
+    const hasMedium = input.riskScoreMediumThreshold != null;
+    const hasHigh = input.riskScoreHighThreshold != null;
+    if (hasMedium !== hasHigh) {
+      throw new BadRequestException("riskScoreMediumThreshold and riskScoreHighThreshold must be set together, or not at all");
+    }
+    if (hasMedium && hasHigh && input.riskScoreMediumThreshold! >= input.riskScoreHighThreshold!) {
+      throw new BadRequestException("riskScoreMediumThreshold must be strictly less than riskScoreHighThreshold");
+    }
+    // SSRF defense-in-depth — see CustodyProviderConfigService's identical check for the full reasoning.
+    if (input.apiBaseUrl != null && !/^https:\/\//i.test(input.apiBaseUrl)) {
+      throw new BadRequestException("apiBaseUrl must start with https://");
     }
 
     return this.prisma.complianceProviderConfig.create({

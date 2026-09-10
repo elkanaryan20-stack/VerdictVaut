@@ -18,6 +18,8 @@ import { WithdrawalsService } from "../wallet/withdrawals/withdrawals.service";
 import { BroadcastWithdrawalDto } from "../wallet/withdrawals/dto/broadcast-withdrawal.dto";
 import { CustodyProviderConfigService } from "../wallet/provider-config/custody-provider-config.service";
 import { ComplianceProviderConfigService } from "../wallet/provider-config/compliance-provider-config.service";
+import { PROVIDER_CAPABILITY_MATRIX } from "../wallet/provider-config/provider-capability-matrix";
+import { FireblocksWebhookService } from "../wallet/executors/fireblocks/fireblocks-webhook.service";
 import { AuditLogService } from "../audit/audit-log.service";
 import {
   CreateAssetNetworkDto,
@@ -67,6 +69,7 @@ export class AdminController {
     private readonly depositWatcherService: DepositWatcherService,
     private readonly custodyProviderConfigService: CustodyProviderConfigService,
     private readonly complianceProviderConfigService: ComplianceProviderConfigService,
+    private readonly fireblocksWebhookService: FireblocksWebhookService,
     private readonly auditLogService: AuditLogService,
   ) {}
 
@@ -400,6 +403,54 @@ export class AdminController {
     const updated = await this.complianceProviderConfigService.setComplianceProviderEnabled(id, false);
     await this.auditLogService.record({ actorId: admin.id, action: "compliance_provider_config.disable", resourceType: "ComplianceProviderConfig", resourceId: id });
     return updated;
+  }
+
+  // ── Provider capability matrix (Phase 14B — SUPER_ADMIN only; a
+  // static, code-reviewed record of what has actually been verified/
+  // implemented per provider/network family, never editable at runtime
+  // — see provider-capability-matrix.ts's own docblock) ────────────────
+  @Get("providers/capability-matrix")
+  @Roles(UserRole.SUPER_ADMIN)
+  getProviderCapabilityMatrix() {
+    return PROVIDER_CAPABILITY_MATRIX;
+  }
+
+  // ── Provider webhook events (Phase 14B — SUPER_ADMIN only; inspection
+  // and manual reprocessing of a delivery whose first processing attempt
+  // failed. Reprocessing NEVER accepts new payload data from the
+  // request — it re-reads and re-applies the event's own already-stored
+  // payload, so an admin can retry delivery handling but never inject
+  // different data than what the provider actually sent) ───────────────
+  @Get("providers/webhook-events")
+  @Roles(UserRole.SUPER_ADMIN)
+  listProviderWebhookEvents(@Query("provider") provider?: string, @Query("resourceId") resourceId?: string) {
+    return this.fireblocksWebhookService.listEvents({ provider, resourceId });
+  }
+
+  @Post("providers/webhook-events/:id/reprocess")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async reprocessProviderWebhookEvent(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    const outcome = await this.fireblocksWebhookService.reprocessEvent(id);
+    await this.auditLogService.record({
+      actorId: admin.id,
+      action: "provider_webhook_event.reprocess",
+      resourceType: "ProviderWebhookEvent",
+      resourceId: id,
+      after: { outcome },
+    });
+    return { outcome };
+  }
+
+  // ── Compliance decision signals (Phase 14B — SUPER_ADMIN only; the
+  // per-category KYC/sanctions/address-risk findings underlying a
+  // withdrawal's compliance decision, recorded on the "withdrawal.request"
+  // audit entry — see WithdrawalComplianceSignals's own docblock. This
+  // is read-only reviewer visibility, never itself a compliance action) ─
+  @Get("withdrawals/:id/compliance-signals")
+  @Roles(UserRole.SUPER_ADMIN)
+  getWithdrawalComplianceSignals(@Param("id") id: string) {
+    return this.auditLogService.list({ resourceType: "Withdrawal", resourceId: id, action: "withdrawal.request" });
   }
 
   // ── Reconciliation (settlement/reconciliation controls — SUPER_ADMIN only) ─

@@ -54,11 +54,13 @@ export class AuditLogService {
     });
   }
 
-  async list(filters: { resourceType?: string; actorId?: string } = {}) {
+  async list(filters: { resourceType?: string; actorId?: string; resourceId?: string; action?: string } = {}) {
     return this.prisma.auditLog.findMany({
       where: {
         resourceType: filters.resourceType,
         actorId: filters.actorId,
+        resourceId: filters.resourceId,
+        action: filters.action,
       },
       orderBy: { createdAt: "desc" },
       take: 200,

@@ -33,6 +33,20 @@ describe("CustodyProviderConfigService", () => {
       ).rejects.toThrow(BadRequestException);
     });
 
+    it("rejects a non-https apiBaseUrl (SSRF defense-in-depth)", async () => {
+      await expect(
+        service.createCustodyProviderConfig({ providerName: "Fireblocks", environment: "SANDBOX", apiBaseUrl: "http://sandbox-api.fireblocks.io/v1" }),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.custodyProviderConfig.create).not.toHaveBeenCalled();
+    });
+
+    it("accepts a well-formed https apiBaseUrl", async () => {
+      prisma.custodyProviderConfig.create.mockResolvedValue({ id: "cfg-1" });
+      await expect(
+        service.createCustodyProviderConfig({ providerName: "Fireblocks", environment: "SANDBOX", apiBaseUrl: "https://sandbox-api.fireblocks.io/v1" }),
+      ).resolves.toBeDefined();
+    });
+
     it("creates a config always starting disabled, even if the caller didn't say so", async () => {
       prisma.custodyProviderConfig.create.mockResolvedValue({ id: "cfg-1" });
       await service.createCustodyProviderConfig({ providerName: "Fireblocks", environment: "PRODUCTION", credentialsSecretRef: "env:FIREBLOCKS_KEY" });

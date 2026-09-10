@@ -1,31 +1,49 @@
-import { Prisma, WithdrawalComplianceDecision } from "@prisma/client";
+import { NetworkFamily, Prisma, WithdrawalComplianceDecision } from "@prisma/client";
 
 export interface WithdrawalComplianceContext {
   userId: string;
   assetSymbol: string;
   networkCode: string;
+  /** Needed by a real address-risk adapter to know whether its verified request shape even applies to this network — see EllipticAddressRiskGate's docblock. */
+  networkFamily: NetworkFamily;
   amount: Prisma.Decimal;
   destinationAddress: string;
 }
 
 /**
- * A single category's outcome — PASS/FAIL/REVIEW are what a real
- * provider would report; NOT_PERFORMED is what DeferredComplianceGate
- * honestly reports for every category today, since no real check ever
- * ran. Never silently absent: an implementation states NOT_PERFORMED
- * explicitly rather than leaving a category undefined, so "we didn't
- * check this" is always visible in the audit trail, not indistinguishable
- * from "we forgot to report it."
+ * Identity/onboarding verification status for this user — a KYC
+ * provider's job, not a per-withdrawal check. NOT_PERFORMED is what
+ * DeferredComplianceGate honestly reports today, since no real check
+ * ever ran; REVIEW is a provider's own "needs manual look" outcome,
+ * distinct from this platform's own separate mandatory SUPER_ADMIN
+ * review step.
  */
-export type ComplianceCheckStatus = "PASS" | "FAIL" | "REVIEW" | "NOT_PERFORMED";
+export type KycStatus = "NOT_PERFORMED" | "PENDING" | "PASSED" | "FAILED" | "REVIEW";
+
+/**
+ * Sanctions/PEP list screening of the user's own identity. Distinct
+ * from KycStatus (identity verification) and AddressRiskStatus
+ * (destination-address risk) — a real provider (e.g. Chainalysis,
+ * Elliptic) reports these as separate concerns, and conflating them
+ * would hide which specific check produced a BLOCKED decision.
+ */
+export type SanctionsStatus = "NOT_PERFORMED" | "CLEAR" | "HIT" | "REVIEW" | "ERROR";
+
+/**
+ * Risk screening of THIS withdrawal's specific destination address
+ * (e.g. a crypto-AML provider's address/transaction risk score).
+ * LOW/MEDIUM/HIGH mirror a categorical risk-tier report; a provider
+ * that instead returns a raw numeric score (e.g. Elliptic's
+ * risk_score) must map it to one of these tiers via an explicit,
+ * admin-configured threshold — VerdictVaut policy, not something the
+ * provider itself defines.
+ */
+export type AddressRiskStatus = "NOT_PERFORMED" | "LOW" | "MEDIUM" | "HIGH" | "BLOCKED" | "ERROR";
 
 export interface WithdrawalComplianceSignals {
-  /** Identity/onboarding verification status for this user — a KYC provider's job, not a per-withdrawal check. */
-  kycStatus?: ComplianceCheckStatus;
-  /** Sanctions/PEP list screening of the user's own identity. */
-  sanctionsScreeningStatus?: ComplianceCheckStatus;
-  /** Risk screening of THIS withdrawal's specific destination address (e.g. a crypto-AML provider's address/transaction risk score). */
-  addressRiskScreeningStatus?: ComplianceCheckStatus;
+  kycStatus?: KycStatus;
+  sanctionsScreeningStatus?: SanctionsStatus;
+  addressRiskScreeningStatus?: AddressRiskStatus;
   /** The provider's own reference/case id for this assessment, if any — never a secret, safe to audit-log and show a SUPER_ADMIN reviewer. */
   providerReference?: string;
 }

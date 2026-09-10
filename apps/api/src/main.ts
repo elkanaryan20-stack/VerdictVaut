@@ -13,7 +13,12 @@ async function bootstrap() {
   // Passed via options (not app.useLogger() after the fact) so even
   // Nest's own bootstrap-time framework log lines come out as
   // structured JSON, not just application code's own logging.
-  const app = await NestFactory.create(AppModule, { logger: new JsonLoggerService() });
+  // rawBody: true (a standard NestJS option) exposes req.rawBody — the
+  // exact bytes a provider webhook signed, needed to verify its
+  // signature (JSON.stringify(JSON.parse(body)) is not guaranteed to
+  // byte-for-byte match what was actually signed) — see
+  // FireblocksWebhookController.
+  const app = await NestFactory.create(AppModule, { logger: new JsonLoggerService(), rawBody: true });
 
   // Assigns/propagates a request id (see observability/request-context.ts)
   // BEFORE any other middleware/guard/handler runs, so every log line

@@ -531,6 +531,93 @@ describe("WithdrawalsService", () => {
     });
   });
 
+  describe("failProviderRejectedSubmission (security review finding B1)", () => {
+    // A real Prisma `updateMany({where:{status:{in:[...]}}})` only
+    // matches when the row's CURRENT status is actually in that list —
+    // this mock reproduces that instead of the file's lenient global
+    // default (which always returns count:1 regardless of `where`), so
+    // these tests genuinely exercise the CAS gate rather than assuming
+    // it works.
+    function mockCurrentStatus(status: string, extra: Record<string, unknown> = {}) {
+      prisma.withdrawal.updateMany.mockImplementation(
+        async ({ where, data }: { where: { status?: { in?: string[] } }; data: Record<string, unknown> }) => {
+          const allowed = where.status?.in ?? [];
+          if (!allowed.includes(status)) return { count: 0 };
+          lastRow = { id: "wd-1", status, ...extra, ...data };
+          return { count: 1 };
+        },
+      );
+      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", status, ...extra });
+    }
+
+    it("1. APPROVED + provider rejection => fails the withdrawal and releases the reservation", async () => {
+      mockCurrentStatus("APPROVED");
+      const result = await service.failProviderRejectedSubmission("wd-1", "policy blocked");
+      expect(result?.status).toBe("FAILED");
+      expect(reservations.release).toHaveBeenCalledWith(prisma, "res-1");
+      expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "withdrawal.provider_rejected", resourceId: "wd-1" }));
+    });
+
+    it("2. PENDING_MANUAL_BROADCAST + provider rejection => fails the withdrawal and releases the reservation", async () => {
+      mockCurrentStatus("PENDING_MANUAL_BROADCAST");
+      const result = await service.failProviderRejectedSubmission("wd-1", "policy blocked");
+      expect(result?.status).toBe("FAILED");
+      expect(reservations.release).toHaveBeenCalledWith(prisma, "res-1");
+    });
+
+    it("3. BROADCASTING + provider rejection => fails the withdrawal and releases the reservation (preserves the pre-existing lease-recovery behavior)", async () => {
+      mockCurrentStatus("BROADCASTING");
+      const result = await service.failProviderRejectedSubmission("wd-1", "policy blocked");
+      expect(result?.status).toBe("FAILED");
+      expect(reservations.release).toHaveBeenCalledWith(prisma, "res-1");
+    });
+
+    it("4. BROADCAST + txHash + provider rejection => MUST NOT fail the withdrawal or release the reservation — logs/audits an anomaly instead", async () => {
+      mockCurrentStatus("BROADCAST", { txHash: "0xrealhash" });
+      const result = await service.failProviderRejectedSubmission("wd-1", "policy blocked");
+
+      expect(result).toBeNull();
+      expect(reservations.release).not.toHaveBeenCalled();
+      expect(prisma.withdrawal.findUniqueOrThrow).not.toHaveBeenCalled(); // no re-read of a row this method never wrote
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorType: "SYSTEM",
+          action: "withdrawal.provider_rejection_after_broadcast_refused",
+          resourceId: "wd-1",
+          after: expect.objectContaining({ status: "BROADCAST", txHash: "0xrealhash" }),
+        }),
+      );
+    });
+
+    it("5. CONFIRMING + txHash + provider rejection => MUST NOT fail the withdrawal or release the reservation — logs/audits an anomaly instead", async () => {
+      mockCurrentStatus("CONFIRMING", { txHash: "0xrealhash" });
+      const result = await service.failProviderRejectedSubmission("wd-1", "policy blocked");
+
+      expect(result).toBeNull();
+      expect(reservations.release).not.toHaveBeenCalled();
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "withdrawal.provider_rejection_after_broadcast_refused", after: expect.objectContaining({ status: "CONFIRMING" }) }),
+      );
+    });
+
+    it("6. a duplicate/out-of-order rejection on an already-FAILED withdrawal is a safe, silent no-op — never double-released, never a spurious anomaly audit entry", async () => {
+      mockCurrentStatus("FAILED");
+      const result = await service.failProviderRejectedSubmission("wd-1", "policy blocked");
+
+      expect(result).toBeNull();
+      expect(reservations.release).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalledWith(expect.objectContaining({ action: "withdrawal.provider_rejection_after_broadcast_refused" }));
+      expect(auditLog.record).not.toHaveBeenCalledWith(expect.objectContaining({ action: "withdrawal.provider_rejected" }));
+    });
+
+    it("a duplicate/out-of-order rejection on an already-REJECTED withdrawal is also a safe, silent no-op", async () => {
+      mockCurrentStatus("REJECTED");
+      const result = await service.failProviderRejectedSubmission("wd-1", "policy blocked");
+      expect(result).toBeNull();
+      expect(reservations.release).not.toHaveBeenCalled();
+    });
+  });
+
   describe("reconcile", () => {
     it("rejects a non-SUPER_ADMIN actor", async () => {
       prisma.user.findUnique.mockResolvedValue({ id: "admin-1", role: "ADMIN" });
