@@ -1,6 +1,6 @@
 import { BadRequestException, Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from "@nestjs/common";
 import { Throttle } from "@nestjs/throttler";
-import { DiscrepancyStatus, UserRole } from "@prisma/client";
+import { ComplianceProviderCategory, DiscrepancyStatus, NetworkEnvironment, UserRole } from "@prisma/client";
 import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
 import { Roles } from "../common/decorators/roles.decorator";
@@ -16,13 +16,19 @@ import { DepositReprocessingService } from "../wallet/watchers/deposit-reprocess
 import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
 import { WithdrawalsService } from "../wallet/withdrawals/withdrawals.service";
 import { BroadcastWithdrawalDto } from "../wallet/withdrawals/dto/broadcast-withdrawal.dto";
+import { CustodyProviderConfigService } from "../wallet/provider-config/custody-provider-config.service";
+import { ComplianceProviderConfigService } from "../wallet/provider-config/compliance-provider-config.service";
 import { AuditLogService } from "../audit/audit-log.service";
 import {
   CreateAssetNetworkDto,
+  CreateComplianceProviderConfigDto,
+  CreateCustodyProviderConfigDto,
   ProvisionAddressDto,
   RejectWithdrawalDto,
+  ResolveAmbiguousExecutionDto,
   ResolveDiscrepancyDto,
   SetActiveDto,
+  SetWithdrawalExecutionConfigDto,
   StartIndependentRescanDto,
 } from "./dto/admin.dto";
 
@@ -59,6 +65,8 @@ export class AdminController {
     private readonly collateralReconciliationService: CollateralReconciliationService,
     private readonly reprocessingService: DepositReprocessingService,
     private readonly depositWatcherService: DepositWatcherService,
+    private readonly custodyProviderConfigService: CustodyProviderConfigService,
+    private readonly complianceProviderConfigService: ComplianceProviderConfigService,
     private readonly auditLogService: AuditLogService,
   ) {}
 
@@ -275,6 +283,122 @@ export class AdminController {
       after: { status: updated.status, txHash: dto.txHash },
       idempotencyKey: id,
     });
+    return updated;
+  }
+
+  // Phase 14A — resolves an EXECUTION_AMBIGUOUS withdrawal (see
+  // WithdrawalExecutionResult's "ambiguous" variant and
+  // WithdrawalsService.resolveAmbiguousExecution's own docblock). Never
+  // guesses: CONFIRMED_BROADCAST requires the real txHash the admin
+  // actually found, CONFIRMED_NOT_EXECUTED requires no fabricated evidence.
+  @Post("withdrawals/:id/resolve-ambiguous-execution")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  resolveAmbiguousExecution(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string, @Body() dto: ResolveAmbiguousExecutionDto) {
+    const resolution =
+      dto.outcome === "CONFIRMED_BROADCAST" ? ({ outcome: "CONFIRMED_BROADCAST", txHash: dto.txHash! } as const) : ({ outcome: "CONFIRMED_NOT_EXECUTED" } as const);
+    return this.withdrawalsService.resolveAmbiguousExecution(id, admin.id, resolution, dto.notes);
+  }
+
+  // ── Custody provider configuration (Phase 14A — SUPER_ADMIN only to
+  // configure; provider-neutral, never a real Fireblocks/BitGo/etc.
+  // integration — see CustodyProviderConfigService's own docblock) ─────
+  @Post("custody/providers")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async createCustodyProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Body() dto: CreateCustodyProviderConfigDto) {
+    const created = await this.custodyProviderConfigService.createCustodyProviderConfig(dto);
+    await this.auditLogService.record({
+      actorId: admin.id,
+      action: "custody_provider_config.create",
+      resourceType: "CustodyProviderConfig",
+      resourceId: created.id,
+      after: { providerName: created.providerName, environment: created.environment },
+    });
+    return created;
+  }
+
+  @Get("custody/providers")
+  listCustodyProviderConfigs() {
+    return this.custodyProviderConfigService.listCustodyProviderConfigs();
+  }
+
+  @Post("custody/providers/:id/enable")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async enableCustodyProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    const updated = await this.custodyProviderConfigService.setCustodyProviderEnabled(id, true);
+    await this.auditLogService.record({ actorId: admin.id, action: "custody_provider_config.enable", resourceType: "CustodyProviderConfig", resourceId: id });
+    return updated;
+  }
+
+  @Post("custody/providers/:id/disable")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async disableCustodyProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    const updated = await this.custodyProviderConfigService.setCustodyProviderEnabled(id, false);
+    await this.auditLogService.record({ actorId: admin.id, action: "custody_provider_config.disable", resourceType: "CustodyProviderConfig", resourceId: id });
+    return updated;
+  }
+
+  @Post("custody/execution-config")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async setWithdrawalExecutionConfig(@CurrentUser() admin: AuthenticatedUser, @Body() dto: SetWithdrawalExecutionConfigDto) {
+    const updated = await this.custodyProviderConfigService.setWithdrawalExecutionConfig(dto);
+    await this.auditLogService.record({
+      actorId: admin.id,
+      action: "withdrawal_execution_config.set",
+      resourceType: "WithdrawalExecutionConfig",
+      resourceId: updated.id,
+      after: { assetNetworkId: dto.assetNetworkId, executorType: dto.executorType, environment: dto.environment },
+    });
+    return updated;
+  }
+
+  @Get("custody/execution-config")
+  listWithdrawalExecutionConfigs() {
+    return this.custodyProviderConfigService.listWithdrawalExecutionConfigs();
+  }
+
+  // ── Compliance provider configuration (Phase 14A — SUPER_ADMIN only;
+  // never a real Sumsub/Chainalysis/etc. integration, and never itself a
+  // legal-compliance claim — see ComplianceProviderConfigService) ──────
+  @Post("compliance/providers")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async createComplianceProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Body() dto: CreateComplianceProviderConfigDto) {
+    const created = await this.complianceProviderConfigService.createComplianceProviderConfig(dto);
+    await this.auditLogService.record({
+      actorId: admin.id,
+      action: "compliance_provider_config.create",
+      resourceType: "ComplianceProviderConfig",
+      resourceId: created.id,
+      after: { category: created.category, providerName: created.providerName, environment: created.environment },
+    });
+    return created;
+  }
+
+  @Get("compliance/providers")
+  listComplianceProviderConfigs(@Query("category") category?: ComplianceProviderCategory, @Query("environment") environment?: NetworkEnvironment) {
+    return this.complianceProviderConfigService.listComplianceProviderConfigs({ category, environment });
+  }
+
+  @Post("compliance/providers/:id/enable")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async enableComplianceProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    const updated = await this.complianceProviderConfigService.setComplianceProviderEnabled(id, true);
+    await this.auditLogService.record({ actorId: admin.id, action: "compliance_provider_config.enable", resourceType: "ComplianceProviderConfig", resourceId: id });
+    return updated;
+  }
+
+  @Post("compliance/providers/:id/disable")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async disableComplianceProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    const updated = await this.complianceProviderConfigService.setComplianceProviderEnabled(id, false);
+    await this.auditLogService.record({ actorId: admin.id, action: "compliance_provider_config.disable", resourceType: "ComplianceProviderConfig", resourceId: id });
     return updated;
   }
 

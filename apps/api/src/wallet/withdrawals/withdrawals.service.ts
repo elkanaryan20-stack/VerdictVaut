@@ -9,6 +9,7 @@ import { PrismaService } from "../../prisma/prisma.service";
 import { SerializableTransactionRunner } from "../../prisma/serializable-transaction-runner";
 import { CustodyProviderFactory } from "../custody/custody-provider.factory";
 import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
+import { LoggingMetricsService, MetricsService } from "../../observability/metrics.service";
 import {
   WITHDRAWAL_COMPLIANCE_GATE,
   WithdrawalComplianceGate,
@@ -25,6 +26,13 @@ const RESERVATION_STILL_HELD_STATUSES = new Set<WithdrawalStatus>([
   WithdrawalStatus.CONFIRMING,
   WithdrawalStatus.CONFIRMED,
   WithdrawalStatus.CREDITED,
+  // Phase 14A: genuinely unknown whether the provider executed this —
+  // the reservation must stay held either way until a SUPER_ADMIN
+  // resolves it (see resolveAmbiguousExecution). reconcile() itself
+  // still no-ops for this status today (no txHash exists yet to check
+  // against the chain), but this categorization stays correct
+  // regardless of that.
+  WithdrawalStatus.EXECUTION_AMBIGUOUS,
 ]);
 
 /** Statuses where the reservation has already been released back to the user — see reconcile(). */
@@ -100,6 +108,7 @@ export class WithdrawalsService {
     private readonly auditLog: AuditLogService,
     @Inject(WITHDRAWAL_FEE_CALCULATOR) private readonly feeCalculator: WithdrawalFeeCalculator,
     @Inject(WITHDRAWAL_COMPLIANCE_GATE) private readonly complianceGate: WithdrawalComplianceGate,
+    private readonly metrics: MetricsService = new LoggingMetricsService(),
   ) {}
 
   async request(userId: string, dto: RequestWithdrawalDto) {
@@ -262,6 +271,12 @@ export class WithdrawalsService {
         assetSymbol: asset.symbol,
         networkCode: network.code,
         complianceDecision: withdrawal.complianceDecision,
+        // Structured per-category findings (KYC/sanctions/address-risk),
+        // when the gate reports them — see WithdrawalComplianceSignals.
+        // Not persisted on the Withdrawal row itself (complianceNote
+        // stays a plain human-readable reason); the audit log is the
+        // durable record for this richer, optional detail.
+        complianceSignals: compliance.signals as Prisma.InputJsonValue | undefined,
       },
       idempotencyKey: withdrawal.id,
     });
@@ -421,7 +436,7 @@ export class WithdrawalsService {
         this.casTransition(tx, withdrawalId, [WithdrawalStatus.BROADCASTING], {
           status: WithdrawalStatus.BROADCAST,
           txHash: result.txHash,
-          custodyReference: result.custodyReference,
+          custodyReference: result.providerReference,
           broadcastAt: new Date(),
         }),
       );
@@ -441,12 +456,78 @@ export class WithdrawalsService {
       return broadcast;
     }
 
+    if (result.status === "ambiguous") {
+      // Deliberately NOT reverted to APPROVED (which WithdrawalsService's
+      // own convention treats as "safe to retry") — the whole point of
+      // this result variant is that retrying could double-execute a real
+      // money movement if the provider actually acted. The reservation
+      // stays held (see RESERVATION_STILL_HELD_STATUSES) until a
+      // SUPER_ADMIN explicitly resolves it via resolveAmbiguousExecution().
+      const ambiguous = await this.txRunner.run((tx) =>
+        this.casTransition(tx, withdrawalId, [WithdrawalStatus.BROADCASTING], {
+          status: WithdrawalStatus.EXECUTION_AMBIGUOUS,
+          custodyReference: result.providerReference,
+          failureReason: result.reason,
+        }),
+      );
+      this.metrics.increment("wallet.withdrawal.execution_ambiguous", { assetNetworkId: withdrawal.assetNetworkId });
+      await this.auditLog.record({
+        actorId,
+        action: "withdrawal.execution_ambiguous",
+        resourceType: "Withdrawal",
+        resourceId: withdrawalId,
+        after: { status: ambiguous.status, reason: result.reason, providerReference: result.providerReference },
+        reason: result.reason,
+      });
+      return ambiguous;
+    }
+
     return this.txRunner.run((tx) =>
       this.casTransition(tx, withdrawalId, [WithdrawalStatus.BROADCASTING], {
         status: WithdrawalStatus.PENDING_MANUAL_BROADCAST,
-        custodyReference: result.custodyReference,
+        custodyReference: result.providerReference,
       }),
     );
+  }
+
+  /**
+   * SUPER_ADMIN resolves an EXECUTION_AMBIGUOUS withdrawal after
+   * confirming, out-of-band or via the executor's own checkStatus()
+   * where implemented, what actually happened at the provider. This
+   * method never guesses: the caller must state which outcome was
+   * confirmed, and CONFIRMED_BROADCAST requires the real txHash that was
+   * actually found — never fabricated, never left to infer from the
+   * request alone.
+   */
+  async resolveAmbiguousExecution(
+    withdrawalId: string,
+    actorId: string,
+    resolution: { outcome: "CONFIRMED_BROADCAST"; txHash: string } | { outcome: "CONFIRMED_NOT_EXECUTED" },
+    notes: string,
+  ) {
+    await this.assertSuperAdmin(actorId);
+
+    const updated = await this.txRunner.run((tx) =>
+      resolution.outcome === "CONFIRMED_BROADCAST"
+        ? this.casTransition(tx, withdrawalId, [WithdrawalStatus.EXECUTION_AMBIGUOUS], {
+            status: WithdrawalStatus.BROADCAST,
+            txHash: resolution.txHash,
+            broadcastAt: new Date(),
+          })
+        : this.casTransition(tx, withdrawalId, [WithdrawalStatus.EXECUTION_AMBIGUOUS], {
+            status: WithdrawalStatus.APPROVED,
+          }),
+    );
+
+    await this.auditLog.record({
+      actorId,
+      action: "withdrawal.ambiguous_execution_resolved",
+      resourceType: "Withdrawal",
+      resourceId: withdrawalId,
+      after: { status: updated.status, resolution: resolution.outcome },
+      reason: notes,
+    });
+    return updated;
   }
 
   /**

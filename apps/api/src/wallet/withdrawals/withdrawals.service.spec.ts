@@ -317,7 +317,7 @@ describe("WithdrawalsService", () => {
 
     it("threads a manual-broadcast executor's result into PENDING_MANUAL_BROADCAST, carrying custodyReference", async () => {
       prisma.withdrawal.findUnique.mockResolvedValue(approvedWithdrawal);
-      executorFactory.resolve.mockResolvedValue({ execute: jest.fn().mockResolvedValue({ status: "awaiting_manual_broadcast", custodyReference: "ref-1" }) });
+      executorFactory.resolve.mockResolvedValue({ execute: jest.fn().mockResolvedValue({ status: "awaiting_manual_broadcast", providerReference: "ref-1" }) });
 
       await service.approve("wd-1", "admin-1");
 
@@ -328,12 +328,36 @@ describe("WithdrawalsService", () => {
 
     it("transitions to BROADCAST and records a distinct audit event when the executor reports a real broadcast", async () => {
       prisma.withdrawal.findUnique.mockResolvedValue(approvedWithdrawal);
-      executorFactory.resolve.mockResolvedValue({ execute: jest.fn().mockResolvedValue({ status: "broadcast", txHash: "0xabc", custodyReference: "ref-2" }) });
+      executorFactory.resolve.mockResolvedValue({ execute: jest.fn().mockResolvedValue({ status: "broadcast", txHash: "0xabc", providerReference: "ref-2" }) });
 
       const result = await service.approve("wd-1", "admin-1");
 
       expect(result).toMatchObject({ status: "BROADCAST", txHash: "0xabc" });
       expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "withdrawal.broadcast", after: expect.objectContaining({ txHash: "0xabc" }) }));
+    });
+
+    it("moves to EXECUTION_AMBIGUOUS (never a blind retry) when the executor reports an ambiguous outcome, and audit-logs the reason", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue(approvedWithdrawal);
+      executorFactory.resolve.mockResolvedValue({
+        execute: jest.fn().mockResolvedValue({ status: "ambiguous", providerReference: "ref-3", reason: "provider request timed out after submission" }),
+      });
+
+      const result = await service.approve("wd-1", "admin-1");
+
+      expect(result).toMatchObject({ status: "EXECUTION_AMBIGUOUS", custodyReference: "ref-3" });
+      // The BROADCASTING execution lease is never reverted back to
+      // APPROVED on an ambiguous result — only the initial RISK_REVIEW ->
+      // APPROVED step (an unrelated, earlier part of approve()) sets
+      // APPROVED; reverting the lease itself would invite a blind retry.
+      expect(prisma.withdrawal.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ status: { in: ["BROADCASTING"] } }),
+          data: expect.objectContaining({ status: "APPROVED" }),
+        }),
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "withdrawal.execution_ambiguous", reason: "provider request timed out after submission" }),
+      );
     });
 
     it("never calls the executor when the CAS to APPROVED fails (already approved/terminal) — no blind re-execution", async () => {
@@ -384,6 +408,60 @@ describe("WithdrawalsService", () => {
           data: expect.objectContaining({ status: "APPROVED" }),
         }),
       );
+    });
+  });
+
+  describe("resolveAmbiguousExecution", () => {
+    it("requires SUPER_ADMIN", async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: "admin-1", role: "ADMIN" });
+      await expect(
+        service.resolveAmbiguousExecution("wd-1", "admin-1", { outcome: "CONFIRMED_NOT_EXECUTED" }, "checked with provider"),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("CONFIRMED_BROADCAST moves EXECUTION_AMBIGUOUS -> BROADCAST with the admin-supplied txHash, never fabricating one", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", status: "EXECUTION_AMBIGUOUS" });
+
+      const result = await service.resolveAmbiguousExecution(
+        "wd-1",
+        "admin-1",
+        { outcome: "CONFIRMED_BROADCAST", txHash: "0xrealtxhash" },
+        "Confirmed via Fireblocks dashboard directly",
+      );
+
+      expect(result).toMatchObject({ status: "BROADCAST", txHash: "0xrealtxhash" });
+      expect(prisma.withdrawal.updateMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ status: { in: ["EXECUTION_AMBIGUOUS"] } }),
+          data: expect.objectContaining({ status: "BROADCAST", txHash: "0xrealtxhash" }),
+        }),
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "withdrawal.ambiguous_execution_resolved", reason: "Confirmed via Fireblocks dashboard directly" }),
+      );
+    });
+
+    it("CONFIRMED_NOT_EXECUTED moves EXECUTION_AMBIGUOUS -> APPROVED, safe for a retry or a subsequent reject()", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", status: "EXECUTION_AMBIGUOUS" });
+
+      const result = await service.resolveAmbiguousExecution(
+        "wd-1",
+        "admin-1",
+        { outcome: "CONFIRMED_NOT_EXECUTED" },
+        "Provider has no record of this idempotency key",
+      );
+
+      expect(result).toMatchObject({ status: "APPROVED" });
+    });
+
+    it("refuses to resolve a withdrawal that isn't actually EXECUTION_AMBIGUOUS", async () => {
+      prisma.withdrawal.updateMany.mockResolvedValue({ count: 0 });
+      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", status: "BROADCAST" });
+
+      await expect(
+        service.resolveAmbiguousExecution("wd-1", "admin-1", { outcome: "CONFIRMED_NOT_EXECUTED" }, "notes"),
+      ).rejects.toThrow(ConflictException);
     });
   });
 

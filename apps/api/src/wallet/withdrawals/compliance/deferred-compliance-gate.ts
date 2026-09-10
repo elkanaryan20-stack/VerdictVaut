@@ -25,6 +25,15 @@ export class DeferredComplianceGate implements WithdrawalComplianceGate {
     return {
       decision: WithdrawalComplianceDecision.DEFERRED,
       reason: "No KYC/AML/sanctions-screening system is integrated yet — pending mandatory human SUPER_ADMIN review.",
+      // Explicit NOT_PERFORMED per category, rather than omitting
+      // `signals` entirely — makes "nothing was actually checked" a
+      // visible fact in the audit trail, not something a reader has to
+      // infer from a missing field.
+      signals: {
+        kycStatus: "NOT_PERFORMED",
+        sanctionsScreeningStatus: "NOT_PERFORMED",
+        addressRiskScreeningStatus: "NOT_PERFORMED",
+      },
     };
   }
 }

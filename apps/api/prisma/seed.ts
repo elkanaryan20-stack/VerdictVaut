@@ -45,6 +45,8 @@ async function main() {
     contractAddress?: string;
     memoRequired?: boolean;
     minConfirmations: number;
+    /** Defaults to true (matching the schema default) when omitted. */
+    isActive?: boolean;
   }> = [
     { assetSymbol: "BTC", networkCode: "bitcoin-testnet", isNative: true, minConfirmations: 2 },
     { assetSymbol: "ETH", networkCode: "ethereum-sepolia", isNative: true, minConfirmations: 12 },
@@ -61,11 +63,15 @@ async function main() {
     { assetSymbol: "USDC", networkCode: "base-sepolia", isNative: false, contractAddress: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", minConfirmations: 12 },
     // Tether does not publish an official Sepolia testnet deployment —
     // contractAddress is deliberately left unset rather than inventing
-    // one. This asset/network pair stays configured but non-functional
-    // for deposits (EvmDepositAdapter.validateNetwork rejects a token
-    // AssetNetwork with no contractAddress) until a real address is
-    // available.
-    { assetSymbol: "USDT", networkCode: "ethereum-sepolia", isNative: false, minConfirmations: 12 },
+    // one, and this row is seeded isActive: false to match: honestly
+    // non-functional and un-activatable (asset_networks_active_token_
+    // requires_contract_check enforces this at the DB level too, not
+    // just here) until a real address is available and someone
+    // deliberately activates it via AssetsNetworksService with one
+    // configured. Phase 14A audit finding: this row previously had no
+    // isActive override and silently defaulted to the schema's `true`,
+    // contradicting this very comment's stated intent.
+    { assetSymbol: "USDT", networkCode: "ethereum-sepolia", isNative: false, minConfirmations: 12, isActive: false },
   ];
 
   for (const an of assetNetworks) {
@@ -80,12 +86,14 @@ async function main() {
         contractAddress: an.contractAddress,
         memoRequired: an.memoRequired ?? false,
         minConfirmations: an.minConfirmations,
+        isActive: an.isActive ?? true,
       },
       update: {
         isNative: an.isNative,
         contractAddress: an.contractAddress,
         memoRequired: an.memoRequired ?? false,
         minConfirmations: an.minConfirmations,
+        isActive: an.isActive ?? true,
       },
     });
   }

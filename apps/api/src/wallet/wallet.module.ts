@@ -25,6 +25,8 @@ import { WithdrawalExecutorFactory } from "./executors/withdrawal-executor.facto
 import { DeferredComplianceGate } from "./withdrawals/compliance/deferred-compliance-gate";
 import { WITHDRAWAL_COMPLIANCE_GATE } from "./withdrawals/compliance/withdrawal-compliance-gate.interface";
 import { ProductionSafetyGate } from "./production-safety.gate";
+import { CustodyProviderConfigService } from "./provider-config/custody-provider-config.service";
+import { ComplianceProviderConfigService } from "./provider-config/compliance-provider-config.service";
 import { WITHDRAWAL_FEE_CALCULATOR } from "./withdrawals/fees/withdrawal-fee-calculator.interface";
 import { ZeroWithdrawalFeeCalculator } from "./withdrawals/fees/zero-withdrawal-fee.calculator";
 import { WithdrawalsController } from "./withdrawals/withdrawals.controller";
@@ -67,6 +69,8 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     { provide: WITHDRAWAL_FEE_CALCULATOR, useClass: ZeroWithdrawalFeeCalculator },
     { provide: WITHDRAWAL_COMPLIANCE_GATE, useClass: DeferredComplianceGate },
     ProductionSafetyGate,
+    CustodyProviderConfigService,
+    ComplianceProviderConfigService,
   ],
   exports: [
     AssetsNetworksService,
@@ -79,6 +83,8 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     ConfirmationPolicyService,
     DepositReprocessingService,
     DepositWatcherService,
+    CustodyProviderConfigService,
+    ComplianceProviderConfigService,
   ],
 })
 export class WalletModule {}

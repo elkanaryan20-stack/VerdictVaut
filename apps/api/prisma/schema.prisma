@@ -211,11 +211,33 @@ enum WithdrawalStatus {
   REJECTED
   FAILED
   CANCELLED
+  // Phase 14A — WithdrawalExecutor.execute() returned "ambiguous": the
+  // call to the (future) custody provider itself failed in a way that
+  // leaves it genuinely unknown whether the provider actually executed
+  // the withdrawal (e.g. a network timeout after the request left this
+  // process). Reverting to APPROVED for a blind retry would risk a real
+  // double-execution if the provider DID act; the reservation stays
+  // held (see RESERVATION_STILL_HELD_STATUSES) until a SUPER_ADMIN
+  // explicitly resolves it via resolveAmbiguousExecution() — by
+  // checking the provider directly (WithdrawalExecutor.checkStatus(),
+  // where implemented) or via out-of-band confirmation.
+  EXECUTION_AMBIGUOUS
 }
 
 enum WithdrawalExecutorType {
   MANUAL_BROADCAST
   PRODUCTION_CUSTODY
+}
+
+// Phase 14A — the two provider categories WithdrawalComplianceGate's
+// real implementation would call: KYC covers who the user is
+// (identity verification, ongoing sanctions/PEP screening at the
+// person level); SANCTIONS_KYT covers what a specific withdrawal
+// touches (destination-address risk scoring, crypto transaction
+// monitoring). See ComplianceProviderConfig.
+enum ComplianceProviderCategory {
+  KYC
+  SANCTIONS_KYT
 }
 
 // Phase 9: the explicit, honest result of WithdrawalComplianceGate.assess()
@@ -867,6 +889,17 @@ model Network {
   @@map("networks")
 }
 
+// Phase 14A — asset_networks_active_token_requires_contract_check
+// (added in the collateral/login-throttle-era migration set) enforces,
+// at the DATABASE level, that an active non-native AssetNetwork always
+// has a contractAddress — the application-level check in
+// AssetsNetworksService (Phase 11) already refused this at create/
+// activate time, but that check only guards its own code path; the DB
+// constraint holds even against a direct write (e.g. a seed script)
+// that bypasses the service entirely. See prisma/seed.ts's USDT/
+// ethereum-sepolia row for exactly the case this exists to catch: no
+// real Sepolia USDT contract exists, so that row is seeded isActive:
+// false, honestly non-functional, rather than inventing an address.
 model AssetNetwork {
   id                  String   @id @default(uuid())
   assetId             String
@@ -1060,13 +1093,86 @@ model WithdrawalExecutionConfig {
   assetNetworkId String                 @unique
   environment    NetworkEnvironment
   executorType   WithdrawalExecutorType @default(MANUAL_BROADCAST)
+  // Free-text, asset-network-specific note (e.g. "vault-3") — distinct
+  // from custodyProviderConfigId below, which is the shared, provider-
+  // LEVEL configuration this asset/network's executions run through.
   providerRef    String?
+  // Phase 14A — required when executorType = PRODUCTION_CUSTODY (see
+  // withdrawal_execution_configs_custody_requires_provider_check): one
+  // CustodyProviderConfig can back many asset/networks (a single
+  // Fireblocks/BitGo account handling several chains), so this is a
+  // many-to-one link, not a duplicate of the provider config itself.
+  custodyProviderConfigId String?
   createdAt      DateTime               @default(now())
   updatedAt      DateTime               @updatedAt
 
-  assetNetwork AssetNetwork @relation(fields: [assetNetworkId], references: [id])
+  assetNetwork          AssetNetwork           @relation(fields: [assetNetworkId], references: [id])
+  custodyProviderConfig CustodyProviderConfig? @relation(fields: [custodyProviderConfigId], references: [id])
 
   @@map("withdrawal_execution_configs")
+}
+
+// Phase 14A — provider-LEVEL custody configuration: one row per real
+// custody account/integration (e.g. one Fireblocks production account),
+// referenced by however many WithdrawalExecutionConfig rows need it.
+// Deliberately provider-NEUTRAL: providerName is free-text/display data
+// only, never branched on by application code (that would mean a real
+// integration exists, which it doesn't yet — see
+// ProductionCustodyExecutor). credentialsSecretRef/webhookSecretRef are
+// REFERENCES to where a real secret lives (e.g. "env:FIREBLOCKS_API_KEY"
+// or "secretsmanager:prod/fireblocks/api-key") — never the secret
+// itself; see custody_provider_configs_secret_ref_scheme_check and
+// CustodyProviderConfigService's own validation for why a raw-looking
+// value is rejected outright, not just discouraged.
+model CustodyProviderConfig {
+  id                    String             @id @default(uuid())
+  providerName          String
+  environment           NetworkEnvironment
+  isEnabled             Boolean            @default(false)
+  credentialsSecretRef  String?
+  webhookUrl            String?
+  webhookSecretRef      String?
+  timeoutMs             Int                @default(10000)
+  // Documents the provider's OWN idempotency mechanism (e.g.
+  // "Idempotency-Key" for Fireblocks) — purely descriptive until a real
+  // executor implementation exists to read it; never invented if
+  // unknown, left null instead.
+  idempotencyHeaderName String?
+  // Non-secret account/vault identifier (e.g. a Fireblocks vault id) —
+  // an identifier, not a credential, so no scheme:path format is required.
+  vaultOrAccountRef     String?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+
+  executionConfigs WithdrawalExecutionConfig[]
+
+  @@index([environment, isEnabled])
+  @@map("custody_provider_configs")
+}
+
+// Phase 14A — provider-neutral compliance configuration, one row per
+// real KYC or crypto-AML/sanctions (KYT) integration. Same
+// reference-not-secret discipline as CustodyProviderConfig. Enabling a
+// row here does NOT itself make WithdrawalComplianceGate real — that
+// still requires an actual implementation replacing DeferredComplianceGate
+// (see that class's own docblock); this table exists so
+// ProductionSafetyGate can verify configuration completeness
+// independently of whether the code-level swap has also happened.
+model ComplianceProviderConfig {
+  id                   String                     @id @default(uuid())
+  category             ComplianceProviderCategory
+  providerName         String
+  environment          NetworkEnvironment
+  isEnabled            Boolean                    @default(false)
+  credentialsSecretRef String?
+  webhookUrl           String?
+  webhookSecretRef     String?
+  timeoutMs            Int                        @default(10000)
+  createdAt            DateTime                   @default(now())
+  updatedAt            DateTime                   @updatedAt
+
+  @@index([category, environment, isEnabled])
+  @@map("compliance_provider_configs")
 }
 
 // ────────────────────────────────────────────────────────────────────────

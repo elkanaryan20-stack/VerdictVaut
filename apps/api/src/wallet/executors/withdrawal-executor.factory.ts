@@ -39,6 +39,7 @@ export class WithdrawalExecutorFactory {
   async resolve(assetNetworkId: string): Promise<WithdrawalExecutor> {
     const config = await this.prisma.withdrawalExecutionConfig.findUnique({
       where: { assetNetworkId },
+      include: { custodyProviderConfig: true },
     });
 
     const isProductionCustody = config?.executorType === WithdrawalExecutorType.PRODUCTION_CUSTODY;
@@ -49,9 +50,35 @@ export class WithdrawalExecutorFactory {
           `No PRODUCTION_CUSTODY WithdrawalExecutionConfig is set for asset/network ${assetNetworkId} — refusing to fall back to manual broadcast in production.`,
         );
       }
-      return this.productionCustodyExecutor;
+      // Belt-and-suspenders alongside the DB-level
+      // withdrawal_execution_configs_custody_requires_provider_check
+      // (which only guarantees a provider config is LINKED, not that
+      // it's currently enabled) — a provider config disabled after the
+      // fact (e.g. mid-incident) must not silently keep routing real
+      // withdrawals to it.
+      if (!config.custodyProviderConfig?.isEnabled) {
+        throw new InternalServerErrorException(
+          `WithdrawalExecutionConfig for asset/network ${assetNetworkId} is linked to a custody provider config that is not enabled — refusing to execute.`,
+        );
+      }
+      return this.assertSupportsAssetNetwork(this.productionCustodyExecutor, assetNetworkId);
     }
 
-    return isProductionCustody ? this.productionCustodyExecutor : this.manualBroadcastExecutor;
+    return isProductionCustody
+      ? this.assertSupportsAssetNetwork(this.productionCustodyExecutor, assetNetworkId)
+      : this.assertSupportsAssetNetwork(this.manualBroadcastExecutor, assetNetworkId);
+  }
+
+  /**
+   * Checked here, once, rather than leaving every call site to remember
+   * — an executor implementation that declares supportsAssetNetwork()
+   * (optional; most don't need to) gets it enforced automatically before
+   * execute() is ever reached.
+   */
+  private async assertSupportsAssetNetwork(executor: WithdrawalExecutor, assetNetworkId: string): Promise<WithdrawalExecutor> {
+    if (executor.supportsAssetNetwork && !(await executor.supportsAssetNetwork(assetNetworkId))) {
+      throw new InternalServerErrorException(`The configured withdrawal executor does not support asset/network ${assetNetworkId}.`);
+    }
+    return executor;
   }
 }

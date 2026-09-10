@@ -1,9 +1,13 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { PrismaService } from "../../prisma/prisma.service";
+import { ChainRpcConfigService } from "../chain-adapters/rpc-config.service";
 
 @Injectable()
 export class AssetsNetworksService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly rpcConfig: ChainRpcConfigService,
+  ) {}
 
   async listAssets() {
     return this.prisma.asset.findMany({ orderBy: { symbol: "asc" } });
@@ -30,7 +34,7 @@ export class AssetsNetworksService {
   }
 
   async setAssetNetworkActive(assetNetworkId: string, isActive: boolean) {
-    const assetNetwork = await this.prisma.assetNetwork.findUnique({ where: { id: assetNetworkId } });
+    const assetNetwork = await this.prisma.assetNetwork.findUnique({ where: { id: assetNetworkId }, include: { network: true } });
     if (!assetNetwork) {
       throw new NotFoundException("Asset/network pair not found");
     }
@@ -39,8 +43,25 @@ export class AssetsNetworksService {
     // adapter's own validateNetwork throws there — see e.g.
     // EvmDepositAdapter/SolanaDepositAdapter) — much later and less
     // actionable than rejecting it immediately here (Phase 11 finding).
+    // Backed by asset_networks_active_token_requires_contract_check at
+    // the DB level too (Phase 14A) — this check stays for the clearer,
+    // immediate error message a direct API caller sees.
     if (isActive && !assetNetwork.isNative && !assetNetwork.contractAddress) {
       throw new BadRequestException("Cannot activate a non-native asset/network with no contractAddress configured");
+    }
+    // Phase 14A: catches "incomplete blockchain watcher configuration"
+    // (section 5) at activation time rather than letting it surface only
+    // when the next scan poll fails — an asset/network with no resolvable
+    // RPC/provider URL is not safely observable for deposits yet.
+    // Re-thrown as BadRequestException: ChainRpcConfigService's own
+    // ServiceUnavailableException is the right signal for a live runtime
+    // call failing, but this is a config-time validation, not an outage.
+    if (isActive) {
+      try {
+        this.rpcConfig.getRpcUrl(assetNetwork.network.code);
+      } catch (error) {
+        throw new BadRequestException((error as Error).message);
+      }
     }
     return this.prisma.assetNetwork.update({ where: { id: assetNetworkId }, data: { isActive } });
   }
