@@ -11,6 +11,7 @@ import { DepositAddressService } from "../wallet/addresses/deposit-address.servi
 import { DepositsService } from "../wallet/deposits/deposits.service";
 import { ReconciliationService } from "../wallet/reconciliation/reconciliation.service";
 import { IndependentReconciliationService } from "../wallet/reconciliation/independent-reconciliation.service";
+import { CollateralReconciliationService } from "../settlement/collateral-reconciliation.service";
 import { DepositReprocessingService } from "../wallet/watchers/deposit-reprocessing.service";
 import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
 import { WithdrawalsService } from "../wallet/withdrawals/withdrawals.service";
@@ -55,6 +56,7 @@ export class AdminController {
     private readonly withdrawalsService: WithdrawalsService,
     private readonly reconciliationService: ReconciliationService,
     private readonly independentReconciliationService: IndependentReconciliationService,
+    private readonly collateralReconciliationService: CollateralReconciliationService,
     private readonly reprocessingService: DepositReprocessingService,
     private readonly depositWatcherService: DepositWatcherService,
     private readonly auditLogService: AuditLogService,
@@ -297,8 +299,34 @@ export class AdminController {
   // come first or it would be swallowed as an :assetNetworkId value
   // (same literal-vs-param ordering rule as deposits/stale above).
   @Get("reconciliation/discrepancies")
-  listDiscrepancies(@Query("assetNetworkId") assetNetworkId?: string, @Query("status") status?: DiscrepancyStatus) {
-    return this.independentReconciliationService.listDiscrepancies({ assetNetworkId, status });
+  listDiscrepancies(
+    @Query("assetNetworkId") assetNetworkId?: string,
+    @Query("marketId") marketId?: string,
+    @Query("status") status?: DiscrepancyStatus,
+  ) {
+    return this.independentReconciliationService.listDiscrepancies({ assetNetworkId, marketId, status });
+  }
+
+  // ── Collateral reconciliation (Phase 13 — market-scoped, SUPER_ADMIN
+  // only to run; registered before "reconciliation/:assetNetworkId" so
+  // "collateral" is never swallowed as an assetNetworkId value) ────────
+  @Post("reconciliation/collateral/:marketId/run")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  runCollateralCheck(@CurrentUser() admin: AuthenticatedUser, @Param("marketId") marketId: string) {
+    return this.collateralReconciliationService.checkMarket(marketId, admin.id);
+  }
+
+  @Get("reconciliation/collateral/:marketId")
+  listCollateralRuns(@Param("marketId") marketId: string) {
+    return this.collateralReconciliationService.listRuns(marketId);
+  }
+
+  @Post("reconciliation/collateral/check-all")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  runCollateralCheckAll(@CurrentUser() admin: AuthenticatedUser) {
+    return this.collateralReconciliationService.checkAllMarkets(admin.id);
   }
 
   @Get("reconciliation/:assetNetworkId")

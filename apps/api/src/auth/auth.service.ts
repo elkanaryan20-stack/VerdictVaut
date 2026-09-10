@@ -16,6 +16,7 @@ import { PrismaService } from "../prisma/prisma.service";
 import { ChangePasswordDto } from "./dto/change-password.dto";
 import { LoginDto } from "./dto/login.dto";
 import { RegisterDto } from "./dto/register.dto";
+import { computeLockDurationMs, isCurrentlyLocked } from "./login-throttle.util";
 
 const PASSWORD_SALT_ROUNDS = 12;
 
@@ -55,15 +56,90 @@ export class AuthService {
   async login(dto: LoginDto): Promise<TokenPair> {
     const user = await this.prisma.user.findUnique({ where: { email: dto.email } });
     if (!user) {
+      // No actorId/resourceId — this email doesn't match a real account.
+      // Recording the attempted email (never the password) is what makes
+      // this table useful for spotting credential-stuffing/brute-force
+      // patterns; see AuditLogService's own docblock on what's safe to
+      // log here.
+      await this.auditLog.record({
+        actorType: AuditActorType.USER,
+        action: "user.login_failed",
+        resourceType: "User",
+        reason: "invalid_credentials",
+        after: { email: dto.email },
+      });
       throw new UnauthorizedException("Invalid email or password");
     }
 
+    // Always run the real bcrypt comparison, even while locked — timing
+    // must not tell an attacker whether the account is currently
+    // throttled or whether their guessed password happened to be right.
+    // A locked account rejects the request regardless of the outcome.
     const passwordValid = await bcrypt.compare(dto.password, user.passwordHash);
-    if (!passwordValid) {
+    const locked = isCurrentlyLocked(user.lockedUntil);
+
+    if (locked) {
+      // Deliberately the SAME generic response as any other failure —
+      // never a distinct "account temporarily locked" message, which
+      // would let an attacker enumerate real emails by which response
+      // they get back. The specific reason is safe to record here since
+      // the audit log itself is never exposed to the caller.
+      await this.auditLog.record({
+        actorId: user.id,
+        actorType: AuditActorType.USER,
+        action: "user.login_blocked_throttled",
+        resourceType: "User",
+        resourceId: user.id,
+        reason: "account_temporarily_locked",
+        after: { lockedUntil: user.lockedUntil, passwordWasCorrect: passwordValid },
+      });
       throw new UnauthorizedException("Invalid email or password");
+    }
+
+    if (!passwordValid) {
+      // Atomic increment — safe under concurrent wrong-password attempts
+      // against the same account (each request's own resulting count is
+      // used to independently decide whether to (re)apply a lock, so a
+      // burst of parallel guesses can only ever converge on the same or
+      // a longer bounded lock, never corrupt the counter).
+      const updated = await this.prisma.user.update({
+        where: { id: user.id },
+        data: { failedLoginAttempts: { increment: 1 } },
+      });
+      const lockDurationMs = computeLockDurationMs(updated.failedLoginAttempts);
+      let lockedUntil: Date | null = null;
+      if (lockDurationMs > 0) {
+        lockedUntil = new Date(Date.now() + lockDurationMs);
+        await this.prisma.user.update({ where: { id: user.id }, data: { lockedUntil } });
+      }
+
+      await this.auditLog.record({
+        actorId: user.id,
+        actorType: AuditActorType.USER,
+        action: "user.login_failed",
+        resourceType: "User",
+        resourceId: user.id,
+        reason: "invalid_credentials",
+        after: { failedLoginAttempts: updated.failedLoginAttempts, lockedUntil },
+      });
+      throw new UnauthorizedException("Invalid email or password");
+    }
+
+    if (user.failedLoginAttempts > 0 || user.lockedUntil) {
+      // Successful login decays the failure state immediately — this is
+      // a temporary throttle, not a lockout that persists once the real
+      // owner proves who they are.
+      await this.prisma.user.update({ where: { id: user.id }, data: { failedLoginAttempts: 0, lockedUntil: null } });
     }
 
     if (user.status === "SUSPENDED") {
+      await this.auditLog.record({
+        actorId: user.id,
+        actorType: AuditActorType.USER,
+        action: "user.login_blocked_suspended",
+        resourceType: "User",
+        resourceId: user.id,
+      });
       throw new ForbiddenException("Account is suspended");
     }
 

@@ -1,5 +1,6 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from "@nestjs/common";
 import { Request, Response } from "express";
+import { getRequestId } from "../../observability/request-context";
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -26,6 +27,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
       path: request.url,
       timestamp: new Date().toISOString(),
       message: typeof message === "string" ? message : (message as Record<string, unknown>).message ?? message,
+      // Never sensitive — a caller quoting this back to support/ops lets
+      // the exact log lines for their request be found immediately.
+      requestId: getRequestId(),
     });
   }
 }

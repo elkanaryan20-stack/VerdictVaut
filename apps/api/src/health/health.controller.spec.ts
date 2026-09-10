@@ -1,0 +1,57 @@
+import { ServiceUnavailableException } from "@nestjs/common";
+import { PrismaService } from "../prisma/prisma.service";
+import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
+import { HealthController } from "./health.controller";
+
+describe("HealthController", () => {
+  let controller: HealthController;
+  let prisma: { $queryRaw: jest.Mock };
+  let depositWatcherService: { listCursorStatus: jest.Mock };
+
+  beforeEach(() => {
+    prisma = { $queryRaw: jest.fn().mockResolvedValue([{ "?column?": 1 }]) };
+    depositWatcherService = { listCursorStatus: jest.fn().mockResolvedValue([]) };
+    controller = new HealthController(prisma as unknown as PrismaService, depositWatcherService as unknown as DepositWatcherService);
+  });
+
+  describe("liveness", () => {
+    it("always reports ok without touching any dependency", () => {
+      const result = controller.liveness();
+      expect(result.status).toBe("ok");
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("readiness", () => {
+    it("reports ok when the database is reachable and no watcher is stale", async () => {
+      const result = await controller.readiness();
+      expect(result.status).toBe("ok");
+      expect(result.checks.database.ok).toBe(true);
+      expect(result.checks.blockchainWatchers.ok).toBe(true);
+    });
+
+    it("throws 503 when the database is unreachable", async () => {
+      prisma.$queryRaw.mockRejectedValue(new Error("connection refused"));
+      await expect(controller.readiness()).rejects.toThrow(ServiceUnavailableException);
+    });
+
+    it("stays 200 but reports degraded when a watcher cursor is stale", async () => {
+      depositWatcherService.listCursorStatus.mockResolvedValue([
+        { assetSymbol: "BTC", networkCode: "bitcoin-mainnet", isScanStale: true },
+        { assetSymbol: "ETH", networkCode: "ethereum-mainnet", isScanStale: false },
+      ]);
+      const result = await controller.readiness();
+      expect(result.status).toBe("ok");
+      expect(result.checks.blockchainWatchers.ok).toBe(false);
+      expect(result.checks.blockchainWatchers.staleCount).toBe(1);
+      expect(result.checks.blockchainWatchers.stale).toEqual([{ assetSymbol: "BTC", networkCode: "bitcoin-mainnet" }]);
+    });
+
+    it("never fails readiness just because the watcher status lookup itself throws", async () => {
+      depositWatcherService.listCursorStatus.mockRejectedValue(new Error("boom"));
+      const result = await controller.readiness();
+      expect(result.status).toBe("ok");
+      expect(result.checks.blockchainWatchers.ok).toBe(true);
+    });
+  });
+});

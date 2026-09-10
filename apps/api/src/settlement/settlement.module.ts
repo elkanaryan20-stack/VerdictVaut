@@ -1,10 +1,11 @@
 import { Module } from "@nestjs/common";
 import { LedgerModule } from "../ledger/ledger.module";
+import { CollateralReconciliationService } from "./collateral-reconciliation.service";
 import { SettlementService } from "./settlement.service";
 
 @Module({
   imports: [LedgerModule],
-  providers: [SettlementService],
-  exports: [SettlementService],
+  providers: [SettlementService, CollateralReconciliationService],
+  exports: [SettlementService, CollateralReconciliationService],
 })
 export class SettlementModule {}

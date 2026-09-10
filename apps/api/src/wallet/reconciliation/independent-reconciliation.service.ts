@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { DiscrepancyStatus, Prisma, ReconciliationStatus, WithdrawalStatus } from "@prisma/client";
 import { AuditLogService } from "../../audit/audit-log.service";
+import { LoggingMetricsService, MetricsService } from "../../observability/metrics.service";
 import { isUniqueConstraintViolation } from "../../prisma/idempotent-create.util";
 import { PrismaService } from "../../prisma/prisma.service";
 import { CustodyProviderFactory } from "../custody/custody-provider.factory";
@@ -72,6 +73,7 @@ export class IndependentReconciliationService {
     private readonly adapterFactory: DepositChainAdapterFactory,
     private readonly custodyProviderFactory: CustodyProviderFactory,
     private readonly auditLog: AuditLogService,
+    private readonly metrics: MetricsService = new LoggingMetricsService(),
   ) {}
 
   async runIndependentRescan(assetNetworkId: string, initiatedByUserId: string, fromPointer?: string) {
@@ -312,6 +314,12 @@ export class IndependentReconciliationService {
    * history) via a uniquified key.
    */
   private async createDiscrepancy(runId: string, assetNetworkId: string, input: IndependentDiscrepancyInput) {
+    // Fired on every finding attempt, not just newly-created rows — an
+    // ops alert on a REPEATED still-open CRITICAL discrepancy is exactly
+    // as important as the first occurrence, since nothing here ever
+    // auto-resolves one.
+    this.metrics.increment("wallet.reconciliation.discrepancy_found", { severity: input.severity, type: input.type });
+
     const baseKey = `${assetNetworkId}:${input.type}:${input.chainIdentity}`;
     const existing = await this.prisma.reconciliationDiscrepancy.findUnique({ where: { idempotencyKey: baseKey } });
     if (existing && (existing.status === "OPEN" || existing.status === "ACKNOWLEDGED")) {
@@ -340,9 +348,9 @@ export class IndependentReconciliationService {
     }
   }
 
-  async listDiscrepancies(filters: { assetNetworkId?: string; status?: DiscrepancyStatus } = {}) {
+  async listDiscrepancies(filters: { assetNetworkId?: string; marketId?: string; status?: DiscrepancyStatus } = {}) {
     return this.prisma.reconciliationDiscrepancy.findMany({
-      where: { assetNetworkId: filters.assetNetworkId, status: filters.status },
+      where: { assetNetworkId: filters.assetNetworkId, marketId: filters.marketId, status: filters.status },
       orderBy: { createdAt: "desc" },
       take: 200,
     });

@@ -13,6 +13,8 @@ import { TradingModule } from "./trading/trading.module";
 import { LedgerModule } from "./ledger/ledger.module";
 import { WalletModule } from "./wallet/wallet.module";
 import { AdminModule } from "./admin/admin.module";
+import { HealthModule } from "./health/health.module";
+import { ObservabilityModule } from "./observability/observability.module";
 
 @Module({
   imports: [
@@ -26,6 +28,7 @@ import { AdminModule } from "./admin/admin.module";
     ThrottlerModule.forRoot([{ name: "default", ttl: 60_000, limit: 100 }]),
     PrismaModule,
     AuditLogModule,
+    ObservabilityModule,
     AuthModule,
     UsersModule,
     MarketsModule,
@@ -33,6 +36,7 @@ import { AdminModule } from "./admin/admin.module";
     LedgerModule,
     WalletModule,
     AdminModule,
+    HealthModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

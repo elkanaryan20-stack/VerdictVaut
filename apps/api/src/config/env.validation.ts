@@ -1,5 +1,6 @@
 import { plainToInstance } from "class-transformer";
 import { IsIn, IsInt, IsOptional, IsString, Max, Min, MinLength, validateSync } from "class-validator";
+import { assertDatabaseTlsConfigured } from "./database-tls.validator";
 
 class EnvironmentVariables {
   @IsIn(["development", "test", "production"])
@@ -69,10 +70,24 @@ export function validateEnv(config: Record<string, unknown>) {
   }
 
   if (validated.APP_ENVIRONMENT === "production") {
-    throw new Error(
-      "APP_ENVIRONMENT=production is not supported yet — production custody is not implemented. " +
-        "Use APP_ENVIRONMENT=sandbox.",
-    );
+    // Every independent production-safety condition is checked and
+    // collected here, rather than stopping at the first failure — so
+    // fixing the TLS blocker below, for instance, never silently
+    // "reveals" a false green light while custody is still unimplemented,
+    // and an operator sees the FULL list of what's still blocking
+    // production in one pass instead of playing whack-a-mole.
+    const blockers: string[] = [
+      "production custody is not implemented yet — ProductionCustodyExecutor is an intentional fail-closed " +
+        "placeholder until a real provider is selected and integrated (use APP_ENVIRONMENT=sandbox)",
+    ];
+
+    try {
+      assertDatabaseTlsConfigured(validated.DATABASE_URL, validated.APP_ENVIRONMENT);
+    } catch (error) {
+      blockers.push((error as Error).message);
+    }
+
+    throw new Error(`APP_ENVIRONMENT=production is not supported yet:\n${blockers.map((b) => `  - ${b}`).join("\n")}`);
   }
 
   return validated;

@@ -198,6 +198,39 @@ deposit automatically — a transaction that disappears/fails after being
 observed is a reconciliation discrepancy for a SUPER_ADMIN to act on
 explicitly, never a silent balance mutation.
 
+**Reorg safety analysis (Phase 13 remediation)** — a deliberate review
+of the existing design, not a new mechanism (the design already handles
+this correctly):
+- Confirmation depth (`AssetNetwork.minConfirmations`, configurable per
+  asset/network, never hardcoded) is the primary defense, and the right
+  depth is chain-specific, not one-size-fits-all: XRPL's consensus
+  protocol gives a validated ledger BFT-style finality (not Bitcoin-style
+  probabilistic PoW finality), so `minConfirmations=1` for XRP is
+  correct, not thin. Solana's seeded value (32) matches Solana's own
+  `finalized` commitment level. Bitcoin's SEEDED value (2) is a
+  **testnet-only** setting — a real mainnet Bitcoin deployment MUST
+  raise this to a materially higher value (6 is the long-standing
+  industry norm) before accepting real value; this is a launch
+  CONFIGURATION requirement, not a code defect, since the field is
+  already fully configurable.
+- If a reorg still invalidates an already-CREDITED deposit deeper than
+  the configured confirmation depth (rare, but not impossible): nothing
+  in this codebase auto-reverses it. Detection is
+  `IndependentReconciliationService.checkRecentCreditedDepositsHaveChainEvidence`
+  — a CREDITED deposit a fresh, cursor-independent rescan can no longer
+  find on chain raises a CRITICAL `internal_deposit_missing_chain_evidence`
+  discrepancy for a SUPER_ADMIN to investigate. This is currently
+  SUPER_ADMIN-triggered on demand
+  (`POST /admin/reconciliation/:assetNetworkId/independent-rescan`), not
+  scheduled — an operational runbook should run it periodically until a
+  scheduler is added (see Next recommended implementation steps).
+- Explicit non-goal, deliberately: automatically reversing a CREDITED
+  deposit (debiting a user who may have already traded or withdrawn
+  against it) is a broader accounting problem than reorg detection
+  alone — it requires a policy for a user who no longer has the funds,
+  which is out of scope here. Left as an explicit, documented blocker
+  rather than an invented reversal mechanism.
+
 **Worker concurrency** — `BlockchainWatchCursor` also carries a
 CAS-acquired scan lease (`lockedAt`/`lockedBy`, reclaimed if stale after
 5 minutes) so multiple concurrently-running API instances never
@@ -260,13 +293,38 @@ RESOLVED/FALSE_POSITIVE`, SUPER_ADMIN-resolved) — this service NEVER
 auto-credits, auto-debits, or otherwise mutates a balance/deposit/
 withdrawal; every finding is purely observational.
 
-**Known limitations, explicitly not implemented**: destination
-verification for Bitcoin/Solana withdrawals (no single unambiguous
-on-chain recipient to compare against without deeper transaction
-analysis); no distributed lock beyond the DB-row CAS lease described
-above (no new infra dependency introduced); no configurable per-network
-RPC timeout (fixed at 10s). See the Phase 10/12A final reports for the
-full list.
+**Withdrawal destination validation** (Phase 13 remediation —
+`destination-address.validator.ts`) is FORMAT + CHECKSUM validation
+only, never on-chain ownership verification — an important distinction:
+- Bitcoin (legacy 1.../3... via Base58Check, bech32/bech32m native
+  segwit v0-v16 including taproot) and XRP classic addresses (Base58Check
+  with the XRPL alphabet) now verify a REAL cryptographic checksum
+  (`address-checksums/base58.util.ts`, `bech32.util.ts` — both built on
+  Node's native `crypto`, no new dependency), not just a shape-matching
+  regex. Solana addresses are verified to decode to exactly 32 bytes
+  (the real ed25519 public key length) — Solana itself has no checksum
+  convention to verify.
+- EVM EIP-55 mixed-case checksum verification is DEFERRED, deliberately
+  documented in `assertValidEvmAddress`'s own comment: it requires
+  Keccak-256, which is NOT the same algorithm as the SHA3-256 Node's
+  built-in `crypto` provides (different padding — using SHA3-256 would
+  silently compute the wrong checksum), and no Keccak dependency exists
+  in this repo today. A correctly- or incorrectly-checksummed mixed-case
+  EVM address is accepted identically (format-only) until a real
+  decision is made to add one.
+- None of this proves the address is actually OWNED by anyone in
+  particular, or that a chain adapter has ever observed activity on it
+  — that would be on-chain ownership verification, which no network
+  performs here (destination cross-checking against chain-reported
+  broadcast data, for an ALREADY-SENT withdrawal, is a separate,
+  narrower check — see `WithdrawalsService.reconcile()`).
+
+**Other known limitations, explicitly not implemented**: no distributed
+lock beyond the DB-row CAS lease described above (no new infra
+dependency introduced); no configurable per-network RPC timeout (fixed
+at 10s); no scheduled/automatic independent-reconciliation rescan (see
+the reorg-safety analysis above — currently SUPER_ADMIN-triggered on
+demand). See the Phase 10/12A/13 final reports for the full list.
 
 ## Settlement collateralization (complete-set minting)
 

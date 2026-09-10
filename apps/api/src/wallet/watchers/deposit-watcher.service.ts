@@ -8,6 +8,7 @@ import { DepositChainAdapterFactory } from "../chain-adapters/deposit-chain-adap
 import { loadWatchedAddresses, WatchedAddressWithOwner } from "../chain-adapters/watched-addresses.util";
 import { ConfirmationPolicyService } from "../confirmation/confirmation-policy.service";
 import { DepositsService } from "../deposits/deposits.service";
+import { LoggingMetricsService, MetricsService } from "../../observability/metrics.service";
 import { STALE_CURSOR_THRESHOLD_MS } from "../reconciliation/reconciliation.service";
 
 // A lease older than this is treated as an abandoned/crashed worker's and
@@ -73,6 +74,11 @@ export class DepositWatcherService implements OnModuleInit, OnModuleDestroy {
     private readonly confirmationPolicy: ConfirmationPolicyService,
     private readonly depositsService: DepositsService,
     private readonly configService: ConfigService<AppConfig, true>,
+    // Optional with a real default (not a no-op) — Nest's DI always
+    // supplies the properly-bound MetricsService; the default only ever
+    // applies to the many existing tests that construct this class
+    // directly outside Nest's container, none of which need to change.
+    private readonly metrics: MetricsService = new LoggingMetricsService(),
   ) {}
 
   onModuleInit(): void {
@@ -229,6 +235,7 @@ export class DepositWatcherService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async releaseLeaseAfterError(assetNetworkId: string, error: Error): Promise<void> {
+    this.metrics.increment("wallet.deposit_watcher.scan_failed", { assetNetworkId });
     await this.prisma.blockchainWatchCursor.updateMany({
       where: { assetNetworkId, lockedBy: this.workerId },
       data: { lockedAt: null, lockedBy: null, lastError: error.message.slice(0, 2000), lastErrorAt: new Date() },

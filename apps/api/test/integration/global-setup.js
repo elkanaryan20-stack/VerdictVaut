@@ -15,6 +15,17 @@ module.exports = async function globalSetup() {
     password: config.password,
     port: config.port,
     persistent: false,
+    // Without this, initdb defaults to the HOST OS's locale/codepage —
+    // on Windows that's typically WIN1252, not UTF8. A real production
+    // Postgres is virtually always UTF8 (every managed provider defaults
+    // to it), so a test DB silently running WIN1252 hides bugs rather
+    // than catching them: any text containing non-ASCII bytes (Prisma's
+    // own error messages sometimes embed a "→" code-frame pointer)
+    // fails to INSERT/UPDATE with an encoding error instead of the
+    // value it's supposed to hold, on Windows dev machines only —
+    // exactly the kind of environment-specific false pass Phase 13's
+    // "do not make it artificially pass" instruction warns against.
+    initdbFlags: ["--encoding=UTF8", "--locale=C"],
   });
 
   await pg.initialise();

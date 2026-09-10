@@ -244,6 +244,11 @@ enum ReconciliationStatus {
 enum ReconciliationRunType {
   CURSOR_BASED_CHECKS
   INDEPENDENT_RESCAN
+  // Phase 13: a market-scoped check (CollateralReconciliationService)
+  // verifying a market's own MARKET LedgerAccount balance equals total
+  // CompleteSetMint quantity minus total PositionSettlement payouts —
+  // never chain/assetNetwork-scoped, see ReconciliationRun.marketId.
+  COLLATERAL_CHECK
 }
 
 // SUPER_ADMIN-controlled resolution lifecycle for one
@@ -283,6 +288,15 @@ model User {
   role         UserRole   @default(USER)
   status       UserStatus @default(PENDING_VERIFICATION)
   totpSecret   String?
+  // Phase 13 remediation — bounded, auto-expiring login throttle (see
+  // login-throttle.util.ts). Never a permanent lockout requiring manual
+  // admin unlock: lockedUntil always expires on its own, and a
+  // successful login resets both fields immediately. Deliberately only
+  // ever set on a REAL user row — an attacker submitting wrong passwords
+  // for a nonexistent email has no row to throttle, which is what keeps
+  // this from being usable as a resource-exhaustion vector.
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
@@ -370,6 +384,10 @@ model Market {
   // asset (see ledger_accounts_marketId_assetId_key).
   ledgerAccounts      LedgerAccount[]
   completeSetMints    CompleteSetMint[]
+  // Phase 13: this market's own collateral-integrity check history —
+  // see CollateralReconciliationService.
+  reconciliationRuns          ReconciliationRun[]
+  reconciliationDiscrepancies ReconciliationDiscrepancy[]
 
   @@index([categoryId])
   @@index([status])
@@ -1085,7 +1103,12 @@ model BlockchainWatchCursor {
 
 model ReconciliationRun {
   id             String               @id @default(uuid())
-  assetNetworkId String
+  // Phase 13: exactly one of assetNetworkId/marketId is set — chain
+  // rescans are asset-network-scoped, collateral checks are
+  // market-scoped. Mirrors ledger_accounts_owner_ref_check's "exactly
+  // one of X/Y" pattern. See reconciliation_runs_target_check.
+  assetNetworkId String?
+  marketId       String?
   runAt          DateTime             @default(now())
   status         ReconciliationStatus
   // Embedded-JSON findings — the original, pre-Phase-12A shape, still
@@ -1109,11 +1132,13 @@ model ReconciliationRun {
   fromPointer       String?
   toPointer         String?
 
-  assetNetwork       AssetNetwork                @relation(fields: [assetNetworkId], references: [id])
+  assetNetwork       AssetNetwork?               @relation(fields: [assetNetworkId], references: [id])
+  market             Market?                     @relation(fields: [marketId], references: [id])
   initiatedBy        User?                       @relation(fields: [initiatedByUserId], references: [id])
   discrepancyRecords ReconciliationDiscrepancy[]
 
   @@index([assetNetworkId, runAt])
+  @@index([marketId, runAt])
   @@map("reconciliation_runs")
 }
 
@@ -1134,7 +1159,10 @@ model ReconciliationRun {
 model ReconciliationDiscrepancy {
   id             String            @id @default(uuid())
   runId          String
-  assetNetworkId String
+  // Phase 13: exactly one of assetNetworkId/marketId is set — see
+  // ReconciliationRun's own note and reconciliation_discrepancies_target_check.
+  assetNetworkId String?
+  marketId       String?
   // Stable, machine-matchable slug — e.g.
   // "chain_event_missing_internal_deposit". Never a vague free-text blob.
   type           String
@@ -1155,10 +1183,12 @@ model ReconciliationDiscrepancy {
   idempotencyKey String            @unique
 
   run          ReconciliationRun @relation(fields: [runId], references: [id])
-  assetNetwork AssetNetwork      @relation(fields: [assetNetworkId], references: [id])
+  assetNetwork AssetNetwork?     @relation(fields: [assetNetworkId], references: [id])
+  market       Market?           @relation(fields: [marketId], references: [id])
   resolvedBy   User?             @relation(fields: [resolvedByUserId], references: [id])
 
   @@index([assetNetworkId, status])
+  @@index([marketId, status])
   @@index([runId])
   @@map("reconciliation_discrepancies")
 }

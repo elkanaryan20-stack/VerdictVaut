@@ -17,7 +17,8 @@
     "prisma:migrate:deploy": "prisma migrate deploy",
     "prisma:migrate:diff": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url \"$DATABASE_URL\" --script",
     "backup:drill": "node scripts/backup-restore-drill.js",
-    "check:integrity": "node scripts/financial-integrity-checks.js"
+    "check:integrity": "node scripts/financial-integrity-checks.js",
+    "check:production-readiness": "node scripts/production-readiness-check.js"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.15",
@@ -32,6 +33,7 @@
     "bcryptjs": "^2.4.3",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
+    "helmet": "^8.3.0",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "reflect-metadata": "^0.2.2",

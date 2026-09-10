@@ -193,6 +193,91 @@ describe("Deposit watcher, reprocessing, and reconciliation (real Postgres, fake
 
       expect(scanCallCount).toBe(1);
     });
+
+    it("restart/crash recovery: a scan that fails partway through releases the lease without advancing the cursor, and the next successful scan resumes cleanly without double-crediting what already succeeded", async () => {
+      const assetNetwork = await getAssetNetwork("XRP", "xrpl-testnet");
+      const marker = `${Date.now()}-${Math.random()}`;
+      const user = await createTestUser();
+      const assignment = await assignXrpAddress(user.id, `rCrash${marker}`, "777");
+
+      const goodDeposit: RawChainDeposit = {
+        walletAddressId: assignment.walletAddressId,
+        txHash: `HASH-GOOD-${marker}`,
+        eventIndex: 0,
+        amount: "12",
+        confirmations: 5,
+        destinationTag: "777",
+        rawProviderPayload: {},
+      };
+      // Violates deposits_amount_positive_check at the DB level —
+      // simulates the kind of mid-batch failure a real RPC/provider
+      // hiccup or bad payload could cause, forcing scanOne's catch block
+      // to run after the first deposit in the batch already committed.
+      const poisonDeposit: RawChainDeposit = {
+        walletAddressId: assignment.walletAddressId,
+        txHash: `HASH-POISON-${marker}`,
+        eventIndex: 0,
+        amount: "-5",
+        confirmations: 5,
+        destinationTag: "777",
+        rawProviderPayload: {},
+      };
+
+      const crashingAdapter: BlockchainDepositAdapter = {
+        family: "XRPL" as never,
+        validateNetwork: async () => undefined,
+        scanForDeposits: async () => ({ deposits: [goodDeposit, poisonDeposit], nextCursor: `cursor-crash-${marker}` }),
+        inspectTransaction: async () => null,
+      };
+      const crashingWatcher = new DepositWatcherService(
+        prisma,
+        fakeAdapterFactory(crashingAdapter) as never,
+        confirmationPolicyService,
+        depositsService,
+        { get: () => ({ enabled: false, pollIntervalMs: 30000 }) } as never,
+      );
+
+      // This assetNetwork's cursor row is shared across every test in
+      // this file that touches XRP — capture its pointer beforehand
+      // rather than assuming a pristine "" starting value, since earlier
+      // tests may have already advanced it.
+      const cursorBeforeCrash = await prisma.blockchainWatchCursor.findUnique({ where: { assetNetworkId: assetNetwork.id } });
+
+      await expect(crashingWatcher.scanOne(assetNetwork.id)).rejects.toThrow();
+
+      // The good deposit inside the same batch already committed —
+      // partial progress within a failed scan is not lost.
+      expect((await getUserAccount(user.id, "XRP"))?.cachedBalance.toString()).toBe("12");
+
+      const cursorAfterCrash = await prisma.blockchainWatchCursor.findUnique({ where: { assetNetworkId: assetNetwork.id } });
+      expect(cursorAfterCrash?.lastScannedPointer).toBe(cursorBeforeCrash?.lastScannedPointer ?? ""); // never advanced past the failed scan
+      expect(cursorAfterCrash?.lockedAt).toBeNull(); // lease released, not left stuck
+      expect(cursorAfterCrash?.lastError).toBeTruthy();
+
+      // A subsequent successful scan re-observes the SAME good deposit
+      // (the adapter is asked to scan from the same, unchanged cursor)
+      // without double-crediting it, and finally advances the cursor.
+      const recoveredAdapter: BlockchainDepositAdapter = {
+        family: "XRPL" as never,
+        validateNetwork: async () => undefined,
+        scanForDeposits: async () => ({ deposits: [goodDeposit], nextCursor: `cursor-recovered-${marker}` }),
+        inspectTransaction: async () => null,
+      };
+      const recoveredWatcher = new DepositWatcherService(
+        prisma,
+        fakeAdapterFactory(recoveredAdapter) as never,
+        confirmationPolicyService,
+        depositsService,
+        { get: () => ({ enabled: false, pollIntervalMs: 30000 }) } as never,
+      );
+
+      await recoveredWatcher.scanOne(assetNetwork.id);
+
+      expect((await getUserAccount(user.id, "XRP"))?.cachedBalance.toString()).toBe("12"); // unchanged — not double-credited
+      const cursorAfterRecovery = await prisma.blockchainWatchCursor.findUnique({ where: { assetNetworkId: assetNetwork.id } });
+      expect(cursorAfterRecovery?.lastScannedPointer).toBe(`cursor-recovered-${marker}`);
+      expect(cursorAfterRecovery?.lastError).toBeNull();
+    });
   });
 
   describe("XRP destination tag validation via the real crediting path", () => {

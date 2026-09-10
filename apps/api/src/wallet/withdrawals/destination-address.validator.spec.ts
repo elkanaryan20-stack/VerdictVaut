@@ -18,6 +18,19 @@ describe("assertValidDestinationAddress", () => {
     it("rejects an obviously malformed string", () => {
       expect(() => assertValidDestinationAddress("BITCOIN", "not-an-address")).toThrow(BadRequestException);
     });
+
+    it("rejects a legacy address that is the right SHAPE but has a corrupted checksum — the real strengthening over format-only regex", () => {
+      // Same length/character-set as a real address, but not a real
+      // checksum — a pure regex (the old implementation) would have
+      // wrongly accepted this.
+      const shapedButInvalid = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN3";
+      expect(() => assertValidDestinationAddress("BITCOIN", shapedButInvalid)).toThrow(BadRequestException);
+    });
+
+    it("rejects a bech32 address with a corrupted checksum", () => {
+      const shapedButInvalid = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdp";
+      expect(() => assertValidDestinationAddress("BITCOIN", shapedButInvalid)).toThrow(BadRequestException);
+    });
   });
 
   describe("EVM", () => {
@@ -50,6 +63,24 @@ describe("assertValidDestinationAddress", () => {
     it("rejects a too-short string", () => {
       expect(() => assertValidDestinationAddress("SOLANA", "short")).toThrow(BadRequestException);
     });
+
+    it("rejects a base58 string within the plausible length range that decodes to the wrong byte length (not a real 32-byte ed25519 key)", () => {
+      // Deterministically construct a 31-byte payload (not 32) and
+      // base58-encode it — same alphabet, a plausible string length,
+      // but the WRONG decoded length. The old length-range-only regex
+      // would have wrongly accepted this.
+      const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+      let value = 0n;
+      const payload31Bytes = Buffer.from(Array.from({ length: 31 }, (_, i) => i + 1));
+      for (const byte of payload31Bytes) value = value * 256n + BigInt(byte);
+      let encoded = "";
+      while (value > 0n) {
+        encoded = alphabet[Number(value % 58n)] + encoded;
+        value /= 58n;
+      }
+
+      expect(() => assertValidDestinationAddress("SOLANA", encoded)).toThrow(BadRequestException);
+    });
   });
 
   describe("XRPL", () => {
@@ -63,6 +94,11 @@ describe("assertValidDestinationAddress", () => {
 
     it("rejects a Bitcoin address on XRPL", () => {
       expect(() => assertValidDestinationAddress("XRPL", "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2")).toThrow(BadRequestException);
+    });
+
+    it("rejects a classic address that is the right shape but has a corrupted checksum", () => {
+      const shapedButInvalid = "rEb8TK3gBgk5auZkwc6sHnwrGVJH8DuaLj"; // last char changed
+      expect(() => assertValidDestinationAddress("XRPL", shapedButInvalid)).toThrow(BadRequestException);
     });
   });
 
