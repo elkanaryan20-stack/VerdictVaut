@@ -1,0 +1,22 @@
+# Phase 15 — keeps apps/api/Dockerfile and apps/web/Dockerfile's
+# `COPY . .` from ever baking a local secret, VCS history, or stale
+# build artifact into an image layer.
+
+.git
+.gitignore
+
+**/node_modules
+**/.next
+**/dist
+**/coverage
+**/*.tsbuildinfo
+**/.swc
+
+# Never bake a real .env into an image — every secret is supplied at
+# container run time only (see each Dockerfile's own header comment).
+.env
+.env.*
+!.env.example
+
+**/npm-debug.log*
+.DS_Store

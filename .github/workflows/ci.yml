@@ -1,0 +1,47 @@
+name: CI
+
+# Phase 15 — the standing typecheck/lint/build/test gate flagged as
+# missing by scripts/production-readiness-check.js (P2 "CI/CD
+# configuration exists"). Deliberately self-contained: apps/api's
+# integration suite provisions its own ephemeral Postgres via
+# embedded-postgres (see apps/api/test/integration/global-setup.js) —
+# this workflow never connects to, or needs credentials for, any real
+# staging/production database or custody/compliance provider. It proves
+# the codebase, not any live external system.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: API unit tests
+        run: npm run test -w apps/api
+
+      - name: API integration tests (ephemeral embedded Postgres, no external DB)
+        run: npm run test:integration -w apps/api
+
+      - name: Web unit tests
+        run: npm run test -w apps/web
