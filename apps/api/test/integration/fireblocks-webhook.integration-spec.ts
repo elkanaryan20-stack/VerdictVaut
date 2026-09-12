@@ -42,6 +42,12 @@ describe("FireblocksWebhookService (real Postgres)", () => {
     const refreshed = await prisma.withdrawal.findUniqueOrThrow({ where: { id: withdrawal.id } });
     expect(refreshed.status).toBe(WithdrawalStatus.BROADCAST);
     expect(refreshed.txHash).toBe("0xrealhash");
+    // Phase 17 — providerReference (Fireblocks' own internal id,
+    // "custodyReference" in the schema) and the real blockchain txHash
+    // must never be conflated/swapped, even though both are just
+    // strings the ORM would happily accept in either column.
+    expect(refreshed.custodyReference).toBe(custodyRef);
+    expect(refreshed.custodyReference).not.toBe(refreshed.txHash);
   });
 
   it("two CONCURRENT deliveries of the identical event race the DB's own unique constraint — exactly one is 'processed', the other 'duplicate', never both applied", async () => {

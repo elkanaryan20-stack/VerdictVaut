@@ -382,6 +382,54 @@ describe("IndependentReconciliationService (real Postgres, fake chain adapters)"
     expect(total).toBe(1);
   });
 
+  // Phase 17 — distinct from the sequential re-run test above: two
+  // GENUINELY CONCURRENT rescans (Promise.all, not one-after-another)
+  // racing to record the exact same finding. createDiscrepancy's
+  // findUnique-then-create has a real TOCTOU window between those two
+  // real Postgres round trips — this proves the DB-level unique
+  // constraint on ReconciliationDiscrepancy.idempotencyKey (schema.prisma)
+  // plus the code's own catch-and-refetch-on-conflict path
+  // (isUniqueConstraintViolation) actually close that window under a
+  // real race, not just against a mocked/serialized sequence of calls.
+  it("two CONCURRENT independent rescans racing to report the identical finding create exactly one discrepancy row, never two", async () => {
+    const superAdmin = await createTestSuperAdmin();
+    const user = await createTestUser();
+    const marker = `${Date.now()}-${Math.random()}`;
+    const { assetNetwork, assignment } = await assignXrpAddress(user.id, `rConcurrent${marker}`, "9");
+
+    const raw: RawChainDeposit = {
+      walletAddressId: assignment.walletAddressId,
+      txHash: `HASH-${marker}`,
+      eventIndex: 0,
+      amount: "10",
+      confirmations: 20,
+      destinationTag: "9",
+      rawProviderPayload: {},
+    };
+    const adapter: BlockchainDepositAdapter = { ...noopAdapter, scanForDeposits: async () => ({ deposits: [raw], nextCursor: "c" }) };
+    // Two independent service instances (as two real concurrent worker
+    // processes would each construct their own), sharing only the real
+    // database — not two calls on one instance, which wouldn't prove
+    // anything about cross-process safety.
+    const serviceA = new IndependentReconciliationService(prisma, fakeAdapterFactory(adapter) as never, fakeCustodyProviderFactory(noopProvider) as never, auditLog);
+    const serviceB = new IndependentReconciliationService(prisma, fakeAdapterFactory(adapter) as never, fakeCustodyProviderFactory(noopProvider) as never, auditLog);
+
+    const results = await Promise.allSettled([
+      serviceA.runIndependentRescan(assetNetwork.id, superAdmin.id),
+      serviceB.runIndependentRescan(assetNetwork.id, superAdmin.id),
+    ]);
+
+    // Neither racer is allowed to fail — the whole point of the
+    // catch-and-refetch path is that a real unique-constraint conflict
+    // is handled gracefully, never surfaced as an unhandled error.
+    expect(results.every((r) => r.status === "fulfilled")).toBe(true);
+
+    const total = await prisma.reconciliationDiscrepancy.count({
+      where: { assetNetworkId: assetNetwork.id, type: "chain_event_missing_internal_deposit", chainIdentity: `${raw.txHash}:0` },
+    });
+    expect(total).toBe(1);
+  });
+
   describe("discrepancy resolution lifecycle", () => {
     it("acknowledge then resolve moves OPEN -> ACKNOWLEDGED -> RESOLVED, recording who and a note", async () => {
       const superAdmin = await createTestSuperAdmin();

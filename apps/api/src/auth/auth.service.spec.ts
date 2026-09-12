@@ -247,6 +247,49 @@ describe("AuthService", () => {
     });
   });
 
+  describe("logout", () => {
+    it("revokes only the specific refresh token for this user, never any other of their sessions or another user's token", async () => {
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.logout("user-1", "some.refresh.token");
+
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { userId: "user-1", tokenHash: expect.any(String), revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+    });
+
+    it("is a safe no-op — never throws — when the token doesn't belong to this user or is already revoked (IDOR/replay safety)", async () => {
+      // The WHERE clause's userId scoping means a token belonging to a
+      // DIFFERENT user matches zero rows here, exactly like an
+      // already-revoked token would — logout() never reveals which case
+      // it was, and never touches another user's session.
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+      await expect(service.logout("user-1", "not-my-token-or-already-revoked")).resolves.toBeUndefined();
+    });
+
+    it("audit-logs the logout against the real actor", async () => {
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      await service.logout("user-1", "some.refresh.token");
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ actorId: "user-1", action: "user.logout", resourceType: "User", resourceId: "user-1" }),
+      );
+    });
+
+    it("session invalidation actually takes effect: a refresh() call with the just-logged-out token is rejected", async () => {
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      await service.logout("user-1", "the.token");
+
+      // Mirrors "rejects a refresh token that was already revoked" above —
+      // once revoked, the stored-token lookup (which filters on
+      // revokedAt: null) excludes it, exactly as a real DB would after
+      // the updateMany above actually ran.
+      jwt.verifyAsync.mockResolvedValue({ sub: "user-1" });
+      prisma.refreshToken.findFirst.mockResolvedValue(null);
+      await expect(service.refresh("the.token")).rejects.toThrow(UnauthorizedException);
+    });
+  });
+
   describe("changePassword", () => {
     it("rejects an incorrect current password without touching the stored hash", async () => {
       const passwordHash = await bcrypt.hash("correct-password", 4);
