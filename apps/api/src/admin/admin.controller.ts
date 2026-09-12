@@ -14,6 +14,7 @@ import { IndependentReconciliationService } from "../wallet/reconciliation/indep
 import { CollateralReconciliationService } from "../settlement/collateral-reconciliation.service";
 import { DepositReprocessingService } from "../wallet/watchers/deposit-reprocessing.service";
 import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
+import { WithdrawalWatcherService } from "../wallet/watchers/withdrawal-watcher.service";
 import { WithdrawalsService } from "../wallet/withdrawals/withdrawals.service";
 import { BroadcastWithdrawalDto } from "../wallet/withdrawals/dto/broadcast-withdrawal.dto";
 import { CustodyProviderConfigService } from "../wallet/provider-config/custody-provider-config.service";
@@ -67,6 +68,7 @@ export class AdminController {
     private readonly collateralReconciliationService: CollateralReconciliationService,
     private readonly reprocessingService: DepositReprocessingService,
     private readonly depositWatcherService: DepositWatcherService,
+    private readonly withdrawalWatcherService: WithdrawalWatcherService,
     private readonly custodyProviderConfigService: CustodyProviderConfigService,
     private readonly complianceProviderConfigService: ComplianceProviderConfigService,
     private readonly fireblocksWebhookService: FireblocksWebhookService,
@@ -553,10 +555,24 @@ export class AdminController {
   // ── Watcher / cursor operational visibility (requirement #15) ────────
   // Read-only for both ADMIN and SUPER_ADMIN (class-level default) — this
   // exposes cursor/lease/error state, never a control to force a scan,
-  // mark something confirmed, or credit/complete anything.
+  // mark something confirmed, or credit/complete anything. Kept as its
+  // own array-shaped response (never changed to an object wrapping both
+  // watchers) to avoid an API-contract break, matching this codebase's
+  // existing precedent (see AdminController's own listDeposits/
+  // listWithdrawals pagination history) — the withdrawal watcher's
+  // status is a new, separate endpoint below instead.
   @Get("watchers")
   listWatcherStatus() {
     return this.depositWatcherService.listCursorStatus();
+  }
+
+  // Phase 16 — WithdrawalWatcherService has no persistent per-item
+  // cursor row (see its own docblock on why no cross-instance lease is
+  // needed), so its status is in-memory per-process rather than a list
+  // of DB rows like the deposit watcher above.
+  @Get("watchers/withdrawals")
+  getWithdrawalWatcherStatus() {
+    return this.withdrawalWatcherService.getStatus();
   }
 
   // ── Audit log ────────────────────────────────────────────────────────

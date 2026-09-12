@@ -3,10 +3,34 @@ import { ConfigService } from "@nestjs/config";
 import { WithdrawalStatus } from "@prisma/client";
 import { AppConfig } from "../../config/configuration";
 import { PrismaService } from "../../prisma/prisma.service";
+import { LoggingMetricsService, MetricsService } from "../../observability/metrics.service";
 import { ConfirmationPolicyService } from "../confirmation/confirmation-policy.service";
 import { CustodyProviderFactory } from "../custody/custody-provider.factory";
 import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
 import { WithdrawalsService } from "../withdrawals/withdrawals.service";
+
+// Same bound as DepositWatcherService's own graceful-shutdown wait — see
+// its docblock. There is no persistent lease to expire here as a
+// backstop (see this class's own docblock on why one isn't needed), so
+// this bound is the only thing standing between a stuck poll and an
+// indefinitely-hung shutdown.
+const GRACEFUL_SHUTDOWN_MAX_WAIT_MS = 30_000;
+
+export interface WithdrawalWatcherStatus {
+  enabled: boolean;
+  pollIntervalMs: number;
+  lastPollStartedAt: string | null;
+  lastPollSuccessAt: string | null;
+  lastPollError: string | null;
+  lastPollErrorAt: string | null;
+  consecutiveFailures: number;
+  // Mirrors DepositWatcherService.listCursorStatus's isScanStale
+  // reasoning, but computed in-memory (this watcher has no persistent
+  // per-item cursor row to read staleness from — see this class's own
+  // docblock): stale if enabled but no successful pass has completed
+  // recently relative to its own poll interval.
+  isStale: boolean;
+}
 
 /**
  * Turns "a withdrawal is BROADCAST/CONFIRMING with a real txHash" into
@@ -45,12 +69,35 @@ import { WithdrawalsService } from "../withdrawals/withdrawals.service";
  * deposit watcher is: importing this module must never cause an app
  * instance — including every unit and integration test — to start
  * making outbound network calls on its own.
+ *
+ * Phase 16 — deliberately has NO cross-instance lease, unlike
+ * DepositWatcherService's per-assetNetwork CAS lease. That lease exists
+ * to protect a single SHARED, ADVANCING CURSOR from being clobbered by
+ * a concurrent worker — there is no analogous shared cursor here (this
+ * watcher re-lists whatever is currently BROADCAST/CONFIRMING/
+ * PENDING_MANUAL_BROADCAST from the database on every pass; there is
+ * nothing to "advance" and nothing a second worker could regress).
+ * The only shared mutable state two concurrent workers could race on is
+ * the Withdrawal row itself, and every mutation method this watcher
+ * calls (recordConfirmation/fail/recordProviderBroadcast/
+ * failProviderRejectedSubmission, all on WithdrawalsService) guards its
+ * update with a status-scoped `updateMany` inside a transaction — a
+ * second worker's redundant call always matches zero rows and safely
+ * no-ops. Running multiple worker replicas is therefore safe (no
+ * duplicate financial effects) without needing new locking machinery;
+ * see docs/deployment-architecture.md for the full reasoning.
  */
 @Injectable()
 export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WithdrawalWatcherService.name);
   private timer?: NodeJS.Timeout;
   private polling = false;
+  private pollIntervalMs = 30_000;
+  private lastPollStartedAt: Date | null = null;
+  private lastPollSuccessAt: Date | null = null;
+  private lastPollError: string | null = null;
+  private lastPollErrorAt: Date | null = null;
+  private consecutiveFailures = 0;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -59,10 +106,14 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     private readonly withdrawalsService: WithdrawalsService,
     private readonly configService: ConfigService<AppConfig, true>,
     private readonly executorFactory: WithdrawalExecutorFactory,
+    // Same optional-with-a-real-default pattern as DepositWatcherService
+    // — see its constructor's own comment.
+    private readonly metrics: MetricsService = new LoggingMetricsService(),
   ) {}
 
   onModuleInit(): void {
     const config = this.configService.get("withdrawalWatcher", { infer: true });
+    this.pollIntervalMs = config.pollIntervalMs;
     if (!config.enabled) {
       this.logger.log("Withdrawal confirmation watcher disabled (set WITHDRAWAL_WATCHER_ENABLED=true to start it)");
       return;
@@ -73,8 +124,41 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     }, config.pollIntervalMs);
   }
 
-  onModuleDestroy(): void {
+  /** Graceful shutdown — see DepositWatcherService.onModuleDestroy's docblock; identical reasoning, no lease to worry about here (see class docblock). */
+  async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    const deadline = Date.now() + GRACEFUL_SHUTDOWN_MAX_WAIT_MS;
+    while (this.polling && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (this.polling) {
+      this.logger.warn(`Shutting down with a withdrawal poll still in flight after waiting ${GRACEFUL_SHUTDOWN_MAX_WAIT_MS}ms.`);
+    }
+  }
+
+  /**
+   * Operational visibility (Phase 16, mirrors DepositWatcherService.
+   * listCursorStatus in spirit) — surfaced via GET /admin/watchers and
+   * folded into GET /health/ready. `isStale` uses a 3x-poll-interval
+   * grace window (consistent with STALE_CURSOR_THRESHOLD_MS's own
+   * "generous relative to normal cadence" reasoning) so one slow pass
+   * is never misreported as stuck.
+   */
+  getStatus(): WithdrawalWatcherStatus {
+    const enabled = this.timer !== undefined;
+    const staleThresholdMs = this.pollIntervalMs * 3;
+    const referenceTime = this.lastPollSuccessAt ?? this.lastPollStartedAt;
+    const isStale = enabled && (referenceTime === null || Date.now() - referenceTime.getTime() > staleThresholdMs);
+    return {
+      enabled,
+      pollIntervalMs: this.pollIntervalMs,
+      lastPollStartedAt: this.lastPollStartedAt?.toISOString() ?? null,
+      lastPollSuccessAt: this.lastPollSuccessAt?.toISOString() ?? null,
+      lastPollError: this.lastPollError,
+      lastPollErrorAt: this.lastPollErrorAt?.toISOString() ?? null,
+      consecutiveFailures: this.consecutiveFailures,
+      isStale,
+    };
   }
 
   /**
@@ -88,6 +172,7 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
   async pollOnce(): Promise<void> {
     if (this.polling) return;
     this.polling = true;
+    this.lastPollStartedAt = new Date();
     try {
       const broadcasted = await this.prisma.withdrawal.findMany({
         where: {
@@ -100,6 +185,7 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
           await this.checkOne(withdrawal.id, withdrawal.assetNetworkId, withdrawal.txHash!);
         } catch (error) {
           this.logger.error(`Confirmation check failed for withdrawal ${withdrawal.id}`, error as Error);
+          this.metrics.increment("wallet.withdrawal_watcher.confirmation_check_failed", { withdrawalId: withdrawal.id });
         }
       }
 
@@ -111,8 +197,22 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
           await this.checkPendingProviderSubmission(withdrawal.id, withdrawal.assetNetworkId);
         } catch (error) {
           this.logger.error(`Provider status check failed for withdrawal ${withdrawal.id}`, error as Error);
+          this.metrics.increment("wallet.withdrawal_watcher.provider_check_failed", { withdrawalId: withdrawal.id });
         }
       }
+
+      this.lastPollSuccessAt = new Date();
+      this.consecutiveFailures = 0;
+    } catch (error) {
+      // A failure here means the pass itself couldn't even enumerate
+      // withdrawals to check (e.g. the database is unreachable) — each
+      // individual withdrawal's own check failure is already caught
+      // above and never reaches this block.
+      this.lastPollError = (error as Error).message;
+      this.lastPollErrorAt = new Date();
+      this.consecutiveFailures += 1;
+      this.metrics.increment("wallet.withdrawal_watcher.poll_failed", { consecutiveFailures: this.consecutiveFailures });
+      throw error;
     } finally {
       this.polling = false;
     }
@@ -141,6 +241,7 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     // genuinely failed broadcast deserves.
     if (status.status === "failed") {
       this.logger.error(`Withdrawal ${withdrawalId}'s broadcast transaction ${txHash} failed on-chain — marking the withdrawal FAILED.`);
+      this.metrics.increment("wallet.withdrawal_watcher.marked_failed", { assetNetworkId, reason: "onchain_failed" });
       await this.withdrawalsService.fail(withdrawalId, `Broadcast transaction ${txHash} failed on-chain.`);
       return;
     }
@@ -171,6 +272,7 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     }
     if (lookup.status === "rejected") {
       this.logger.error(`Withdrawal ${withdrawalId}'s provider submission was rejected (${lookup.reason ?? "no reason given"}) — marking the withdrawal FAILED.`);
+      this.metrics.increment("wallet.withdrawal_watcher.marked_failed", { assetNetworkId, reason: "provider_rejected" });
       // Security review finding B1: uses the dedicated, narrower
       // failProviderRejectedSubmission() — never the general-purpose
       // fail() — so a stale/anomalous "rejected" report can never

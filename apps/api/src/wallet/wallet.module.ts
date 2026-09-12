@@ -94,6 +94,7 @@ import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service"
     ConfirmationPolicyService,
     DepositReprocessingService,
     DepositWatcherService,
+    WithdrawalWatcherService,
     CustodyProviderConfigService,
     ComplianceProviderConfigService,
     FireblocksWebhookService,

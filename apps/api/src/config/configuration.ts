@@ -26,6 +26,17 @@ export interface AppConfig {
     enabled: boolean;
     pollIntervalMs: number;
   };
+  // Phase 16 — the HTTP API process (main.ts) refuses to boot at all if
+  // either watcher above is enabled unless this is explicitly true (see
+  // config/watcher-boundary.guard.ts). Background watchers belong in the
+  // dedicated worker process (worker.main.ts); this exists only as an
+  // explicit escape hatch for a deliberate single-process deployment
+  // (e.g. a small self-hosted install), never a silent default.
+  allowWatchersInApiProcess: boolean;
+  worker: {
+    heartbeatFile: string;
+    heartbeatIntervalMs: number;
+  };
 }
 
 export default (): AppConfig => ({
@@ -56,5 +67,10 @@ export default (): AppConfig => ({
   withdrawalWatcher: {
     enabled: process.env.WITHDRAWAL_WATCHER_ENABLED === "true",
     pollIntervalMs: parseInt(process.env.WITHDRAWAL_WATCHER_POLL_INTERVAL_MS ?? "30000", 10),
+  },
+  allowWatchersInApiProcess: process.env.ALLOW_WATCHERS_IN_API_PROCESS === "true",
+  worker: {
+    heartbeatFile: process.env.WORKER_HEARTBEAT_FILE ?? "/tmp/verdictvaut-worker-heartbeat",
+    heartbeatIntervalMs: parseInt(process.env.WORKER_HEARTBEAT_INTERVAL_MS ?? "15000", 10),
   },
 });

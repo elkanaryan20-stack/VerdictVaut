@@ -5,7 +5,9 @@
   "scripts": {
     "build": "nest build",
     "dev": "nest start --watch",
+    "dev:worker": "nest start --watch --entryFile worker.main",
     "start": "node dist/main.js",
+    "start:worker": "node dist/worker.main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint \"src/**/*.ts\"",
     "test": "jest",
@@ -13,9 +15,11 @@
     "test:cov": "jest --coverage",
     "test:integration": "jest --config jest-integration.config.js --runInBand --forceExit",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate": "node scripts/guard-destructive-migration.js && prisma migrate dev",
     "prisma:migrate:deploy": "prisma migrate deploy",
     "prisma:migrate:diff": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url \"$DATABASE_URL\" --script",
+    "prisma:migrate:validate": "prisma validate",
+    "prisma:migrate:diff-report": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url \"$DATABASE_URL\"",
     "backup:drill": "node scripts/backup-restore-drill.js",
     "check:integrity": "node scripts/financial-integrity-checks.js",
     "check:production-readiness": "node scripts/production-readiness-check.js"

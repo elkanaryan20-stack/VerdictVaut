@@ -4,6 +4,8 @@
 
 .git
 .gitignore
+.github
+.claude
 
 **/node_modules
 **/.next
@@ -17,6 +19,12 @@
 .env
 .env.*
 !.env.example
+
+# Phase 16 — real pg_dump output (docs/database-backup-recovery.md warns
+# this is as sensitive as production DB credentials) and jest/test logs
+# have no business in a build context or an image layer.
+infra/backups
+**/*.log
 
 **/npm-debug.log*
 .DS_Store

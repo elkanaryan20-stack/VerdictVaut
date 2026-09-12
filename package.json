@@ -10,6 +10,7 @@
   "scripts": {
     "build": "npm run build -w packages/shared-types && npm run build -w apps/api && npm run build -w apps/web",
     "dev:api": "npm run dev -w apps/api",
+    "dev:worker": "npm run dev:worker -w apps/api",
     "dev:web": "npm run dev -w apps/web",
     "test": "npm run test -w apps/api",
     "test:cov": "npm run test:cov -w apps/api",
@@ -17,7 +18,8 @@
     "typecheck": "npm run typecheck -w apps/api && npm run typecheck -w apps/web && npm run typecheck -w packages/shared-types",
     "prisma:generate": "npm run prisma:generate -w apps/api",
     "prisma:migrate": "npm run prisma:migrate -w apps/api",
-    "prisma:migrate:diff": "npm run prisma:migrate:diff -w apps/api"
+    "prisma:migrate:diff": "npm run prisma:migrate:diff -w apps/api",
+    "prisma:migrate:validate": "npm run prisma:migrate:validate -w apps/api"
   },
   "engines": {
     "node": ">=20.0.0"

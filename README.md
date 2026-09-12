@@ -28,7 +28,11 @@ infra/
   backup.sh            Real pg_dump-based backup for the docker-compose Postgres
   restore.sh           Restores a backup/backup.sh dump into a new database
 docs/
-  database-backup-recovery.md   Backup/DR architecture, RPO/RTO status, restore test results
+  database-backup-recovery.md         Backup/DR architecture, RPO/RTO status, restore test results
+  deployment-architecture.md          Phase 16 — API/worker/web process split, deployment boundaries
+  production-database-requirements.md Phase 16 — production Postgres version/TLS/pooling/migration requirements
+  observability-and-alerting.md       Phase 16 — logs/metrics/health endpoints, defined alert conditions
+  operations-runbook.md               Phase 16 — deploy/rollback/backup/restore/incident procedures
 ```
 
 ### Backend module boundaries (`apps/api/src`)
@@ -382,6 +386,27 @@ reusable financial integrity checks (`apps/api/scripts/financial-integrity-check
 `npm run check:integrity`) usable during development, after a restore,
 or during an incident.
 
+## Deployment & operations (Phase 16)
+
+The API, background blockchain workers, and web frontend are three
+independently deployable processes/images — see
+[`docs/deployment-architecture.md`](docs/deployment-architecture.md)
+for the process split, the boundary that stops workers from
+accidentally starting inside the HTTP API process, and why no new
+cross-instance locking was needed for withdrawal workers. See also:
+[`docs/production-database-requirements.md`](docs/production-database-requirements.md)
+(version/TLS/connection-pooling requirements and migration safety),
+[`docs/observability-and-alerting.md`](docs/observability-and-alerting.md)
+(what's loggable/measurable today and the alert conditions defined
+against it), and
+[`docs/operations-runbook.md`](docs/operations-runbook.md) (deploy,
+rollback, backup/restore, worker recovery, incident response —
+each procedure marked READY FOR IMPLEMENTATION or VERIFIED). None of
+this has been exercised against a real orchestrator or Docker daemon
+(unavailable in every environment this repo has been developed in so
+far) — `.github/workflows/ci.yml`'s `docker-build` job is where that
+actually gets validated, on GitHub's own runners.
+
 ## Next recommended implementation steps
 
 The matching engine, market resolution/settlement, order/withdrawal risk
@@ -424,3 +449,12 @@ remains, roughly in priority order:
    RPO/RTO targets are all still undecided/unimplemented — see
    `docs/database-backup-recovery.md` §7 for the exact prerequisite
    list. **Do not hold real funds in production until this is resolved.**
+7. **Real Docker/orchestrator verification** — Phase 16 split the API
+   and background workers into independently deployable Dockerfile
+   targets (`docs/deployment-architecture.md`) and CI now builds both on
+   every push (`.github/workflows/ci.yml`'s `docker-build` job), but no
+   session that authored this code has ever had a working Docker daemon
+   to run either image, let alone deploy two real replicas against a
+   real Postgres and watch the worker actually process a sandbox
+   deposit/withdrawal end to end. Do this before trusting the worker
+   split in a real deployment.

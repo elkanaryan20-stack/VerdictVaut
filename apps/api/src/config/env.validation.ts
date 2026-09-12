@@ -53,6 +53,17 @@ class EnvironmentVariables {
   @IsInt()
   @IsOptional()
   WITHDRAWAL_WATCHER_POLL_INTERVAL_MS: number = 30000;
+
+  @IsOptional()
+  ALLOW_WATCHERS_IN_API_PROCESS: string = "false";
+
+  @IsString()
+  @IsOptional()
+  WORKER_HEARTBEAT_FILE: string = "/tmp/verdictvaut-worker-heartbeat";
+
+  @IsInt()
+  @IsOptional()
+  WORKER_HEARTBEAT_INTERVAL_MS: number = 15000;
 }
 
 export function validateEnv(config: Record<string, unknown>) {

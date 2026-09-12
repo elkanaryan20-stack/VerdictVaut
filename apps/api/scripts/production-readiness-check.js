@@ -193,7 +193,66 @@ function runStructuralChecks() {
     "Structured logging + a provider-neutral metrics boundary exist",
     "P1",
     Boolean(metricsSource) && Boolean(jsonLoggerSource),
-    "JsonLoggerService + MetricsService/LoggingMetricsService exist (Phase 13 remediation) — but NO real alerting vendor/sink is connected yet; LoggingMetricsService only logs metric events structurally. Wiring a real Prometheus/Datadog/CloudWatch backend (implement the same MetricsService interface) and connecting log-based or metric-based alerts on CRITICAL reconciliation discrepancies, watcher scan failures, and settlement/withdrawal failures remains a real, undone operational step.",
+    "JsonLoggerService + MetricsService/LoggingMetricsService exist (Phase 13 remediation) — but NO real alerting vendor/sink is connected yet; LoggingMetricsService only logs metric events structurally. Wiring a real Prometheus/Datadog/CloudWatch backend (implement the same MetricsService interface) and connecting log-based or metric-based alerts on CRITICAL reconciliation discrepancies, watcher scan failures, and settlement/withdrawal failures remains a real, undone operational step. See docs/observability-and-alerting.md for the concrete alert conditions defined against these signals.",
+  );
+
+  // Phase 16 — deployment/operations maturity checks. All P2 (operational
+  // maturity, not a launch blocker): a single-process deployment via
+  // ALLOW_WATCHERS_IN_API_PROCESS=true remains a valid, supported
+  // configuration, so none of these being absent blocks anything the P0/P1
+  // checks above don't already independently cover.
+  const workerMainSource = readSourceFile("src/worker.main.ts");
+  check(
+    "A dedicated background-worker process, independent of the HTTP API, exists",
+    "P2",
+    Boolean(workerMainSource),
+    workerMainSource ? "worker.main.ts exists — see docs/deployment-architecture.md" : "background watchers can currently only run inside the API process",
+  );
+
+  const mainSource = readSourceFile("src/main.ts");
+  check(
+    "The API process refuses to silently double as a background worker",
+    "P2",
+    Boolean(mainSource) && /assertWatchersNotAccidentallyEnabledInApiProcess/.test(mainSource),
+    mainSource && /assertWatchersNotAccidentallyEnabledInApiProcess/.test(mainSource)
+      ? "watcher-boundary.guard.ts is wired into main.ts's bootstrap()"
+      : "no boundary guard found — a misconfigured deployment could silently run watchers inside the HTTP process",
+  );
+
+  const guardMigrationSource = readSourceFile("scripts/guard-destructive-migration.js");
+  const apiPackageJsonSource = readSourceFile("package.json");
+  const migrateScriptGuarded = Boolean(apiPackageJsonSource) && /guard-destructive-migration\.js.*&&.*prisma migrate dev/.test(apiPackageJsonSource);
+  check(
+    "The dev migration script (prisma migrate dev, which can drop/reset data) is guarded against running against production",
+    "P2",
+    Boolean(guardMigrationSource) && migrateScriptGuarded,
+    guardMigrationSource && migrateScriptGuarded
+      ? "guard-destructive-migration.js is wired into the npm prisma:migrate script — but it only checks APP_ENVIRONMENT/NODE_ENV, never DATABASE_URL's actual value, and only protects the npm-script path (direct `npx prisma migrate dev` bypasses it). It will NOT stop `prisma migrate dev` from running against a real production database if APP_ENVIRONMENT is left unset/sandbox while DATABASE_URL points at one — see docs/production-database-requirements.md §4 for the full limitation and why it isn't fixed with a hostname heuristic."
+      : "no guard found — only protects the npm-script path even when present, see the script's own docblock",
+  );
+
+  const workerHealthcheckSource = readSourceFile("scripts/worker-healthcheck.js");
+  check(
+    "The background-worker container has liveness tooling (it binds no HTTP port to probe)",
+    "P2",
+    Boolean(workerHealthcheckSource),
+    workerHealthcheckSource ? "scripts/worker-healthcheck.js exists, used by the worker Docker target's HEALTHCHECK" : "no heartbeat-based healthcheck found",
+  );
+
+  const ciWorkflowSource = readSourceFile("../../.github/workflows/ci.yml");
+  check(
+    "CI validates the Prisma schema (and reports schema/migration-history drift for human review)",
+    "P2",
+    Boolean(ciWorkflowSource) && /prisma:migrate:validate/.test(ciWorkflowSource),
+    ciWorkflowSource && /prisma:migrate:validate/.test(ciWorkflowSource)
+      ? "prisma-migration-validation job found in ci.yml — schema syntax is a hard gate; the schema-vs-migration-history diff is reported but deliberately non-blocking (see that job's own comment for why)"
+      : "no migration-validation CI step found",
+  );
+  check(
+    "CI validates that both Dockerfile targets (API and worker) actually build",
+    "P2",
+    Boolean(ciWorkflowSource) && /docker build/.test(ciWorkflowSource),
+    ciWorkflowSource && /docker build/.test(ciWorkflowSource) ? "docker-build job found in ci.yml" : "no Docker build validation found in CI — Dockerfiles could silently rot",
   );
 
   return results;

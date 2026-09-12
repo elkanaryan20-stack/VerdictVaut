@@ -171,4 +171,53 @@ describe("WithdrawalWatcherService", () => {
       expect(withdrawalsService.recordProviderBroadcast).not.toHaveBeenCalled();
     });
   });
+
+  describe("Phase 16 — status reporting and graceful shutdown", () => {
+    it("reports disabled/not-stale status before onModuleInit ever runs", () => {
+      const status = service.getStatus();
+      expect(status.enabled).toBe(false);
+      expect(status.isStale).toBe(false);
+      expect(status.consecutiveFailures).toBe(0);
+    });
+
+    it("records a successful poll's timestamp and resets consecutiveFailures", async () => {
+      await service.pollOnce();
+      const status = service.getStatus();
+      expect(status.lastPollSuccessAt).not.toBeNull();
+      expect(status.consecutiveFailures).toBe(0);
+    });
+
+    it("tracks consecutiveFailures and the last error when the pass itself throws (e.g. the database is unreachable)", async () => {
+      prisma.withdrawal.findMany.mockRejectedValueOnce(new Error("connection refused"));
+      await expect(service.pollOnce()).rejects.toThrow("connection refused");
+      const status = service.getStatus();
+      expect(status.consecutiveFailures).toBe(1);
+      expect(status.lastPollError).toBe("connection refused");
+    });
+
+    it("onModuleDestroy resolves immediately when no poll is in flight", async () => {
+      await expect(service.onModuleDestroy()).resolves.toBeUndefined();
+    });
+
+    it("onModuleDestroy waits for an in-flight poll to finish before returning", async () => {
+      let resolveFirst!: () => void;
+      const pending = new Promise<void>((resolve) => (resolveFirst = resolve));
+      prisma.withdrawal.findMany.mockImplementationOnce(() => pending.then(() => []));
+
+      const pollPromise = service.pollOnce();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      let destroyed = false;
+      const destroyPromise = service.onModuleDestroy().then(() => {
+        destroyed = true;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(destroyed).toBe(false); // still waiting on the in-flight poll
+
+      resolveFirst();
+      await Promise.all([pollPromise, destroyPromise]);
+      expect(destroyed).toBe(true);
+    });
+  });
 });

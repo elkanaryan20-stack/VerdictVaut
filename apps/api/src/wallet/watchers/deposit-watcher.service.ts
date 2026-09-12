@@ -19,6 +19,11 @@ import { STALE_CURSOR_THRESHOLD_MS } from "../reconciliation/reconciliation.serv
 // still-healthy scan is never mistaken for a dead one.
 const LEASE_STALE_AFTER_MS = 5 * 60_000;
 
+// Bounds how long graceful shutdown (onModuleDestroy) waits for an
+// in-flight poll to finish before giving up and returning anyway — see
+// onModuleDestroy's own docblock.
+const GRACEFUL_SHUTDOWN_MAX_WAIT_MS = 30_000;
+
 /**
  * Guards against a cursor ever moving backward (requirement #3: "a
  * cursor must contain enough information to safely resume" — resuming
@@ -93,8 +98,26 @@ export class DepositWatcherService implements OnModuleInit, OnModuleDestroy {
     }, config.pollIntervalMs);
   }
 
-  onModuleDestroy(): void {
+  /**
+   * Graceful shutdown (Phase 16): stop scheduling new poll ticks
+   * immediately, then wait for any poll already in flight to finish
+   * before returning, so app.close() (SIGTERM in worker.main.ts) never
+   * kills the process mid-scan — which would otherwise leave a scan
+   * lease held (see acquireLease/LEASE_STALE_AFTER_MS) for up to 5
+   * minutes with no work actually happening, and could interrupt a
+   * chain adapter mid-request. Bounded (not an unbounded await) so a
+   * genuinely stuck poll can't block shutdown forever; the lease's own
+   * staleness timeout is the backstop if this bound is ever hit.
+   */
+  async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    const deadline = Date.now() + GRACEFUL_SHUTDOWN_MAX_WAIT_MS;
+    while (this.polling && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (this.polling) {
+      this.logger.warn(`Shutting down with a deposit scan still in flight after waiting ${GRACEFUL_SHUTDOWN_MAX_WAIT_MS}ms — its lease will expire naturally via LEASE_STALE_AFTER_MS.`);
+    }
   }
 
   /**

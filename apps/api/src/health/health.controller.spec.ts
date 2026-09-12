@@ -1,17 +1,26 @@
 import { ServiceUnavailableException } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
 import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
+import { WithdrawalWatcherService } from "../wallet/watchers/withdrawal-watcher.service";
 import { HealthController } from "./health.controller";
 
 describe("HealthController", () => {
   let controller: HealthController;
   let prisma: { $queryRaw: jest.Mock };
   let depositWatcherService: { listCursorStatus: jest.Mock };
+  let withdrawalWatcherService: { getStatus: jest.Mock };
 
   beforeEach(() => {
     prisma = { $queryRaw: jest.fn().mockResolvedValue([{ "?column?": 1 }]) };
     depositWatcherService = { listCursorStatus: jest.fn().mockResolvedValue([]) };
-    controller = new HealthController(prisma as unknown as PrismaService, depositWatcherService as unknown as DepositWatcherService);
+    withdrawalWatcherService = {
+      getStatus: jest.fn().mockReturnValue({ enabled: false, pollIntervalMs: 30000, lastPollStartedAt: null, lastPollSuccessAt: null, lastPollError: null, lastPollErrorAt: null, consecutiveFailures: 0, isStale: false }),
+    };
+    controller = new HealthController(
+      prisma as unknown as PrismaService,
+      depositWatcherService as unknown as DepositWatcherService,
+      withdrawalWatcherService as unknown as WithdrawalWatcherService,
+    );
   });
 
   describe("liveness", () => {
@@ -52,6 +61,23 @@ describe("HealthController", () => {
       const result = await controller.readiness();
       expect(result.status).toBe("ok");
       expect(result.checks.blockchainWatchers.ok).toBe(true);
+    });
+
+    it("stays 200 but reports degraded when the withdrawal watcher is stale", async () => {
+      withdrawalWatcherService.getStatus.mockReturnValue({ enabled: true, pollIntervalMs: 30000, lastPollStartedAt: null, lastPollSuccessAt: null, lastPollError: "boom", lastPollErrorAt: new Date().toISOString(), consecutiveFailures: 3, isStale: true });
+      const result = await controller.readiness();
+      expect(result.status).toBe("ok");
+      expect(result.checks.withdrawalWatcher.ok).toBe(false);
+      expect(result.checks.withdrawalWatcher.consecutiveFailures).toBe(3);
+    });
+
+    it("never fails readiness just because the withdrawal watcher status lookup itself throws", async () => {
+      withdrawalWatcherService.getStatus.mockImplementation(() => {
+        throw new Error("boom");
+      });
+      const result = await controller.readiness();
+      expect(result.status).toBe("ok");
+      expect(result.checks.withdrawalWatcher.ok).toBe(true);
     });
   });
 });

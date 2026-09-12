@@ -8,6 +8,15 @@ name: CI
 # this workflow never connects to, or needs credentials for, any real
 # staging/production database or custody/compliance provider. It proves
 # the codebase, not any live external system.
+#
+# Phase 16 adds two more independent jobs (prisma-migration-validation,
+# docker-build), both still self-contained: the Postgres service below
+# is a fresh, throwaway container this workflow creates and destroys
+# itself, never a real staging/production database; the Docker builds
+# never push an image anywhere — they only prove the Dockerfile still
+# builds, and are the intentional stopping point (deploying built images
+# anywhere is deliberately NOT automated here — see docs/operations-runbook.md
+# for why that stays a deliberate, reviewed, human-triggered step).
 
 on:
   push:
@@ -45,3 +54,157 @@ jobs:
 
       - name: Web unit tests
         run: npm run test -w apps/web
+
+  # Independent of the `ci` job above. `prisma validate` (schema syntax)
+  # needs no database at all. The Postgres service below is used only by
+  # the informational diff-report step — "migrations actually apply
+  # cleanly from scratch" is already proven for real by the `ci` job's
+  # own integration-test suite (its global-setup.js runs the exact same
+  # `prisma migrate deploy` against a fresh embedded-postgres instance on
+  # every CI run), so this job deliberately doesn't duplicate that.
+  prisma-migration-validation:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci_validate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      # DATABASE_URL only needs to be SET here, not reachable — `prisma
+      # validate` resolves schema.prisma's `url = env("DATABASE_URL")`
+      # to parse the datasource block but never connects.
+      - name: Prisma schema is syntactically valid
+        working-directory: apps/api
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_validate
+        run: npm run prisma:migrate:validate
+
+      # Report-only, never fails the build: run once against this repo's
+      # real migration history and it reported several FK/index
+      # declaration-ORDER differences that are cosmetically different
+      # but not functionally different (Prisma's diff is sensitive to
+      # which migration re-declares a constraint, not just the resulting
+      # schema) — gating on --exit-code here would make this check
+      # permanently, uninformatively red rather than catching a real
+      # problem. Kept as a report so a genuinely NEW, unexpected diff is
+      # still visible to a human reviewing CI output.
+      - name: Prisma schema vs. migration-history diff (informational only)
+        working-directory: apps/api
+        continue-on-error: true
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_validate
+        run: npm run prisma:migrate:diff-report
+
+  # Proves the Dockerfiles still build — never pushes an image anywhere,
+  # and does not select/verify/execute against any custody or compliance
+  # provider (see apps/api/Dockerfile's own header comment). Feasible
+  # here even though Docker was unavailable in the sandbox this phase was
+  # authored in — GitHub Actions runners ship Docker preinstalled.
+  #
+  # The postgres service below exists ONLY for the API-image smoke test
+  # step further down — it is a fresh, throwaway container this workflow
+  # creates and destroys itself, exactly like prisma-migration-validation's
+  # own service (never a real staging/production database), and every
+  # credential referencing it below is a hardcoded, clearly-fake CI-only
+  # placeholder — not a secret, and never treated as one.
+  docker-build:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API image (runtime target)
+        run: docker build -f apps/api/Dockerfile --target runtime -t verdictvaut-api:ci .
+
+      - name: Build worker image (worker target)
+        run: docker build -f apps/api/Dockerfile --target worker -t verdictvaut-worker:ci .
+
+      - name: Build web image
+        run: docker build -f apps/web/Dockerfile -t verdictvaut-web:ci --build-arg NEXT_PUBLIC_API_URL=http://localhost:4000 .
+
+      # Smoke test (Phase 16 review finding M2): proves the built API
+      # image doesn't just BUILD but actually BOOTS and serves real HTTP
+      # traffic — a `docker build` success alone says nothing about
+      # runtime correctness (e.g. a broken Prisma client from the
+      # Dockerfile's `npm prune --omit=dev` step would have built fine
+      # and only shown up here). No Fireblocks/real credentials/real
+      # funds/production infrastructure are involved: APP_ENVIRONMENT is
+      # sandbox, every secret-shaped env var below is a hardcoded
+      # 32+ character CI-only placeholder string (not a GitHub secret,
+      # because it isn't one), and CHAIN_WATCHER_ENABLED/
+      # WITHDRAWAL_WATCHER_ENABLED are left at their default (false) so
+      # this container never attempts a real outbound chain/provider
+      # call. `--network host` is what lets this container reach the
+      # `postgres` service above via `localhost:5432` (GitHub Actions
+      # service containers are exposed on the runner's own localhost,
+      # not reachable from a normal bridge-networked container without
+      # this — see GitHub's own docs on job service containers).
+      - name: Smoke test API image (boots + GET /health + GET /health/ready)
+        run: |
+          set -euo pipefail
+          docker run -d --name verdictvaut-api-smoke --network host \
+            -e NODE_ENV=production \
+            -e APP_ENVIRONMENT=sandbox \
+            -e PORT=4000 \
+            -e DATABASE_URL="postgresql://ci:ci@localhost:5432/ci_smoke" \
+            -e JWT_ACCESS_SECRET="ci-smoke-test-access-secret-fake-not-real-000000" \
+            -e JWT_REFRESH_SECRET="ci-smoke-test-refresh-secret-fake-not-real-00000" \
+            verdictvaut-api:ci
+
+          cleanup() {
+            echo "--- container logs ---"
+            docker logs verdictvaut-api-smoke || true
+            docker rm -f verdictvaut-api-smoke || true
+          }
+          trap cleanup EXIT
+
+          echo "Waiting for the container to boot and serve GET /health..."
+          ready=false
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:4000/health >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "true" ]; then
+            echo "API image never became live within 30s — see container logs above." >&2
+            exit 1
+          fi
+
+          echo "Liveness OK — checking GET /health/ready (proves the container can actually reach Postgres)..."
+          curl -sf http://localhost:4000/health/ready
+
+          echo ""
+          echo "Smoke test passed: image boots, connects to Postgres, and serves both health endpoints."

@@ -206,4 +206,31 @@ describe("DepositWatcherService", () => {
 
     expect(scanOneSpy).toHaveBeenCalledTimes(1);
   });
+
+  describe("Phase 16 — graceful shutdown", () => {
+    it("onModuleDestroy resolves immediately when no poll is in flight", async () => {
+      await expect(service.onModuleDestroy()).resolves.toBeUndefined();
+    });
+
+    it("onModuleDestroy waits for an in-flight poll to finish before returning", async () => {
+      let resolveFirst!: () => void;
+      jest.spyOn(service, "scanOne").mockImplementationOnce(() => new Promise((resolve) => (resolveFirst = resolve)));
+      prisma.assetNetwork.findMany.mockResolvedValue([{ id: "an-1" }]);
+
+      const pollPromise = service.pollOnce();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      let destroyed = false;
+      const destroyPromise = service.onModuleDestroy().then(() => {
+        destroyed = true;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(destroyed).toBe(false);
+
+      resolveFirst();
+      await Promise.all([pollPromise, destroyPromise]);
+      expect(destroyed).toBe(true);
+    });
+  });
 });

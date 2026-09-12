@@ -2,6 +2,7 @@ import { Controller, Get, HttpCode, ServiceUnavailableException } from "@nestjs/
 import { SkipThrottle } from "@nestjs/throttler";
 import { PrismaService } from "../prisma/prisma.service";
 import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
+import { WithdrawalWatcherService } from "../wallet/watchers/withdrawal-watcher.service";
 
 /**
  * Phase 13 — this repository had zero health/readiness surface before
@@ -23,6 +24,7 @@ export class HealthController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly depositWatcherService: DepositWatcherService,
+    private readonly withdrawalWatcherService: WithdrawalWatcherService,
   ) {}
 
   /** Liveness: the process itself is running. Never checks dependencies. */
@@ -65,6 +67,18 @@ export class HealthController {
     const cursors = await this.depositWatcherService.listCursorStatus().catch(() => []);
     const staleWatchers = cursors.filter((c) => c.isScanStale).map((c) => ({ assetSymbol: c.assetSymbol, networkCode: c.networkCode }));
 
+    // Same "never fail readiness over a status LOOKUP itself throwing"
+    // reasoning as the deposit-watcher cursor list above — getStatus()
+    // is a synchronous in-memory read and should never throw in
+    // practice, but the same defensive shape is kept for consistency.
+    const withdrawalWatcherStatus = (() => {
+      try {
+        return this.withdrawalWatcherService.getStatus();
+      } catch {
+        return null;
+      }
+    })();
+
     return {
       status: "ok",
       checks: {
@@ -74,6 +88,14 @@ export class HealthController {
           staleCount: staleWatchers.length,
           stale: staleWatchers,
         },
+        withdrawalWatcher: withdrawalWatcherStatus
+          ? {
+              ok: !withdrawalWatcherStatus.isStale,
+              enabled: withdrawalWatcherStatus.enabled,
+              isStale: withdrawalWatcherStatus.isStale,
+              consecutiveFailures: withdrawalWatcherStatus.consecutiveFailures,
+            }
+          : { ok: true, enabled: false, isStale: false, consecutiveFailures: 0 },
       },
     };
   }
