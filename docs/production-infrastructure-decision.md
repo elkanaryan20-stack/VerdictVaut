@@ -1,10 +1,180 @@
-# Production Infrastructure Decision — Phase 23
+# Production Infrastructure Decision — Phase 23 + Phase 24 addendum
 
 This document turns VerdictVaut's existing deployment architecture
 (Phase 15/16 Dockerfiles + CI, Phase 22 backup/DR) into a concrete
 production infrastructure contract: a provider comparison, a
 recommended (not provisioned) target architecture, and the network/
 secret/deployment/observability models a real production rollout needs.
+
+**Phase 24 update**: Phase 23 deliberately declined to recommend a
+single provider ("a business decision... this repository has [no]
+visibility into"). Phase 24 was explicitly asked to go further and
+produce a concrete, repository-grounded recommendation — see the
+**"Phase 24 — concrete recommendation"** section immediately below.
+This does **not** change Phase 23's own status: no provider has been
+provisioned, no cloud account exists, and nothing here is an
+authorization to provision anything. The recommendation is advisory,
+for the human operator who owns this decision to accept, reject, or
+override. Sections 1–18 below are the original Phase 23 content,
+re-verified (not re-derived from memory) against the current
+repository state this session and left otherwise unchanged — see
+`docs/production-deployment-plan.md`, `docs/production-network-security.md`,
+and `docs/production-secret-management.md` (new this phase) for the
+deployment/network/secret detail made concrete for the recommended
+provider.
+
+## Phase 24 — concrete recommendation
+
+**Recommended: AWS (RDS for PostgreSQL + ECS Fargate).** Not yet
+selected/authorized by the human operator — see the caveat above.
+
+### Why AWS fits this repository specifically
+
+This repository's architecture has one structural property that
+matters more than any generic provider feature checklist: the
+**worker is a long-running process that binds no HTTP port at all**
+(`apps/api/src/worker.main.ts`, `docs/deployment-architecture.md` §1) —
+by explicit design, it must remain independently deployable from the
+API and must never be reachable from the internet. This is the
+deciding factor between the three options in §2's matrix:
+
+| Requirement | AWS ECS Fargate | Google Cloud Run | Azure Container Apps |
+|---|---|---|---|
+| Runs a long-lived container with no HTTP listener, as a first-class deployment unit, with the same execution model as the API/web services | **Yes, natively.** A Fargate "service" (or standalone task) is just a long-running container; attaching a load balancer/target group is optional, not required (verified against AWS's own ECS Fargate documentation this session — Fargate services "can optionally be configured to use Elastic Load Balancing," `docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html`) | **Requires an execution-mode change to fit safely.** Cloud Run's default billing/CPU-allocation model only allocates CPU while an HTTP request is being processed; Google's own documentation states the default is request-based billing, and explicitly recommends setting `min-instances` to at least 1 *and* switching to instance-based billing for any service that "performs other tasks even when it isn't processing requests, such as running background threads, or processing asynchronous tasks" (verified against `docs.cloud.google.com/run/docs/about-instance-autoscaling` this session) — workable, but it means the worker would run on a materially different execution mode/billing model than the request-driven web/API services, an asymmetry this repository's own three-symmetric-Dockerfile-targets design doesn't have today. Cloud Run Jobs is the alternative, but Jobs are run-to-completion batch executions, not a natural fit for a continuous poll loop either. | Azure Container Apps supports long-running, non-HTTP-ingress containers (a "background" scale rule / no ingress configuration) — plausible fit, not verified against current official docs this session (out of scope given AWS/GCP already gave a clear, verified differentiator) |
+| Managed PostgreSQL PITR | Verified Phase 23: continuous transaction-log upload every 5 min, restore always to a new instance | Verified Phase 23: continuous, always restores to a new instance | Verified Phase 23: 7–35 day retention, stated RPO "up to five minutes" |
+| Native Secrets Manager ↔ managed-DB credential rotation | AWS Secrets Manager documents built-in "managed rotation" for supported services, and Lambda-based rotation (including AWS-provided rotation function templates for RDS) for the rest — verified against `docs.aws.amazon.com/secretsmanager/latest/userguide/rotate-secrets_how.html` this session | Google Secret Manager has no equivalent native RDS-style managed-rotation integration for Cloud SQL as of this session's un-verified general knowledge — not independently re-verified, not counted for or against | Azure Key Vault + Azure Database for PostgreSQL rotation is not verified this session |
+| Zero application code changes implied | Yes — confirmed zero AWS/GCP/Azure SDK usage anywhere in this repo (re-verified this session, same grep as Phase 23, zero matches); ECS injects Secrets Manager values as plain container env vars before the process starts, which is **exactly** the shape `secret-ref.validator.ts`'s existing `env:` scheme already expects — no new secret-ref scheme needs to be built for this to work | Same (Cloud Run also injects secrets as env vars or mounted files) | Same (Container Apps also injects secrets as env vars) |
+| Ecosystem maturity for a financial application's third-party integrations (custody/compliance vendors, auditors) | AWS has the longest operating history and the broadest documented base of fintech/custody-adjacent deployments of the three; this is a qualitative, not independently-benchmarked, observation | Not verified | Not verified |
+
+**The load-bearing, verified technical reason is the worker's
+execution model** — everything else in §2's matrix (PITR, HA, secret
+management, container hosting) is comparably strong across all three
+providers for this repository's needs, as Phase 23 already found. AWS
+is the only one of the three where "run three Docker images the same
+way, one of which happens to bind no port" requires **no** deviation
+from the platform's default execution model.
+
+### Why the alternatives are weaker (not disqualified)
+
+- **Google Cloud (Cloud SQL + Cloud Run)** remains a reasonable choice
+  if the worker were re-architected to Cloud Run Jobs on a
+  schedule (poll every N minutes via Cloud Scheduler) instead of a
+  continuous in-process poll loop, or if Cloud Run's instance-based
+  billing mode is accepted as the worker's steady-state cost model.
+  Neither is a large change, but both are changes this repository does
+  not need if AWS is chosen — GKE would remove the asymmetry entirely
+  but reintroduces Kubernetes operational complexity this repository
+  has no other reason to take on (see the IaC/orchestration section
+  below).
+- **Azure (Flexible Server + Container Apps)** was not eliminated by
+  any verified technical gap this session — it was simply not the
+  provider with a verified, repository-specific differentiator the way
+  AWS's Fargate optional-load-balancer behavior is. If the human
+  operator has an existing Azure relationship/credits/compliance
+  requirement, Azure remains a credible second option pending the same
+  verification AWS received this session.
+
+### Assumptions this recommendation depends on
+
+1. The worker's current design (a single continuous poll loop, no HTTP
+   port, `worker.main.ts` unchanged) is the design that ships to
+   production. If the worker is ever redesigned into a scheduled
+   batch job, this recommendation's deciding factor weakens and the
+   three providers become closer to equivalent.
+2. No existing organizational cloud relationship, negotiated
+   enterprise agreement, data-residency requirement, or team expertise
+   bias exists that this repository has no visibility into — the same
+   caveat Phase 23 already stated, unchanged. **This is exactly the
+   kind of fact only the human operator has** and can override this
+   recommendation outright.
+3. `docs/production-database-readiness.md`'s proposed RPO ≤5min / RTO
+   ≤60min targets (still proposed, not accepted) are compatible with
+   RDS Multi-AZ's failover characteristics — plausible given Phase 23's
+   verified PITR/backup capability, not independently load-tested.
+4. Custody/compliance provider network reachability (Fireblocks,
+   Elliptic) is achievable from AWS's network — no VPC peering/
+   PrivateLink relationship with either vendor has been verified this
+   session; both are reached over the public internet by the existing
+   sandbox adapters today (`FireblocksCustodyAdapter`,
+   `EllipticAddressRiskGate`), so this is not a blocking assumption,
+   only a note that a future private-networking upgrade with either
+   vendor has not been investigated.
+
+### What would change this decision
+
+- A credible, cited technical gap found in AWS ECS Fargate/RDS that
+  the other two don't share (none was found this session).
+- A business constraint (existing contract, compliance/data-residency
+  requirement, team expertise) that this repository cannot see.
+- A decision to redesign the worker away from a continuous poll loop
+  (see assumption 1) — would meaningfully close the gap with Cloud Run.
+- A real quoted pricing comparison at expected production scale — not
+  attempted this session (see §14/Phase 24's cost section below; no
+  precise pricing is invented).
+
+### Infrastructure-as-code decision
+
+**No Terraform/Pulumi/CloudFormation/CDK code is added by this
+phase.** No provider has been selected by the human operator yet —
+writing provider-specific IaC now would be exactly the "invent
+resource names/IDs against a provider nobody has authorized"
+anti-pattern this phase's brief explicitly forbids. Confirmed this
+session: no `*.tf`, `*.tf.json`, Pulumi, CDK, or CloudFormation file
+exists anywhere in this repository (`infra/` contains only
+`docker-compose.yml`, `backup.sh`, `restore.sh` — all pre-existing,
+unmodified this phase).
+
+**What to build once a provider is actually authorized** (documented
+here so the eventual work has a concrete starting shape, not built
+now):
+
+```
+infra/
+  terraform/                     (or pulumi/ — pick one, don't mix)
+    environments/
+      staging/
+        main.tf                  # backend config, provider version pin
+        variables.tf
+        terraform.tfvars         # NOT committed if it holds anything
+                                  # environment-specific-sensitive;
+                                  # otherwise safe non-secret values only
+      production/
+        (same shape as staging — deliberately parallel, not shared
+        state, so a staging apply can never touch production)
+    modules/
+      network/                   # VPC, public/private subnets, NAT,
+                                  # security groups — docs/production-network-security.md
+      database/                  # RDS instance, subnet group, parameter
+                                  # group (force_ssl), Secrets Manager
+                                  # secret + rotation
+      ecs-service/                # reusable module, instantiated 3x
+                                  # (web, api, worker) with different
+                                  # inputs (port vs no port, desired
+                                  # count, target group or none)
+      secrets/                   # Secrets Manager secret definitions
+                                  # (names/ARNs only — never a real
+                                  # secret VALUE in committed .tf code)
+      observability/             # CloudWatch log groups, optional
+                                  # alarms (§12 of this document)
+```
+
+Principles for whenever this is built (not enforced by any code today,
+stated so the eventual author doesn't have to rediscover them):
+state must be stored remotely with locking (S3+DynamoDB, or Terraform
+Cloud) — never local `.tfstate` for anything touching production;
+staging and production must be separate state files/workspaces, never
+one shared state with a variable flipping between them; no secret
+VALUE ever appears in `.tf`/`.tfvars` source — only references
+(Secrets Manager ARNs, generated at apply time via
+`random_password`/`aws_secretsmanager_secret` resources, never a
+literal string); `terraform plan` output must be reviewed by a human
+before every `apply` against production, same standard as this
+repository already applies to `prisma migrate deploy` (§10 below).
+
+**This repository already contains no cloud provider lock-in to
+migrate away from** — re-verified this session (§5's grep, zero
+matches) — so adopting IaC later is purely additive, not a rewrite.
+
 
 **No cloud provider has been selected anywhere in this repository's
 history.** `docs/production-database-requirements.md` §5 and
@@ -104,75 +274,105 @@ product-existence fact (e.g. "AWS has a service called Secrets
 Manager") or an explicitly-labeled subjective assessment — never
 presented as a verified guarantee.
 
-**This document does not recommend one over the other as a final
-choice** — that is a business decision (existing team cloud experience,
-existing vendor relationships, compliance/data-residency requirements
-none of which this repository has visibility into). Where a
-architecture needs to be described concretely for §3 below, it is
-described in provider-neutral terms; a `<CHOSEN PROVIDER>` placeholder
-marks anywhere a real decision would fill in a specific product name.
+**Phase 23 did not recommend one over the other as a final choice.**
+**Phase 24 update: see "Phase 24 — concrete recommendation" above —
+AWS is now recommended (not selected/authorized) based on a verified,
+repository-specific technical differentiator (the portless worker
+process's fit with Fargate vs. Cloud Run's request-driven default).**
+This remains a business decision the human operator can override
+(existing team cloud experience, existing vendor relationships,
+compliance/data-residency requirements none of this repository's prior
+analysis had visibility into). §3 below is now made concrete for AWS
+per the recommendation, with a note wherever a real decision would
+still need to fill in a specific resource name/ID.
 
 ## 3. Recommended target architecture — **RECOMMENDED, NOT YET PROVISIONED**
+
+Made concrete for AWS per the Phase 24 recommendation above. Every
+resource name below is a description of what would be created, not a
+real ARN/ID — none is invented as though it already exists.
 
 ```
                               Internet
                                  │
                                  ▼
                     ┌───────────────────────────┐
-                    │   TLS termination / LB     │   <CHOSEN PROVIDER's
-                    │  (ALB / Cloud LB / App GW)  │   managed load balancer>
+                    │  Application Load Balancer  │  public subnets,
+                    │  ACM certificate (TLS 1.2+)  │  HTTPS:443 only
                     └─────────────┬─────────────┘
-                                  │ HTTPS only
+                                  │ HTTPS only, host/path routing
                     ┌─────────────┴─────────────┐
                     │                             │
                     ▼                             ▼
           ┌──────────────────┐         ┌──────────────────┐
           │   Web service      │        │    API service     │
           │ (Next.js standalone)│        │  (NestJS runtime)   │
-          │  public subnet /    │        │  public subnet /    │
-          │  public ingress     │        │  public ingress     │
+          │  ECS Fargate task,  │        │  ECS Fargate task,   │
+          │  PRIVATE subnet,    │        │  PRIVATE subnet,     │
+          │  reachable only via │        │  reachable only via  │
+          │  the ALB's SG       │        │  the ALB's SG        │
+          │  (incl. the         │        │  (incl. the          │
+          │  Fireblocks webhook  │        │  Fireblocks webhook  │
+          │  route — same ALB)   │        │  route — same ALB)   │
           └──────────────────┘         └─────────┬────────┘
                                                     │ DATABASE_URL (TLS)
                                                     ▼
                                     ┌───────────────────────────┐
-                                    │      PRIVATE subnet         │
-                                    │  Managed PostgreSQL primary │
-                                    │  <CHOSEN PROVIDER>          │
+                                    │   Isolated DB subnet group   │
+                                    │   RDS for PostgreSQL 16      │
+                                    │   (Multi-AZ, if HA accepted) │
                                     └─────────────┬─────────────┘
                                                     │
                                     ┌─────────────┴─────────────┐
-                                    │  Automated backups + WAL/   │
-                                    │  PITR (provider-native)     │
+                                    │  Automated backups + PITR   │
+                                    │  (transaction logs uploaded │
+                                    │  every ~5 min — RDS-native)  │
                                     └─────────────┬─────────────┘
                                                     │
                                     ┌─────────────┴─────────────┐
-                                    │  Standby/replica (HA) —     │
-                                    │  same-region synchronous,   │
-                                    │  where the provider's HA    │
-                                    │  tier is enabled            │
+                                    │  Multi-AZ synchronous       │
+                                    │  standby, where enabled —   │
+                                    │  see §10 of                 │
+                                    │  production-database-       │
+                                    │  readiness.md for the        │
+                                    │  accepted in-flight-tx-      │
+                                    │  during-failover gap         │
                                     └───────────────────────────┘
 
   Independently:
 
           ┌──────────────────┐
-          │  Worker service     │   private subnet, NO public ingress,
-          │ (background watcher)│   no HTTP port at all (matches
-          │  no HTTP surface    │   worker.main.ts's own design)
-          └─────────┬──────────┘
+          │  Worker service     │   ECS Fargate task/service, PRIVATE
+          │ (background watcher)│   subnet, NO target group / NO load
+          │  no HTTP surface    │   balancer attached at all (matches
+          └─────────┬──────────┘   worker.main.ts's own no-port design;
+                    │              confirmed against AWS's own docs
+                    │              this session that a Fargate service's
+                    │              load balancer attachment is optional)
                     │ DATABASE_URL (TLS, private)
                     ▼
-          [ same managed PostgreSQL primary above ]
+          [ same RDS primary above ]
                     │
-                    │ outbound only, egress-filtered
+                    │ outbound only, via NAT gateway, egress-filtered
                     ▼
      blockchain RPC providers · Fireblocks · Elliptic · Postmark
+
+  Supporting (not pictured above):
+    - Secrets Manager: JWT/Fireblocks/Elliptic/Postmark/DB credentials
+      (see docs/production-secret-management.md)
+    - ECR: container image registry (CI's existing docker-build job
+      would push here once authorized — not added this phase)
+    - CloudWatch Logs: destination for every service's stdout JSON logs
+      (see §12 below and docs/production-deployment-plan.md)
 ```
 
 **The API and worker remain independently deployable units — exactly
 as Phase 16 built them.** Nothing in this architecture runs blockchain
 watchers inside the API process; `watcher-boundary.guard.ts` continues
 to enforce that at the code level regardless of how deployment is
-configured.
+configured. Full network/ingress/egress detail:
+`docs/production-network-security.md` (new this phase, not duplicated
+here).
 
 ## 4. Networking
 
@@ -445,7 +645,19 @@ comment), never a `secrets.*` reference to anything real.
 | Backup failure signal | INTERNAL SIGNAL IMPLEMENTED (Phase 22) — `infra/backups/backup-metadata.jsonl` |
 | **External alerting sink** | **EXTERNAL ALERTING SINK REQUIRED — not connected, not invented.** Every signal above is real and queryable; none pages a human without a real vendor (CloudWatch/Datadog/whatever the chosen provider's own logging integrates with) actually wired to `MetricsService`'s interface. This is unchanged from Phase 13/16/22 — restated here as the deployment-readiness implication: **choosing a cloud provider in §2 does not, by itself, wire up alerting** — that is a separate integration step against whichever provider's monitoring product is chosen. |
 
-No external monitoring vendor is selected or assumed by this phase.
+No external monitoring vendor is selected or assumed by Phase 23.
+**Phase 24, optional recommendation only, not implemented or
+selected**: if the AWS recommendation above is authorized, the natural
+default sink for every "INTERNAL SIGNAL IMPLEMENTED" row is CloudWatch
+Logs (ECS's `awslogs` log driver ships each container's stdout —
+already structured JSON, no format change needed) with CloudWatch
+Alarms on log-based metric filters for the `CRITICAL`-severity/
+`*_failed`/`*_failures_total` signals already named in
+`docs/observability-and-alerting.md` §2. This is explicitly a
+recommendation to evaluate, not a vendor decision made by this
+document — a real production deployment could just as validly ship the
+same JSON logs to Datadog, Grafana Loki, or any other aggregator; no
+functionality here depends on CloudWatch specifically.
 
 ## 13. Security — reviewed, no gate weakened
 
@@ -554,9 +766,16 @@ session.
 
 ## 18. Unresolved decisions
 
-1. Which of AWS/GCP/Azure (§2) — a business decision, not made here.
-2. Container hosting product within the chosen provider (ECS vs. App
-   Runner; Cloud Run vs. GKE; Container Apps vs. AKS).
+1. Which of AWS/GCP/Azure (§2) — **Phase 24 adds a concrete
+   recommendation (AWS) with a verified, repository-specific
+   rationale** (see "Phase 24 — concrete recommendation" above), but
+   the actual selection/authorization remains the human operator's
+   decision, not made by this repository or this session.
+2. Container hosting product within the chosen provider — **for the
+   AWS recommendation, this is ECS Fargate** (see Phase 24 addendum);
+   still not authorized/provisioned. If Azure or GCP is chosen instead,
+   this reopens (App Runner vs. ECS is moot; Cloud Run vs. GKE;
+   Container Apps vs. AKS).
 3. Whether/when to enable the chosen provider's HA tier (§2's Multi-AZ/
    regional row) — a cost/RTO tradeoff, informed by
    `docs/production-database-readiness.md` §2's proposed (not yet
