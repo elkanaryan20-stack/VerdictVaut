@@ -1,0 +1,22 @@
+# DESIGNED, NOT APPLIED — EXAMPLE ONLY. See
+# environments/staging/terraform.tfvars.example for the full set of
+# caveats (not repeated here). Additionally: production must NEVER be
+# applied without the human approvals listed in docs/aws-production-architecture.md
+# and this phase's final report — region, account, go-live, and every
+# custody/compliance/email production credential decision remain
+# entirely outside this repository's authority.
+
+aws_region         = "us-east-1" # EXAMPLE ONLY — REQUIRES HUMAN APPROVAL
+availability_zones = ["us-east-1a", "us-east-1b"] # EXAMPLE ONLY
+
+db_instance_class = "REPLACE_WITH_A_REAL_MEASURED_SIZING_DECISION" # no default — docs/aws-disaster-recovery.md §1
+
+web_image    = "<account-id>.dkr.ecr.us-east-1.amazonaws.com/verdictvaut-web:REPLACE_WITH_COMMIT_SHA"
+api_image    = "<account-id>.dkr.ecr.us-east-1.amazonaws.com/verdictvaut-api:REPLACE_WITH_COMMIT_SHA"
+worker_image = "<account-id>.dkr.ecr.us-east-1.amazonaws.com/verdictvaut-worker:REPLACE_WITH_COMMIT_SHA"
+
+cors_allowed_origins = "https://app.example.com" # EXAMPLE ONLY — real production domain not chosen
+email_base_url       = "https://app.example.com"
+email_from_address   = "noreply@example.com" # must be a Postmark-verified sending domain (SPF/DKIM) before this can actually deliver mail
+
+# certificate_arn left unset — no domain/certificate exists yet.

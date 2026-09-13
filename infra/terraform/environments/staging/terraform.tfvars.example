@@ -1,0 +1,24 @@
+# DESIGNED, NOT APPLIED — EXAMPLE ONLY. Copy to terraform.tfvars and
+# fill in real values before ever running `terraform init`/`plan`
+# against a real backend — which this phase does not do. No value
+# below is real; every AWS-identifier-shaped string is a placeholder.
+#
+# terraform.tfvars itself should NOT be committed once it holds real
+# non-placeholder values for a real environment (add it to .gitignore
+# at that point) — this .example file is the only one meant to be
+# committed.
+
+aws_region          = "us-east-1" # EXAMPLE ONLY — see docs/aws-production-architecture.md §10, REQUIRES HUMAN APPROVAL
+availability_zones  = ["us-east-1a", "us-east-1b"] # EXAMPLE ONLY
+
+db_instance_class = "db.t4g.micro" # EXAMPLE ONLY — staging does not need production sizing; still not a measured value
+
+web_image    = "<account-id>.dkr.ecr.us-east-1.amazonaws.com/verdictvaut-web:REPLACE_WITH_COMMIT_SHA"
+api_image    = "<account-id>.dkr.ecr.us-east-1.amazonaws.com/verdictvaut-api:REPLACE_WITH_COMMIT_SHA"
+worker_image = "<account-id>.dkr.ecr.us-east-1.amazonaws.com/verdictvaut-worker:REPLACE_WITH_COMMIT_SHA"
+
+cors_allowed_origins = "https://staging.example.com" # EXAMPLE ONLY
+email_base_url       = "https://staging.example.com"
+email_from_address   = "noreply@staging.example.com"
+
+# certificate_arn left unset — no domain/certificate exists yet.

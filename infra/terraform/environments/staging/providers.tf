@@ -1,0 +1,24 @@
+# DESIGNED, NOT APPLIED. See infra/terraform/README.md.
+
+terraform {
+  required_version = ">= 1.5"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+
+  default_tags {
+    tags = {
+      Project     = "verdictvaut"
+      Environment = "staging"
+      ManagedBy   = "terraform"
+    }
+  }
+}
