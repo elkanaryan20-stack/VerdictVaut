@@ -65,5 +65,69 @@ describe("validateEnv", () => {
       expect(thrown!.message).toMatch(/production custody is not implemented/);
       expect(thrown!.message).not.toMatch(/sslmode/);
     });
+
+    describe("email (Phase 20)", () => {
+      it("reports the email blocker when EMAIL_PROVIDER is left at its 'none' default", () => {
+        expect(() =>
+          validateEnv(
+            baseConfig({
+              APP_ENVIRONMENT: "production",
+              DATABASE_URL: "postgresql://user:pass@prod-db.example.com:5432/app?sslmode=require",
+            }),
+          ),
+        ).toThrow(/EMAIL_PROVIDER=postmark/);
+      });
+
+      it("reports the email blocker when EMAIL_PROVIDER=postmark but POSTMARK_SERVER_TOKEN is missing", () => {
+        expect(() =>
+          validateEnv(
+            baseConfig({
+              APP_ENVIRONMENT: "production",
+              DATABASE_URL: "postgresql://user:pass@prod-db.example.com:5432/app?sslmode=require",
+              EMAIL_PROVIDER: "postmark",
+              EMAIL_FROM_ADDRESS: "noreply@verdictvaut.example",
+              EMAIL_BASE_URL: "https://app.verdictvaut.example",
+            }),
+          ),
+        ).toThrow(/POSTMARK_SERVER_TOKEN/);
+      });
+
+      it("reports the email blocker when EMAIL_BASE_URL is not a valid URL", () => {
+        expect(() =>
+          validateEnv(
+            baseConfig({
+              APP_ENVIRONMENT: "production",
+              DATABASE_URL: "postgresql://user:pass@prod-db.example.com:5432/app?sslmode=require",
+              EMAIL_PROVIDER: "postmark",
+              POSTMARK_SERVER_TOKEN: "real-server-token",
+              EMAIL_FROM_ADDRESS: "noreply@verdictvaut.example",
+              EMAIL_BASE_URL: "not-a-url",
+            }),
+          ),
+        ).toThrow(/EMAIL_BASE_URL to be a valid URL/);
+      });
+
+      it("does NOT report the email blocker when EMAIL_PROVIDER=postmark with all required fields present — only the (still-unresolved) custody blocker remains", () => {
+        let thrown: Error | undefined;
+        try {
+          validateEnv(
+            baseConfig({
+              APP_ENVIRONMENT: "production",
+              DATABASE_URL: "postgresql://user:pass@prod-db.example.com:5432/app?sslmode=verify-full",
+              EMAIL_PROVIDER: "postmark",
+              POSTMARK_SERVER_TOKEN: "real-server-token",
+              EMAIL_FROM_ADDRESS: "noreply@verdictvaut.example",
+              EMAIL_BASE_URL: "https://app.verdictvaut.example",
+            }),
+          );
+        } catch (error) {
+          thrown = error as Error;
+        }
+        expect(thrown).toBeDefined();
+        expect(thrown!.message).toMatch(/production custody is not implemented/);
+        expect(thrown!.message).not.toMatch(/EMAIL_PROVIDER=postmark/);
+        expect(thrown!.message).not.toMatch(/POSTMARK_SERVER_TOKEN/);
+      });
+    });
   });
 });

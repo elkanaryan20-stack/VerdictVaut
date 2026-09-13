@@ -53,6 +53,25 @@ export class AuthController {
     return this.authService.verifyEmail(dto.token);
   }
 
+  // Phase 20 — AUTHENTICATED (JwtAuthGuard only, no @Roles) rather than
+  // an unauthenticated "resend by email address" endpoint: see
+  // AuthService.resendVerificationEmail's own docblock for why this is
+  // both the safer and the architecturally consistent choice. No
+  // request body at all — it only ever acts on the caller's own
+  // account (@CurrentUser()), which is what makes email-enumeration
+  // structurally impossible here rather than something a generic
+  // response has to paper over. Always the same fixed response
+  // regardless of what actually happened (ACTIVE/SUSPENDED/genuinely
+  // pending) — see the service method for why.
+  @Post("resend-verification-email")
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  @Throttle(AUTH_THROTTLE)
+  async resendVerificationEmail(@CurrentUser() user: AuthenticatedUser) {
+    await this.authService.resendVerificationEmail(user.id);
+    return { message: "If your account requires verification, a new verification email has been sent." };
+  }
+
   @Post("logout")
   @HttpCode(HttpStatus.NO_CONTENT)
   @UseGuards(JwtAuthGuard)

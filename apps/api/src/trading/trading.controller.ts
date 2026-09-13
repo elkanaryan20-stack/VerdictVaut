@@ -3,6 +3,8 @@ import { Throttle } from "@nestjs/throttler";
 import { OrderStatus } from "@prisma/client";
 import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
+import { RequireActiveUser } from "../common/decorators/require-active-user.decorator";
+import { ActiveUserGuard } from "../common/guards/active-user.guard";
 import { TRADING_THROTTLE } from "../common/throttle-presets";
 import { CreateOrderDto } from "./dto/create-order.dto";
 import { FillsService } from "./fills/fills.service";
@@ -31,8 +33,13 @@ export class TradingController {
     private readonly fillsService: FillsService,
   ) {}
 
+  // Phase 20 security-gate remediation — the declarative, route-visible
+  // half of "an unverified account can never open a new position"; the
+  // pre-existing check inside OrdersService.create() itself remains as
+  // defense-in-depth (see ActiveUserGuard's own docblock).
   @Post("orders")
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, ActiveUserGuard)
+  @RequireActiveUser()
   @Throttle(TRADING_THROTTLE)
   async createOrder(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateOrderDto): Promise<OrderPlacementResponse> {
     try {
@@ -56,6 +63,11 @@ export class TradingController {
     return { ...summary, matchingDeferred: true };
   }
 
+  // Deliberately NOT @RequireActiveUser() — this only resumes matching
+  // for an order that already exists (which requires having been ACTIVE
+  // at creation time, since createOrder above is gated); it never
+  // creates new financial exposure a still-ACTIVE check would need to
+  // prevent (see Phase 20 security-gate audit).
   @Post("orders/:id/retry-matching")
   @UseGuards(JwtAuthGuard)
   @Throttle(TRADING_THROTTLE)
@@ -71,6 +83,11 @@ export class TradingController {
   // native bigint, which JSON.stringify cannot serialize at all (throws,
   // not just leaks); it's also an internal tie-breaker clients must never
   // read as an ordering signal (see Order.sequence's docblock).
+  // Deliberately NOT @RequireActiveUser() — cancellation only reduces
+  // existing exposure, never creates it; there is also no code path that
+  // ever moves an account from ACTIVE back to PENDING_VERIFICATION, so a
+  // non-ACTIVE user could never legitimately have an order to cancel in
+  // the first place (see Phase 20 security-gate audit).
   @Post("orders/:id/cancel")
   @UseGuards(JwtAuthGuard)
   @Throttle(TRADING_THROTTLE)

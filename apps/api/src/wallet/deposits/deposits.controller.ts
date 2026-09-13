@@ -2,6 +2,8 @@ import { Body, Controller, Get, Param, Post, Query, UseGuards } from "@nestjs/co
 import { IsString } from "class-validator";
 import { JwtAuthGuard } from "../../auth/guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../../common/decorators/current-user.decorator";
+import { RequireActiveUser } from "../../common/decorators/require-active-user.decorator";
+import { ActiveUserGuard } from "../../common/guards/active-user.guard";
 import { DepositAddressService } from "../addresses/deposit-address.service";
 import { DepositsService } from "./deposits.service";
 
@@ -35,7 +37,17 @@ export class DepositsController {
     return this.depositAddressService.listMine(user.id);
   }
 
+  // Phase 20 security-gate audit finding — this was the one wallet
+  // mutation with NO status check anywhere (unlike order creation and
+  // withdrawal requests, which already had an inline ACTIVE check
+  // inside their own services). Self-assigning a real deposit address
+  // is exactly the kind of "obtain the means to move real value"
+  // action the PENDING_VERIFICATION lifecycle is meant to gate — an
+  // unverified account should not be able to provision a real address
+  // to receive funds at any more than it can trade or withdraw them.
   @Post("addresses")
+  @UseGuards(ActiveUserGuard)
+  @RequireActiveUser()
   assignAddress(@CurrentUser() user: AuthenticatedUser, @Body() dto: AssignAddressDto) {
     return this.depositAddressService.getOrAssign(user.id, dto.assetSymbol, dto.networkCode);
   }

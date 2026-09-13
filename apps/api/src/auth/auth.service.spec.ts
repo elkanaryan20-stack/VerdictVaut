@@ -2,6 +2,7 @@ import { ConflictException, ForbiddenException, NotFoundException, UnauthorizedE
 import * as bcrypt from "bcryptjs";
 import { PrismaService } from "../prisma/prisma.service";
 import { AuditLogService } from "../audit/audit-log.service";
+import { EmailProvider } from "../email/email-provider.interface";
 import { AuthService } from "./auth.service";
 
 describe("AuthService", () => {
@@ -32,9 +33,14 @@ describe("AuthService", () => {
     config = {
       // Key-aware, unlike a bare mockReturnValue — register() now also
       // reads "nodeEnv" (to decide whether to include devVerificationToken
-      // in its response), distinct from the "jwt" config every other
-      // test here already relies on.
-      get: jest.fn((key: string) => (key === "nodeEnv" ? "test" : { accessSecret: "access-secret", refreshSecret: "refresh-secret", accessTtl: "15m", refreshTtl: "7d" })),
+      // in its response) and "email" (Phase 20 — to build the
+      // verification link's base URL), distinct from the "jwt" config
+      // every other test here already relies on.
+      get: jest.fn((key: string) => {
+        if (key === "nodeEnv") return "test";
+        if (key === "email") return { provider: "none", postmarkServerToken: "", fromAddress: "", baseUrl: "https://app.example.test" };
+        return { accessSecret: "access-secret", refreshSecret: "refresh-secret", accessTtl: "15m", refreshTtl: "7d" };
+      }),
     };
     auditLog = { record: jest.fn().mockResolvedValue({}) };
 
@@ -431,6 +437,147 @@ describe("AuthService", () => {
         data: { revokedAt: expect.any(Date) },
       });
       expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ actorId: "user-1", action: "user.session_revoke", resourceId: "session-1" }));
+    });
+  });
+
+  describe("verification email delivery (Phase 20)", () => {
+    let emailProvider: { sendVerificationEmail: jest.Mock };
+    let serviceWithEmail: AuthService;
+
+    beforeEach(() => {
+      emailProvider = { sendVerificationEmail: jest.fn().mockResolvedValue({ providerMessageId: "msg-1" }) };
+      serviceWithEmail = new AuthService(
+        prisma as unknown as PrismaService,
+        jwt as never,
+        config as never,
+        auditLog as unknown as AuditLogService,
+        emailProvider as unknown as EmailProvider,
+      );
+    });
+
+    it("register() calls the injected EmailProvider with the recipient and a verification URL built from EMAIL_BASE_URL", async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockImplementation(async ({ data }) => ({ id: "user-1", role: "USER", ...data }));
+      prisma.refreshToken.create.mockResolvedValue({});
+
+      await serviceWithEmail.register({ email: "new@example.com", password: "password1234" });
+
+      expect(emailProvider.sendVerificationEmail).toHaveBeenCalledWith({
+        to: "new@example.com",
+        verificationUrl: expect.stringContaining("https://app.example.test/verify-email?token="),
+      });
+    });
+
+    it("register() still succeeds and still returns tokens when the EmailProvider throws — registration is authoritative, delivery is not", async () => {
+      emailProvider.sendVerificationEmail.mockRejectedValue(new Error("provider unavailable"));
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockImplementation(async ({ data }) => ({ id: "user-1", role: "USER", ...data }));
+      prisma.refreshToken.create.mockResolvedValue({});
+
+      const result = await serviceWithEmail.register({ email: "new@example.com", password: "password1234" });
+
+      expect(result.accessToken).toBe("signed.jwt.token");
+      expect(result.devVerificationToken).toEqual(expect.any(String));
+    });
+
+    it("register() never lets an EmailProvider failure roll back or alter the created user's PENDING_VERIFICATION state", async () => {
+      emailProvider.sendVerificationEmail.mockRejectedValue(new Error("provider unavailable"));
+      prisma.user.findUnique.mockResolvedValue(null);
+      let createdData: Record<string, unknown> = {};
+      prisma.user.create.mockImplementation(async ({ data }) => {
+        createdData = data;
+        return { id: "user-1", role: "USER", ...data };
+      });
+      prisma.refreshToken.create.mockResolvedValue({});
+
+      await serviceWithEmail.register({ email: "new@example.com", password: "password1234" });
+
+      // create() was already called (and its result already committed by
+      // Prisma in a real DB) BEFORE the email send is even attempted —
+      // this asserts the ordering, not just the outcome.
+      expect(createdData.emailVerificationTokenHash).toEqual(expect.any(String));
+    });
+  });
+
+  describe("resendVerificationEmail (Phase 20)", () => {
+    let emailProvider: { sendVerificationEmail: jest.Mock };
+    let serviceWithEmail: AuthService;
+
+    beforeEach(() => {
+      emailProvider = { sendVerificationEmail: jest.fn().mockResolvedValue({ providerMessageId: "msg-1" }) };
+      serviceWithEmail = new AuthService(
+        prisma as unknown as PrismaService,
+        jwt as never,
+        config as never,
+        auditLog as unknown as AuditLogService,
+        emailProvider as unknown as EmailProvider,
+      );
+    });
+
+    it("issues a fresh token and sends a new email for a genuinely PENDING_VERIFICATION user", async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", status: "PENDING_VERIFICATION" });
+      prisma.user.updateMany.mockResolvedValue({ count: 1 });
+
+      await serviceWithEmail.resendVerificationEmail("user-1");
+
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: { id: "user-1", status: "PENDING_VERIFICATION" },
+        data: { emailVerificationTokenHash: expect.any(String), emailVerificationTokenExpiresAt: expect.any(Date) },
+      });
+      expect(emailProvider.sendVerificationEmail).toHaveBeenCalledWith({ to: "a@example.com", verificationUrl: expect.any(String) });
+      expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ actorId: "user-1", action: "user.verification_email_resend_requested" }));
+    });
+
+    it("replaces (invalidates) the previous token hash rather than creating a second valid one", async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", status: "PENDING_VERIFICATION", emailVerificationTokenHash: "old-hash-value" });
+      prisma.user.updateMany.mockResolvedValue({ count: 1 });
+
+      await serviceWithEmail.resendVerificationEmail("user-1");
+
+      const updateCall = prisma.user.updateMany.mock.calls[0][0];
+      expect(updateCall.data.emailVerificationTokenHash).not.toBe("old-hash-value");
+    });
+
+    it("is a safe no-op for an already-ACTIVE user — no token created, no email sent, no account-status leak", async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", status: "ACTIVE" });
+
+      await serviceWithEmail.resendVerificationEmail("user-1");
+
+      expect(prisma.user.updateMany).not.toHaveBeenCalled();
+      expect(emailProvider.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it("is a safe no-op for a SUSPENDED user", async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", status: "SUSPENDED" });
+
+      await serviceWithEmail.resendVerificationEmail("user-1");
+
+      expect(prisma.user.updateMany).not.toHaveBeenCalled();
+      expect(emailProvider.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it("is a safe no-op when the user no longer exists", async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      await expect(serviceWithEmail.resendVerificationEmail("gone")).resolves.toBeUndefined();
+      expect(emailProvider.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it("loses a concurrent race safely — updateMany matching zero rows never sends an email for a token that's already stale", async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", status: "PENDING_VERIFICATION" });
+      prisma.user.updateMany.mockResolvedValue({ count: 0 }); // lost the race (e.g. a concurrent verifyEmail() already landed)
+
+      await serviceWithEmail.resendVerificationEmail("user-1");
+
+      expect(emailProvider.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it("never throws back to the caller when the EmailProvider fails — the new token is still stored for a future attempt", async () => {
+      emailProvider.sendVerificationEmail.mockRejectedValue(new Error("provider unavailable"));
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", status: "PENDING_VERIFICATION" });
+      prisma.user.updateMany.mockResolvedValue({ count: 1 });
+
+      await expect(serviceWithEmail.resendVerificationEmail("user-1")).resolves.toBeUndefined();
+      expect(prisma.user.updateMany).toHaveBeenCalled();
     });
   });
 });

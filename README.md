@@ -158,6 +158,8 @@ integration tests against a real Postgres instance is a good next addition.
 | `BITCOIN_TESTNET_RPC_URL`, `ETHEREUM_SEPOLIA_RPC_URL`, `BASE_SEPOLIA_RPC_URL`, `SOLANA_DEVNET_RPC_URL`, `XRPL_TESTNET_RPC_URL` | Read-only RPC/explorer endpoints for the chain adapters/watchers. Optional — each has a working public sandbox/testnet default (see `rpc-config.service.ts`); set these to point at a credentialed provider (Infura/Alchemy/QuickNode/etc.) instead for anything beyond light development traffic |
 | `CHAIN_WATCHER_ENABLED` / `CHAIN_WATCHER_POLL_INTERVAL_MS` | Deposit-scanning background worker — `false` by default so importing the module (including every test run) never makes outbound network calls on its own |
 | `WITHDRAWAL_WATCHER_ENABLED` / `WITHDRAWAL_WATCHER_POLL_INTERVAL_MS` | Withdrawal-confirmation background worker — same off-by-default reasoning |
+| `EMAIL_PROVIDER` | `none` (default, no real email ever sent) or `postmark` — see [`docs/email-delivery.md`](docs/email-delivery.md) |
+| `POSTMARK_SERVER_TOKEN` / `EMAIL_FROM_ADDRESS` / `EMAIL_BASE_URL` | Required only when `EMAIL_PROVIDER=postmark`; production refuses to boot without all three |
 
 ### `apps/web/.env`
 

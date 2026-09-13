@@ -87,6 +87,25 @@ function runEnvChecks(env) {
       "empty means CORS fails closed (safe) but no browser client can call this API at all — likely a misconfiguration, not a deliberate choice",
     );
     check("ENABLE_DEV_FUNDING_TOOLS is not enabled in production", "P0", env.ENABLE_DEV_FUNDING_TOOLS !== "true", `ENABLE_DEV_FUNDING_TOOLS=${env.ENABLE_DEV_FUNDING_TOOLS ?? "(unset)"}`);
+
+    // Phase 20 — P1, not P0: a missing/misconfigured email provider
+    // means real users can never self-verify (a real launch blocker),
+    // but unlike custody/compliance it puts no funds at risk — the
+    // SUPER_ADMIN adminActivate escape hatch remains available
+    // regardless. env.validation.ts's own assertProductionEmailConfigured
+    // already refuses to let the process BOOT at all in this state; this
+    // is a duplicate, human-readable check for someone auditing
+    // configuration BEFORE attempting to deploy, following this
+    // script's own "verify before deploying" purpose (see file header).
+    const emailProviderOk = env.EMAIL_PROVIDER === "postmark" && Boolean(env.POSTMARK_SERVER_TOKEN) && Boolean(env.EMAIL_FROM_ADDRESS) && Boolean(env.EMAIL_BASE_URL);
+    check(
+      "Production email delivery (account verification) is configured",
+      "P1",
+      emailProviderOk,
+      emailProviderOk
+        ? "EMAIL_PROVIDER=postmark with POSTMARK_SERVER_TOKEN/EMAIL_FROM_ADDRESS/EMAIL_BASE_URL all set"
+        : `EMAIL_PROVIDER=${env.EMAIL_PROVIDER ?? "(unset, defaults to none)"} — the 'none' default (NoopEmailProvider) sends no real email; env.validation.ts independently refuses to boot production in this state, so this can never silently pass at real runtime either`,
+    );
   }
 
   check(

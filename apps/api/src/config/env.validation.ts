@@ -64,6 +64,70 @@ class EnvironmentVariables {
   @IsInt()
   @IsOptional()
   WORKER_HEARTBEAT_INTERVAL_MS: number = 15000;
+
+  // Phase 20 — "none" (the default) makes no real email send anywhere,
+  // including every test run. Selecting "postmark" without the three
+  // fields below is a real, checked configuration error, not silently
+  // tolerated — see the production-only blocker further down for the
+  // hardest form of that check.
+  @IsIn(["none", "postmark"])
+  @IsOptional()
+  EMAIL_PROVIDER: string = "none";
+
+  @IsString()
+  @IsOptional()
+  POSTMARK_SERVER_TOKEN: string = "";
+
+  @IsString()
+  @IsOptional()
+  EMAIL_FROM_ADDRESS: string = "";
+
+  // Deliberately just @IsString() here, not @IsUrl() — class-validator's
+  // @IsOptional() only exempts null/undefined, not this field's own ""
+  // default, so an @IsUrl() decorator would fail validation in every
+  // environment that leaves this unset (i.e. almost every dev/test run
+  // today). Real URL-shape checking happens once, in
+  // assertProductionEmailConfigured below, exactly when a value is
+  // actually required. This is never fetched by the server itself (it
+  // only ever appears inside an email body as a link a human clicks),
+  // so it carries no SSRF risk; the only real risk is an open-redirect/
+  // phishing-style link if this were ever attacker-influenced, which it
+  // cannot be — it is a fixed operator-set env var, never derived from
+  // request input (see docs/email-delivery.md's security section).
+  @IsString()
+  @IsOptional()
+  EMAIL_BASE_URL: string = "";
+}
+
+/**
+ * Phase 20 — belt-and-suspenders alongside PostmarkEmailProvider's own
+ * runtime behavior: production must never silently fall back to
+ * NoopEmailProvider just because required config is missing. Kept as a
+ * small standalone function (not inlined into validateEnv's blockers
+ * array) so it has its own name and can be unit-tested directly, the
+ * same reasoning assertDatabaseTlsConfigured already gets its own file.
+ */
+export function assertProductionEmailConfigured(env: { EMAIL_PROVIDER: string; POSTMARK_SERVER_TOKEN: string; EMAIL_FROM_ADDRESS: string; EMAIL_BASE_URL: string }): void {
+  if (env.EMAIL_PROVIDER !== "postmark") {
+    throw new Error(
+      "production requires EMAIL_PROVIDER=postmark — the default 'none' selects NoopEmailProvider, which sends no real email and must never be used in production.",
+    );
+  }
+  if (!env.POSTMARK_SERVER_TOKEN) {
+    throw new Error("production requires POSTMARK_SERVER_TOKEN to be set when EMAIL_PROVIDER=postmark.");
+  }
+  if (!env.EMAIL_FROM_ADDRESS) {
+    throw new Error("production requires EMAIL_FROM_ADDRESS to be set when EMAIL_PROVIDER=postmark.");
+  }
+  if (!env.EMAIL_BASE_URL) {
+    throw new Error("production requires EMAIL_BASE_URL to be set when EMAIL_PROVIDER=postmark (used to construct the verification link).");
+  }
+  try {
+    // eslint-disable-next-line no-new
+    new URL(env.EMAIL_BASE_URL);
+  } catch {
+    throw new Error(`production requires EMAIL_BASE_URL to be a valid URL — got "${env.EMAIL_BASE_URL}".`);
+  }
 }
 
 export function validateEnv(config: Record<string, unknown>) {
@@ -94,6 +158,12 @@ export function validateEnv(config: Record<string, unknown>) {
 
     try {
       assertDatabaseTlsConfigured(validated.DATABASE_URL, validated.APP_ENVIRONMENT);
+    } catch (error) {
+      blockers.push((error as Error).message);
+    }
+
+    try {
+      assertProductionEmailConfigured(validated);
     } catch (error) {
       blockers.push((error as Error).message);
     }

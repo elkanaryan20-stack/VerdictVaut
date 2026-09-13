@@ -1,7 +1,9 @@
 import {
   ConflictException,
   ForbiddenException,
+  Inject,
   Injectable,
+  Logger,
   NotFoundException,
   UnauthorizedException,
 } from "@nestjs/common";
@@ -12,6 +14,9 @@ import * as bcrypt from "bcryptjs";
 import * as crypto from "crypto";
 import { AuditLogService } from "../audit/audit-log.service";
 import { AppConfig } from "../config/configuration";
+import { EMAIL_PROVIDER, EmailProvider } from "../email/email-provider.interface";
+import { NoopEmailProvider } from "../email/noop-email.provider";
+import { LoggingMetricsService, MetricsService } from "../observability/metrics.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { ChangePasswordDto } from "./dto/change-password.dto";
 import { LoginDto } from "./dto/login.dto";
@@ -46,11 +51,22 @@ function hashToken(token: string): string {
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService<AppConfig, true>,
     private readonly auditLog: AuditLogService,
+    // Defaulted so every existing direct `new AuthService(prisma, jwt,
+    // config, auditLog)` call site (auth.service.spec.ts,
+    // login-throttle.integration-spec.ts, user-activation.integration-
+    // spec.ts) keeps working unchanged — real DI (AuthModule) always
+    // supplies the actual bound provider/metrics regardless of these
+    // defaults, same pattern as EllipticAddressRiskGate's own
+    // `metrics: MetricsService = new LoggingMetricsService()`.
+    @Inject(EMAIL_PROVIDER) private readonly emailProvider: EmailProvider = new NoopEmailProvider(),
+    private readonly metrics: MetricsService = new LoggingMetricsService(),
   ) {}
 
   /**
@@ -94,12 +110,109 @@ export class AuthService {
     });
     await this.auditLog.record({ actorId: user.id, actorType: AuditActorType.USER, action: "user.register", resourceType: "User", resourceId: user.id });
 
+    // Registration itself is authoritative and must not be blocked or
+    // rolled back by an email-delivery failure — see
+    // sendVerificationEmailSafely's own docblock for the full failure
+    // semantics. The user row above is already committed either way.
+    await this.sendVerificationEmailSafely(user, rawVerificationToken);
+
     const tokens = await this.issueTokenPair(user);
     const nodeEnv = this.config.get("nodeEnv", { infer: true });
     if (nodeEnv === "production") {
       return tokens;
     }
     return { ...tokens, devVerificationToken: rawVerificationToken };
+  }
+
+  /**
+   * Phase 20 — the self-service counterpart to register()'s own
+   * verification email, for a PENDING_VERIFICATION user whose original
+   * token expired, was lost, or never arrived. Deliberately
+   * AUTHENTICATED (called with the caller's own user id from a valid
+   * JWT — see AuthController) rather than an unauthenticated "resend by
+   * email address" endpoint: JwtStrategy issues a token regardless of
+   * status (only SUSPENDED blocks login itself — see login() above),
+   * and JwtAuthGuard alone (no @Roles) never re-checks DB status either
+   * (only RolesGuard does, for role-gated routes) — so a
+   * PENDING_VERIFICATION user can already reach any JwtAuthGuard-only
+   * route today, exactly like logout()/changePassword() above. Requiring
+   * authentication here means this endpoint can ONLY ever act on the
+   * calling user's own account, which eliminates the email-enumeration
+   * surface an unauthenticated "does this email exist" endpoint would
+   * otherwise need generic-response tricks to hide.
+   *
+   * ALWAYS returns the same shape regardless of what actually happened
+   * (already-ACTIVE, SUSPENDED, or genuinely PENDING_VERIFICATION) — the
+   * caller (AuthController) turns this into one fixed generic HTTP
+   * response, so account status is never distinguishable from the
+   * response alone.
+   *
+   * The token replacement itself is a single CAS-guarded updateMany
+   * scoped by `{id, status: PENDING_VERIFICATION}` — the same pattern
+   * verifyEmail() uses — so a concurrent verifyEmail() or a second
+   * concurrent resendVerificationEmail() call can never leave the row in
+   * an inconsistent state: whichever write actually lands, the OLD token
+   * hash is atomically replaced (never both an old and new hash valid at
+   * once — this column holds exactly one value).
+   */
+  async resendVerificationEmail(userId: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || user.status !== UserStatus.PENDING_VERIFICATION) {
+      // Not an error — ACTIVE/SUSPENDED/deleted all resolve to the same
+      // safe no-op, indistinguishable from the caller's point of view.
+      return;
+    }
+
+    const rawVerificationToken = crypto.randomBytes(32).toString("hex");
+    const result = await this.prisma.user.updateMany({
+      where: { id: userId, status: UserStatus.PENDING_VERIFICATION },
+      data: {
+        emailVerificationTokenHash: hashToken(rawVerificationToken),
+        emailVerificationTokenExpiresAt: new Date(Date.now() + EMAIL_VERIFICATION_TOKEN_TTL_MS),
+      },
+    });
+    if (result.count === 0) {
+      // Lost a race against a concurrent verifyEmail()/status change —
+      // safe no-op, same as the check above.
+      return;
+    }
+
+    await this.auditLog.record({ actorId: userId, actorType: AuditActorType.USER, action: "user.verification_email_resend_requested", resourceType: "User", resourceId: userId });
+    await this.sendVerificationEmailSafely(user, rawVerificationToken);
+  }
+
+  /**
+   * IMPORTANT FAILURE SEMANTICS (Phase 20): a provider failure here NEVER
+   * throws back to the caller. The user's row (created/updated by
+   * register()/resendVerificationEmail() immediately before this is
+   * called) is already committed either way — this only decides whether
+   * a real email attempt was made and logs/metrics the outcome. The user
+   * remains PENDING_VERIFICATION regardless; they are never activated by
+   * this method, and the SUPER_ADMIN adminActivate escape hatch (see
+   * UsersService) remains available exactly as before if delivery never
+   * succeeds. Never logs the raw token or the constructed verification
+   * URL (it embeds the token as a query parameter) — only the recipient
+   * address and a classified outcome.
+   */
+  private async sendVerificationEmailSafely(user: User, rawVerificationToken: string): Promise<void> {
+    const tags = { flow: "verification_email" };
+    this.metrics.increment("auth.verification_email.send_attempted", tags);
+    try {
+      const verificationUrl = this.buildVerificationUrl(rawVerificationToken);
+      const result = await this.emailProvider.sendVerificationEmail({ to: user.email, verificationUrl });
+      this.metrics.increment("auth.verification_email.send_accepted", tags);
+      this.logger.log({ event: "auth.verification_email.sent", userId: user.id, providerMessageId: result.providerMessageId });
+    } catch (error) {
+      this.metrics.increment("auth.verification_email.send_failed", tags);
+      this.logger.error(`Verification email send failed for user ${user.id}`, (error as Error).stack ?? String(error));
+      // Never claim delivery succeeded, never rethrow — see this
+      // method's own docblock.
+    }
+  }
+
+  private buildVerificationUrl(rawVerificationToken: string): string {
+    const baseUrl = this.config.get("email", { infer: true }).baseUrl;
+    return `${baseUrl}/verify-email?token=${encodeURIComponent(rawVerificationToken)}`;
   }
 
   /**

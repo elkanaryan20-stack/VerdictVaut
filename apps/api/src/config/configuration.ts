@@ -37,6 +37,19 @@ export interface AppConfig {
     heartbeatFile: string;
     heartbeatIntervalMs: number;
   };
+  // Phase 20 — account-verification email delivery. "none" (the
+  // default) selects NoopEmailProvider: no real email is ever sent, and
+  // no POSTMARK_SERVER_TOKEN/EMAIL_FROM_ADDRESS/EMAIL_BASE_URL value is
+  // required. "postmark" selects the real PostmarkEmailProvider — see
+  // email/email-provider.factory.ts. Production additionally requires
+  // "postmark" with all three values present (env.validation.ts) — the
+  // no-op provider must never be silently selected in production.
+  email: {
+    provider: "none" | "postmark";
+    postmarkServerToken: string;
+    fromAddress: string;
+    baseUrl: string;
+  };
 }
 
 export default (): AppConfig => ({
@@ -72,5 +85,11 @@ export default (): AppConfig => ({
   worker: {
     heartbeatFile: process.env.WORKER_HEARTBEAT_FILE ?? "/tmp/verdictvaut-worker-heartbeat",
     heartbeatIntervalMs: parseInt(process.env.WORKER_HEARTBEAT_INTERVAL_MS ?? "15000", 10),
+  },
+  email: {
+    provider: (process.env.EMAIL_PROVIDER as "none" | "postmark") ?? "none",
+    postmarkServerToken: process.env.POSTMARK_SERVER_TOKEN ?? "",
+    fromAddress: process.env.EMAIL_FROM_ADDRESS ?? "",
+    baseUrl: process.env.EMAIL_BASE_URL ?? "",
   },
 });
