@@ -20,6 +20,22 @@ interface AuthContextValue {
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+  /**
+   * Phase 21 — re-fetches GET /users/me and updates the cached user.
+   * Called after a successful /verify-email submission so a session
+   * already open in this browser reflects the new ACTIVE status
+   * immediately, with no forced logout/login cycle (the existing access
+   * token remains valid and usable throughout — see AuthService's own
+   * docblock on why status is never encoded in the JWT itself).
+   */
+  refreshUser: () => Promise<void>;
+  /**
+   * Phase 21 — thin wrapper over the existing authenticated
+   * POST /auth/resend-verification-email (Phase 20). No email-address
+   * argument by design: the endpoint only ever acts on the caller's own
+   * account, identified by the bearer token apiFetch already attaches.
+   */
+  resendVerificationEmail: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -89,7 +105,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setStatus("unauthenticated");
   }, []);
 
-  const value = useMemo(() => ({ status, user, login, register, logout }), [status, user, login, register, logout]);
+  const refreshUser = useCallback(async () => {
+    await loadCurrentUser();
+  }, [loadCurrentUser]);
+
+  const resendVerificationEmail = useCallback(async () => {
+    await apiFetch("/auth/resend-verification-email", { method: "POST" });
+  }, []);
+
+  const value = useMemo(
+    () => ({ status, user, login, register, logout, refreshUser, resendVerificationEmail }),
+    [status, user, login, register, logout, refreshUser, resendVerificationEmail],
+  );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

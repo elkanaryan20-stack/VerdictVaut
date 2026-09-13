@@ -68,4 +68,29 @@ describe("AuthGuard", () => {
     );
     expect(screen.getByText("Restricted admin data")).toBeInTheDocument();
   });
+
+  it("shows the pending-verification banner ABOVE children (never blocking them) for a PENDING_VERIFICATION user — Phase 21", () => {
+    mockedUseAuth.mockReturnValue({
+      status: "authenticated",
+      user: { id: "u1", email: "a@b.com", role: "USER", status: "PENDING_VERIFICATION" },
+      resendVerificationEmail: jest.fn(),
+    });
+    render(
+      <AuthGuard>
+        <div>Wallet balances</div>
+      </AuthGuard>,
+    );
+    expect(screen.getByText(/verify your email/i)).toBeInTheDocument();
+    expect(screen.getByText("Wallet balances")).toBeInTheDocument();
+  });
+
+  it("shows no verification banner for an already-ACTIVE user", () => {
+    mockedUseAuth.mockReturnValue({ status: "authenticated", user: { id: "u1", email: "a@b.com", role: "USER", status: "ACTIVE" } });
+    render(
+      <AuthGuard>
+        <div>Wallet balances</div>
+      </AuthGuard>,
+    );
+    expect(screen.queryByText(/verify your email/i)).not.toBeInTheDocument();
+  });
 });

@@ -191,13 +191,50 @@ here for anyone reading only this doc.)
   `test/integration/resend-verification-email.integration-spec.ts` for
   the real-Postgres concurrent-request proof.
 
-## 9. Known limitation — no corresponding frontend page yet
+## 9. Frontend — the `/verify-email` page (Phase 21)
 
-`EMAIL_BASE_URL + "/verify-email?token=..."` assumes a web page at that
-route that reads the `token` query parameter and calls `POST
-/auth/verify-email`. No such page exists in `apps/web` as of this
-phase — building it was out of this (backend-only) phase's scope. This
-is not a new gap introduced by Phase 20: the same link shape was already
-implied by `devVerificationToken`'s existence since Phase 18/19; Phase
-20 only makes it externally visible via a real email a real user could
-receive.
+`EMAIL_BASE_URL + "/verify-email?token=..."` now resolves to a real
+page: `apps/web/app/verify-email/`. It is a **public** route (no
+`AuthGuard`) since `POST /auth/verify-email` itself carries no auth
+guard on the backend — the token is the credential, and the person
+opening the link may not have any session in this browser at all (a
+different device than the one they registered from).
+
+- Reads `token` from the URL exactly once (captured into local React
+  state before the URL is ever rewritten), POSTs it to the real,
+  unmodified `POST /auth/verify-email`, and shows one of: verifying,
+  success, invalid/expired (one generic message for wrong/expired/
+  already-used, matching the backend's own deliberate anti-oracle
+  design — see `AuthService.verifyEmail`'s docblock), missing-token
+  (no API call made at all), or a network/server failure with a manual
+  (never automatic) retry.
+- On success, calls the existing `AuthContext.refreshUser()` (a thin
+  wrapper over the existing `GET /users/me` re-fetch) so a session
+  already open in this same browser reflects `ACTIVE` immediately —
+  the existing access token remains valid and usable throughout; no
+  forced logout/login cycle. If there's no session in this browser,
+  this is a harmless no-op.
+- The raw token is never logged, never sent anywhere but that one POST
+  body, and is stripped from the URL/browser history via
+  `router.replace("/verify-email")` once the attempt finishes.
+- The "continue" destination after success is always a fixed internal
+  route (`/wallet` if a session exists, `/login` otherwise) — never
+  derived from the token or any query parameter, so this can never
+  become an open redirect.
+
+**Resend UX**: `PendingVerificationBanner`
+(`apps/web/components/auth/`), rendered by the existing `AuthGuard` for
+any authenticated `PENDING_VERIFICATION` user, on every route it already
+wraps. Informational only — it never blocks reads or navigation; the
+backend's own `ActiveUserGuard`/service-level checks (Phase 20) remain
+the actual boundary for trading, withdrawals, and deposit-address
+assignment. No email-address input (matching the backend endpoint),
+no automatic resend on mount, and the button disables itself
+immediately after one send.
+
+**Not built this phase, still real gaps**: a real Postmark sandbox/
+test-token smoke test (same "never provisioned" status as Fireblocks/
+Elliptic — see `docs/fireblocks-sandbox-smoke-test.md`); the frontend
+verification flow does not and cannot bypass backend authorization —
+every restriction a `PENDING_VERIFICATION` user experiences is enforced
+server-side regardless of what this page shows.

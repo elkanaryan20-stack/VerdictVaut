@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { useAuth, CurrentUser } from "../../lib/auth/auth-context";
+import { PendingVerificationBanner } from "../auth/PendingVerificationBanner";
 
 export interface AuthGuardProps {
   children: React.ReactNode;
@@ -65,5 +66,17 @@ export function AuthGuard({ children, allow }: AuthGuardProps) {
     );
   }
 
-  return <>{children}</>;
+  // Phase 21 — informational only, never blocking: the backend's own
+  // ActiveUserGuard/OrdersService/WithdrawalsService checks (Phase 20)
+  // are the real boundary for trading/withdrawals/deposit-address
+  // mutations. This just makes the restriction visible and gives a
+  // PENDING_VERIFICATION user the one thing they need to get past it —
+  // reads, navigation, and every other authenticated route remain fully
+  // usable underneath.
+  return (
+    <>
+      {user?.status === "PENDING_VERIFICATION" && <PendingVerificationBanner />}
+      {children}
+    </>
+  );
 }
