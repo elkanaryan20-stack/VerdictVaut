@@ -309,6 +309,24 @@ function runStructuralChecks() {
     ciWorkflowSource && /docker build/.test(ciWorkflowSource) ? "docker-build job found in ci.yml" : "no Docker build validation found in CI — Dockerfiles could silently rot",
   );
 
+  // Phase 23 — a real, structural fact (does a decision document exist),
+  // never a claim that infrastructure is actually provisioned. Kept P1
+  // (blocks launch, not financial activity itself) — the same severity
+  // reasoning as Phase 22's own managed-backup check: nothing here can
+  // put funds at risk, but a real production launch cannot proceed
+  // without a real, chosen deployment target for the containers/database
+  // this repository already builds.
+  const infraDecisionDocExists = fs.existsSync(path.join(__dirname, "..", "..", "..", "docs", "production-infrastructure-decision.md"));
+  check(
+    "A production cloud provider and deployment architecture has been decided",
+    "P1",
+    false,
+    infraDecisionDocExists
+      ? "docs/production-infrastructure-decision.md documents a RECOMMENDATION and a provider comparison — no provider has actually been selected/provisioned yet; this check can only ever go green once a real choice is made and reflected there, never merely because the document exists"
+      : "no production-infrastructure decision document exists",
+    "NOT CONFIGURED",
+  );
+
   return results;
 }
 
