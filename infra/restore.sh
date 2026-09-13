@@ -16,12 +16,51 @@ set -euo pipefail
 DUMP_FILE="${1:?Usage: restore.sh <dump-file> [target_db_name]}"
 CONTAINER_NAME="${CONTAINER_NAME:-verdictvaut-postgres}"
 POSTGRES_USER="${POSTGRES_USER:-verdictvaut}"
+# The name of the LIVE database this container actually serves — the one
+# safeguard below explicitly refuses to restore over, regardless of
+# whatever target name is passed in. Never assume the caller got this
+# right; ask explicitly.
+ACTIVE_DB="${POSTGRES_DB:-verdictvaut}"
 TARGET_DB="${2:-verdictvaut_restore_$(date -u +%Y%m%dT%H%M%SZ)}"
 
 if [ ! -f "$DUMP_FILE" ]; then
   echo "ERROR: dump file not found: $DUMP_FILE" >&2
   exit 1
 fi
+
+# Phase 22 — refuse outright if the target name is (or looks like) the
+# live database. createdb below would already fail if TARGET_DB exists,
+# but that failure mode is generic and easy to work around by accident
+# (e.g. a typo'd target that happens to match). This check exists
+# specifically so restoring OVER the active production/staging database
+# is never one flag away — an operator must explicitly choose a new,
+# disposable name every time.
+if [ "$TARGET_DB" = "$ACTIVE_DB" ]; then
+  echo "REFUSING: target database name '$TARGET_DB' matches the configured ACTIVE database (POSTGRES_DB=$ACTIVE_DB)." >&2
+  echo "This script only ever restores into a NEW, disposable database — pass a different target_db_name." >&2
+  exit 1
+fi
+
+# Phase 22 — verify the backup's own checksum (written by backup.sh)
+# before spending time restoring a possibly-corrupted/truncated dump.
+# Missing checksum file is a WARNING, not a hard failure (an operator
+# may be restoring an older backup taken before this feature existed, or
+# a dump obtained by some other means) — but a checksum that exists and
+# does NOT match is always a hard failure; never restore data that
+# fails its own integrity check.
+checksum_file="${DUMP_FILE}.sha256"
+if [ -f "$checksum_file" ]; then
+  dump_dir="$(dirname "$DUMP_FILE")"
+  if (cd "$dump_dir" && sha256sum -c "$(basename "$checksum_file")") >/dev/null 2>&1; then
+    echo "Checksum verified: $DUMP_FILE matches $checksum_file."
+  else
+    echo "ERROR: checksum verification FAILED for $DUMP_FILE — the file may be corrupted or truncated. Refusing to restore." >&2
+    exit 1
+  fi
+else
+  echo "WARNING: no checksum file found at $checksum_file — proceeding without integrity verification (this dump predates the checksum feature, or was obtained by another means)." >&2
+fi
+
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   echo "ERROR: container '$CONTAINER_NAME' is not running." >&2
   exit 1

@@ -96,6 +96,40 @@ async function runIntegrityChecks(prisma) {
     `${resolvedMarketsWithCollateral.length} market(s) with leftover/negative collateral`,
   );
 
+  // 8. Withdrawal state consistency (Phase 22) — independently audits the
+  // SAME invariant "withdrawals_broadcast_requires_txhash_check" (Phase
+  // 9) already enforces at write time: a withdrawal can never be
+  // BROADCAST/CONFIRMING/CONFIRMED/CREDITED with no real txHash on
+  // record. A live DB CHECK constraint only protects writes made AFTER
+  // the constraint existed — this catches the same violation in data
+  // that predates it, e.g. a restore from an older schema version.
+  const badWithdrawals = await prisma.$queryRaw`
+    SELECT id FROM "withdrawals"
+    WHERE status IN ('BROADCAST', 'CONFIRMING', 'CONFIRMED', 'CREDITED') AND "txHash" IS NULL
+  `;
+  check(
+    "every BROADCAST/CONFIRMING/CONFIRMED/CREDITED withdrawal has a real txHash",
+    badWithdrawals.length === 0,
+    `${badWithdrawals.length} violation(s)`,
+  );
+
+  // 9. Reconciliation discrepancy resolution consistency (Phase 22) —
+  // independently audits "reconciliation_discrepancies_resolution_
+  // consistency_check" (Phase 12A): a RESOLVED/FALSE_POSITIVE row must
+  // carry who/when closed it; an OPEN/ACKNOWLEDGED row must not. Same
+  // "pre-existing-data" reasoning as check 8 — this is a read-only audit,
+  // never a repair; a violation here is reported, never silently fixed.
+  const badDiscrepancies = await prisma.$queryRaw`
+    SELECT id FROM "reconciliation_discrepancies"
+    WHERE (status IN ('RESOLVED', 'FALSE_POSITIVE') AND ("resolvedAt" IS NULL OR "resolvedByUserId" IS NULL))
+       OR (status IN ('OPEN', 'ACKNOWLEDGED') AND ("resolvedAt" IS NOT NULL OR "resolvedByUserId" IS NOT NULL))
+  `;
+  check(
+    "every ReconciliationDiscrepancy's resolution fields are consistent with its status",
+    badDiscrepancies.length === 0,
+    `${badDiscrepancies.length} violation(s)`,
+  );
+
   return results;
 }
 

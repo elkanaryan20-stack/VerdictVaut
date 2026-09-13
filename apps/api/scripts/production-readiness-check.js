@@ -36,8 +36,15 @@ function readSourceFile(relativePath) {
 /** Environment/config checks — no DB, no compiled app required. */
 function runEnvChecks(env) {
   const results = [];
-  const check = (label, severity, passed, detail) => {
-    results.push({ label, severity, passed, detail });
+  const check = (label, severity, passed, detail, status) => {
+    // Phase 22 — `status` lets a caller report a more precise state than
+    // the boolean `passed` alone can (e.g. "NOT CONFIGURED" for
+    // infrastructure that was never decided, distinct from "FAIL" for
+    // something that was attempted and is actually broken). Defaults to
+    // the boolean-derived PASS/FAIL for every pre-existing call site —
+    // this is additive, not a behavior change for callers that don't
+    // pass it.
+    results.push({ label, severity, passed, detail, status: status ?? (passed ? "PASS" : "FAIL") });
     return passed;
   };
 
@@ -126,8 +133,15 @@ function runEnvChecks(env) {
  */
 function runStructuralChecks() {
   const results = [];
-  const check = (label, severity, passed, detail) => {
-    results.push({ label, severity, passed, detail });
+  const check = (label, severity, passed, detail, status) => {
+    // Phase 22 — `status` lets a caller report a more precise state than
+    // the boolean `passed` alone can (e.g. "NOT CONFIGURED" for
+    // infrastructure that was never decided, distinct from "FAIL" for
+    // something that was attempted and is actually broken). Defaults to
+    // the boolean-derived PASS/FAIL for every pre-existing call site —
+    // this is additive, not a behavior change for callers that don't
+    // pass it.
+    results.push({ label, severity, passed, detail, status: status ?? (passed ? "PASS" : "FAIL") });
     return passed;
   };
 
@@ -179,11 +193,32 @@ function runStructuralChecks() {
     "no automated test/build/deploy pipeline exists yet — see .github/workflows",
   );
 
+  // Phase 22 — split what used to be one always-false check into two
+  // honest, distinctly-labeled ones: local backup/restore TOOLING is
+  // real and genuinely passes (see docs/database-backup-recovery.md §6
+  // / docs/production-database-readiness.md's restore-drill result) —
+  // that deserves an actual PASS, not being permanently lumped in with
+  // "no managed production infrastructure exists," which is a real,
+  // separate, still-unresolved gap and must never be reported as
+  // "backup enabled" just because local tooling exists.
+  const backupScriptsExist =
+    fs.existsSync(path.join(__dirname, "..", "..", "..", "infra", "backup.sh")) &&
+    fs.existsSync(path.join(__dirname, "..", "..", "..", "infra", "restore.sh")) &&
+    fs.existsSync(path.join(__dirname, "backup-restore-drill.js"));
   check(
-    "Production-grade backup infrastructure (managed provider, WAL/PITR, off-site storage) is decided and provisioned",
+    "Local backup/restore tooling exists and a restore drill is runnable",
+    "P2",
+    backupScriptsExist,
+    backupScriptsExist
+      ? "infra/backup.sh, infra/restore.sh, and scripts/backup-restore-drill.js all exist — see docs/production-database-readiness.md for the drill's actual last-run result"
+      : "local backup/restore tooling is missing",
+  );
+  check(
+    "Managed production backup infrastructure (automated backups, WAL/PITR, off-site encrypted storage) is decided and provisioned",
     "P1",
     false,
-    "infra/backup.sh + a passing restore drill exist and are real, but no managed-provider/self-hosted HA strategy, WAL archiving, or off-site encrypted storage is chosen yet — see docs/database-backup-recovery.md",
+    "no managed provider or self-hosted HA/WAL-archiving strategy has been chosen anywhere in this repository — local pg_dump-based tooling above is real but is not a substitute for this. See docs/production-database-readiness.md §2/§3.",
+    "NOT CONFIGURED",
   );
 
   const authServiceSource = readSourceFile("src/auth/auth.service.ts");
@@ -282,8 +317,15 @@ async function runDbChecks() {
   const { PrismaClient } = require("@prisma/client");
   const prisma = new PrismaClient();
   const results = [];
-  const check = (label, severity, passed, detail) => {
-    results.push({ label, severity, passed, detail });
+  const check = (label, severity, passed, detail, status) => {
+    // Phase 22 — `status` lets a caller report a more precise state than
+    // the boolean `passed` alone can (e.g. "NOT CONFIGURED" for
+    // infrastructure that was never decided, distinct from "FAIL" for
+    // something that was attempted and is actually broken). Defaults to
+    // the boolean-derived PASS/FAIL for every pre-existing call site —
+    // this is additive, not a behavior change for callers that don't
+    // pass it.
+    results.push({ label, severity, passed, detail, status: status ?? (passed ? "PASS" : "FAIL") });
     return passed;
   };
 
@@ -332,7 +374,7 @@ async function main() {
   }
 
   for (const r of allResults) {
-    console.log(`  [${r.passed ? "PASS" : "FAIL"}] (${r.severity}) ${r.label}${r.detail ? " — " + r.detail : ""}`);
+    console.log(`  [${r.status ?? (r.passed ? "PASS" : "FAIL")}] (${r.severity}) ${r.label}${r.detail ? " — " + r.detail : ""}`);
   }
 
   const p0Failures = allResults.filter((r) => !r.passed && r.severity === "P0");

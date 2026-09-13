@@ -9,7 +9,7 @@ import { DepositsController } from "../../src/wallet/deposits/deposits.controlle
 import { TradingController } from "../../src/trading/trading.controller";
 import { WithdrawalsController } from "../../src/wallet/withdrawals/withdrawals.controller";
 import { UsersService } from "../../src/users/users.service";
-import { auditLog, depositAddressService, ordersService, prisma, withdrawalsService } from "./helpers";
+import { auditLog, depositAddressService, getAssetNetwork, ordersService, prisma, provisionAddress, withdrawalsService } from "./helpers";
 
 const TEST_ACCESS_SECRET = "test-access-secret";
 
@@ -111,6 +111,15 @@ describe("PENDING_VERIFICATION lifecycle — real registration flow, real guards
     await expect(
       guard.canActivate(makeGuardContext(DepositsController.prototype.assignAddress, DepositsController, userId)),
     ).rejects.toThrow(ForbiddenException);
+    // Provisions its own address rather than relying on some other test
+    // file to have incidentally left one available in the shared pool —
+    // this assertion is about the SERVICE layer never blocking on
+    // status, not about deposit-address-pool availability, which is a
+    // distinct concern already covered by deposit-address-pool.
+    // integration-spec.ts's own tests.
+    const addressMarker = `${Date.now()}-${Math.random()}`;
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+    await provisionAddress(assetNetwork.id, `0xpendingLifecycle${addressMarker}`);
     await expect(depositAddressService.getOrAssign(userId, "USDC", "ethereum-sepolia")).resolves.toBeDefined(); // service layer alone never blocked this — the guard is load-bearing here
   });
 
