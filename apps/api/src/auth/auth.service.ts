@@ -7,7 +7,7 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
-import { AuditActorType, User } from "@prisma/client";
+import { AuditActorType, User, UserStatus } from "@prisma/client";
 import * as bcrypt from "bcryptjs";
 import * as crypto from "crypto";
 import { AuditLogService } from "../audit/audit-log.service";
@@ -20,9 +20,24 @@ import { computeLockDurationMs, isCurrentlyLocked } from "./login-throttle.util"
 
 const PASSWORD_SALT_ROUNDS = 12;
 
+// How long a freshly-issued email-verification token remains valid.
+// Generous relative to how long checking an inbox actually takes —
+// there is currently no "resend" endpoint, so a token that expired too
+// aggressively would strand a slow-to-verify user with no self-service
+// way to recover (they'd need SUPER_ADMIN's adminActivate as the only
+// way out — see UsersService).
+const EMAIL_VERIFICATION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+
 export interface TokenPair {
   accessToken: string;
   refreshToken: string;
+}
+
+// Phase 18 remediation — returned ONLY outside production (see
+// register()'s own docblock). Never a real field a production client
+// should ever see or rely on.
+export interface TokenPairWithDevVerification extends TokenPair {
+  devVerificationToken?: string;
 }
 
 function hashToken(token: string): string {
@@ -38,19 +53,106 @@ export class AuthService {
     private readonly auditLog: AuditLogService,
   ) {}
 
-  async register(dto: RegisterDto): Promise<TokenPair> {
+  /**
+   * Phase 18 remediation — every new user starts PENDING_VERIFICATION
+   * (the schema default) and now genuinely CAN leave that state: a real,
+   * single-use, 24h-expiring verification token is generated here (only
+   * its SHA-256 hash is stored — same pattern as RefreshToken.tokenHash)
+   * and consumed by verifyEmail() below.
+   *
+   * This codebase has no email-sending integration yet (no SMTP/provider
+   * is configured anywhere), so there is currently no real channel to
+   * deliver the raw token to a production user — exactly the same
+   * "real mechanism, missing the final delivery integration" situation
+   * as ProductionCustodyExecutor's own placeholder. Rather than block
+   * registration entirely on an unbuilt integration, or silently mark
+   * everyone verified (which would defeat the point), the raw token is
+   * returned directly in this response ONLY when NODE_ENV !== "production"
+   * — belt-and-suspenders, the same pattern configuration.ts already
+   * uses for devFundingToolsEnabled: gated on the real NODE_ENV, not a
+   * separate flag that could be misconfigured on independently. A real
+   * production deployment needs either a real email-sending integration
+   * wired in here, or to rely on SUPER_ADMIN's adminActivate escape
+   * hatch (see UsersService) until one exists — never a change to this
+   * gate itself.
+   */
+  async register(dto: RegisterDto): Promise<TokenPairWithDevVerification> {
     const existing = await this.prisma.user.findUnique({ where: { email: dto.email } });
     if (existing) {
       throw new ConflictException("Email is already registered");
     }
 
     const passwordHash = await bcrypt.hash(dto.password, PASSWORD_SALT_ROUNDS);
+    const rawVerificationToken = crypto.randomBytes(32).toString("hex");
     const user = await this.prisma.user.create({
-      data: { email: dto.email, passwordHash },
+      data: {
+        email: dto.email,
+        passwordHash,
+        emailVerificationTokenHash: hashToken(rawVerificationToken),
+        emailVerificationTokenExpiresAt: new Date(Date.now() + EMAIL_VERIFICATION_TOKEN_TTL_MS),
+      },
     });
     await this.auditLog.record({ actorId: user.id, actorType: AuditActorType.USER, action: "user.register", resourceType: "User", resourceId: user.id });
 
-    return this.issueTokenPair(user);
+    const tokens = await this.issueTokenPair(user);
+    const nodeEnv = this.config.get("nodeEnv", { infer: true });
+    if (nodeEnv === "production") {
+      return tokens;
+    }
+    return { ...tokens, devVerificationToken: rawVerificationToken };
+  }
+
+  /**
+   * The self-service half of the activation lifecycle — consumes the
+   * token register() issued. Deliberately the SAME generic error for
+   * "wrong token", "expired token", and "already-used token": no
+   * response here should let a caller distinguish those (a distinct
+   * "already used" response would confirm a guessed/stale token once
+   * belonged to a real, now-verified account — the same enumeration-
+   * safety reasoning login() already applies to its own error messages).
+   *
+   * The transition itself is a single CAS-guarded updateMany (matching
+   * this codebase's standard idempotent-mutation pattern — see
+   * WithdrawalsService.recordConfirmation) scoped by the token hash AND
+   * status=PENDING_VERIFICATION together, so two concurrent submissions
+   * of the same valid token can only ever both succeed at match=1 for
+   * one of them; the loser's updateMany matches zero rows and gets the
+   * same generic rejection, never a partial/duplicate transition.
+   */
+  async verifyEmail(rawToken: string): Promise<{ status: UserStatus }> {
+    const tokenHash = hashToken(rawToken);
+    const candidate = await this.prisma.user.findFirst({
+      where: { emailVerificationTokenHash: tokenHash, status: UserStatus.PENDING_VERIFICATION },
+    });
+
+    if (!candidate || !candidate.emailVerificationTokenExpiresAt || candidate.emailVerificationTokenExpiresAt < new Date()) {
+      throw new UnauthorizedException("Invalid or expired verification token");
+    }
+
+    const result = await this.prisma.user.updateMany({
+      where: { id: candidate.id, emailVerificationTokenHash: tokenHash, status: UserStatus.PENDING_VERIFICATION },
+      data: {
+        status: UserStatus.ACTIVE,
+        emailVerifiedAt: new Date(),
+        emailVerificationTokenHash: null,
+        emailVerificationTokenExpiresAt: null,
+      },
+    });
+    if (result.count === 0) {
+      throw new UnauthorizedException("Invalid or expired verification token");
+    }
+
+    await this.auditLog.record({
+      actorId: candidate.id,
+      actorType: AuditActorType.USER,
+      action: "user.email_verified",
+      resourceType: "User",
+      resourceId: candidate.id,
+      before: { status: "PENDING_VERIFICATION" },
+      after: { status: "ACTIVE" },
+    });
+
+    return { status: UserStatus.ACTIVE };
   }
 
   async login(dto: LoginDto): Promise<TokenPair> {

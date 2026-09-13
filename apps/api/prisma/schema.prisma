@@ -310,6 +310,22 @@ model User {
   role         UserRole   @default(USER)
   status       UserStatus @default(PENDING_VERIFICATION)
   totpSecret   String?
+  // Phase 18 remediation — the real (email-ownership) verification
+  // mechanism that moves a user PENDING_VERIFICATION -> ACTIVE. Only
+  // the SHA-256 hash of the raw token is ever stored (same pattern as
+  // RefreshToken.tokenHash) — the raw value exists only transiently in
+  // memory and in the response returned at registration time (see
+  // AuthService.register's own docblock on environment-gating that).
+  // Single-use: AuthService.verifyEmail clears both columns on success,
+  // so a captured/replayed token can never be consumed twice.
+  // emailVerifiedAt is set ONLY by genuine self-service verification —
+  // an admin-driven activation (UsersService.adminActivate) deliberately
+  // leaves it null, so "was this email actually proven, or did an admin
+  // override it" stays a real, auditable distinction rather than being
+  // collapsed into one ambiguous timestamp.
+  emailVerificationTokenHash      String?
+  emailVerificationTokenExpiresAt DateTime?
+  emailVerifiedAt                 DateTime?
   // Phase 13 remediation — bounded, auto-expiring login throttle (see
   // login-throttle.util.ts). Never a permanent lockout requiring manual
   // admin unlock: lockedUntil always expires on its own, and a

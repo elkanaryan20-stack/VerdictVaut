@@ -7,7 +7,7 @@ import { AuthService } from "./auth.service";
 describe("AuthService", () => {
   let service: AuthService;
   let prisma: {
-    user: { findUnique: jest.Mock; findUniqueOrThrow: jest.Mock; create: jest.Mock; update: jest.Mock };
+    user: { findUnique: jest.Mock; findUniqueOrThrow: jest.Mock; findFirst: jest.Mock; create: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
     refreshToken: { findFirst: jest.Mock; create: jest.Mock; update: jest.Mock; updateMany: jest.Mock; findMany: jest.Mock };
   };
   let jwt: { signAsync: jest.Mock; verifyAsync: jest.Mock };
@@ -16,7 +16,7 @@ describe("AuthService", () => {
 
   beforeEach(() => {
     prisma = {
-      user: { findUnique: jest.fn(), findUniqueOrThrow: jest.fn(), create: jest.fn(), update: jest.fn() },
+      user: { findUnique: jest.fn(), findUniqueOrThrow: jest.fn(), findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
       refreshToken: {
         findFirst: jest.fn(),
         create: jest.fn(),
@@ -30,12 +30,11 @@ describe("AuthService", () => {
       verifyAsync: jest.fn(),
     };
     config = {
-      get: jest.fn().mockReturnValue({
-        accessSecret: "access-secret",
-        refreshSecret: "refresh-secret",
-        accessTtl: "15m",
-        refreshTtl: "7d",
-      }),
+      // Key-aware, unlike a bare mockReturnValue — register() now also
+      // reads "nodeEnv" (to decide whether to include devVerificationToken
+      // in its response), distinct from the "jwt" config every other
+      // test here already relies on.
+      get: jest.fn((key: string) => (key === "nodeEnv" ? "test" : { accessSecret: "access-secret", refreshSecret: "refresh-secret", accessTtl: "15m", refreshTtl: "7d" })),
     };
     auditLog = { record: jest.fn().mockResolvedValue({}) };
 
@@ -63,6 +62,92 @@ describe("AuthService", () => {
       const createdPasswordHash = prisma.user.create.mock.calls[0][0].data.passwordHash;
       expect(createdPasswordHash).not.toBe("password1234");
       expect(await bcrypt.compare("password1234", createdPasswordHash)).toBe(true);
+    });
+
+    it("creates the user PENDING_VERIFICATION-eligible: a hashed (never raw) verification token with a future expiry", async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockImplementation(async ({ data }) => ({ id: "user-1", role: "USER", ...data }));
+      prisma.refreshToken.create.mockResolvedValue({});
+
+      await service.register({ email: "new@example.com", password: "password1234" });
+
+      const createData = prisma.user.create.mock.calls[0][0].data;
+      expect(createData.emailVerificationTokenHash).toEqual(expect.any(String));
+      expect(createData.emailVerificationTokenHash).toHaveLength(64); // sha256 hex
+      expect(createData.emailVerificationTokenExpiresAt.getTime()).toBeGreaterThan(Date.now());
+    });
+
+    it("includes devVerificationToken in the response outside production (NODE_ENV=test here)", async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockImplementation(async ({ data }) => ({ id: "user-1", role: "USER", ...data }));
+      prisma.refreshToken.create.mockResolvedValue({});
+
+      const result = await service.register({ email: "new@example.com", password: "password1234" });
+
+      expect(result.devVerificationToken).toEqual(expect.any(String));
+      // The token returned to the caller must be the RAW value, never
+      // the hash stored on the row — otherwise it could never actually
+      // verify anything.
+      const storedHash = prisma.user.create.mock.calls[0][0].data.emailVerificationTokenHash;
+      expect(result.devVerificationToken).not.toBe(storedHash);
+    });
+
+    it("NEVER includes devVerificationToken in production, regardless of anything else", async () => {
+      config.get.mockImplementation((key: string) => (key === "nodeEnv" ? "production" : { accessSecret: "access-secret", refreshSecret: "refresh-secret", accessTtl: "15m", refreshTtl: "7d" }));
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockImplementation(async ({ data }) => ({ id: "user-1", role: "USER", ...data }));
+      prisma.refreshToken.create.mockResolvedValue({});
+
+      const result = await service.register({ email: "new@example.com", password: "password1234" });
+
+      expect(result).not.toHaveProperty("devVerificationToken");
+    });
+  });
+
+  describe("verifyEmail", () => {
+    it("activates a valid, unexpired token: status -> ACTIVE, token cleared, audit-logged", async () => {
+      const futureExpiry = new Date(Date.now() + 1_000_000);
+      prisma.user.findFirst.mockResolvedValue({ id: "user-1", status: "PENDING_VERIFICATION", emailVerificationTokenExpiresAt: futureExpiry });
+      prisma.user.updateMany.mockResolvedValue({ count: 1 });
+
+      const result = await service.verifyEmail("a-real-raw-token");
+
+      expect(result.status).toBe("ACTIVE");
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: { id: "user-1", emailVerificationTokenHash: expect.any(String), status: "PENDING_VERIFICATION" },
+        data: {
+          status: "ACTIVE",
+          emailVerifiedAt: expect.any(Date),
+          emailVerificationTokenHash: null,
+          emailVerificationTokenExpiresAt: null,
+        },
+      });
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ actorId: "user-1", action: "user.email_verified", resourceType: "User", resourceId: "user-1" }),
+      );
+    });
+
+    it("rejects when no user has a matching PENDING_VERIFICATION token (wrong/foreign/already-consumed token)", async () => {
+      prisma.user.findFirst.mockResolvedValue(null);
+      await expect(service.verifyEmail("wrong-token")).rejects.toThrow(UnauthorizedException);
+      expect(prisma.user.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("rejects an expired token with the SAME generic error as a wrong one (no oracle)", async () => {
+      const pastExpiry = new Date(Date.now() - 1_000);
+      prisma.user.findFirst.mockResolvedValue({ id: "user-1", status: "PENDING_VERIFICATION", emailVerificationTokenExpiresAt: pastExpiry });
+
+      await expect(service.verifyEmail("expired-token")).rejects.toThrow(UnauthorizedException);
+      expect(prisma.user.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("rejects (never double-applies) when a concurrent submission already consumed the token — updateMany matches zero rows", async () => {
+      const futureExpiry = new Date(Date.now() + 1_000_000);
+      prisma.user.findFirst.mockResolvedValue({ id: "user-1", status: "PENDING_VERIFICATION", emailVerificationTokenExpiresAt: futureExpiry });
+      prisma.user.updateMany.mockResolvedValue({ count: 0 }); // a concurrent call won the race first
+
+      await expect(service.verifyEmail("raced-token")).rejects.toThrow(UnauthorizedException);
+      expect(auditLog.record).not.toHaveBeenCalled();
     });
   });
 

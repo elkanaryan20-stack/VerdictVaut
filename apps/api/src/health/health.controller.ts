@@ -1,4 +1,4 @@
-import { Controller, Get, HttpCode, ServiceUnavailableException } from "@nestjs/common";
+import { Controller, Get, HttpCode, Logger, ServiceUnavailableException } from "@nestjs/common";
 import { SkipThrottle } from "@nestjs/throttler";
 import { PrismaService } from "../prisma/prisma.service";
 import { DepositWatcherService } from "../wallet/watchers/deposit-watcher.service";
@@ -21,6 +21,8 @@ import { WithdrawalWatcherService } from "../wallet/watchers/withdrawal-watcher.
 @Controller("health")
 @SkipThrottle()
 export class HealthController {
+  private readonly logger = new Logger(HealthController.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly depositWatcherService: DepositWatcherService,
@@ -49,18 +51,26 @@ export class HealthController {
   @HttpCode(200)
   async readiness() {
     let databaseOk = true;
-    let databaseError: string | undefined;
     try {
       await this.prisma.$queryRaw`SELECT 1`;
     } catch (error) {
       databaseOk = false;
-      databaseError = (error as Error).message;
+      // Phase 18 remediation — the real error (which can include the
+      // literal DB hostname/port, e.g. Prisma's own "Can't reach
+      // database server at `host:port`" message) is logged here, INSIDE
+      // the process, through the same structured/redacted logger every
+      // other error goes through (JsonLoggerService). This endpoint has
+      // no guard (see this class's own docblock — an orchestrator probe
+      // carries no JWT), so anything placed in the HTTP response itself
+      // is effectively public; the caller gets only a generic status,
+      // never infrastructure detail.
+      this.logger.error("Readiness check: database unreachable", (error as Error).stack ?? String(error));
     }
 
     if (!databaseOk) {
       throw new ServiceUnavailableException({
         status: "not_ready",
-        checks: { database: { ok: false, error: databaseError } },
+        checks: { database: { ok: false, error: "unavailable" } },
       });
     }
 

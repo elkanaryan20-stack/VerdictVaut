@@ -4,6 +4,7 @@ import { AuthService } from "./auth.service";
 import { ChangePasswordDto } from "./dto/change-password.dto";
 import { LoginDto } from "./dto/login.dto";
 import { RegisterDto } from "./dto/register.dto";
+import { VerifyEmailDto } from "./dto/verify-email.dto";
 import { JwtAuthGuard } from "./guards/jwt-auth.guard";
 import { CurrentUser, AuthenticatedUser } from "../common/decorators/current-user.decorator";
 import { IsString } from "class-validator";
@@ -39,6 +40,17 @@ export class AuthController {
   @Throttle(AUTH_THROTTLE)
   refresh(@Body() dto: RefreshDto) {
     return this.authService.refresh(dto.refreshToken);
+  }
+
+  // Unauthenticated by design — the token itself IS the credential
+  // (same shape as a password-reset link), so this must be reachable
+  // without an access token. Same throttle tier as the rest of this
+  // controller's credential-guessing surface.
+  @Post("verify-email")
+  @HttpCode(HttpStatus.OK)
+  @Throttle(AUTH_THROTTLE)
+  verifyEmail(@Body() dto: VerifyEmailDto) {
+    return this.authService.verifyEmail(dto.token);
   }
 
   @Post("logout")

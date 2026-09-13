@@ -44,6 +44,34 @@ describe("HealthController", () => {
       await expect(controller.readiness()).rejects.toThrow(ServiceUnavailableException);
     });
 
+    // Phase 18 remediation — the real Prisma error (e.g. "Can't reach
+    // database server at `internal-db-host:5432`") must never reach this
+    // UNAUTHENTICATED endpoint's response body. It's still logged
+    // in-process (see the controller's own Logger.error call) — this
+    // test only asserts on what a caller actually receives over HTTP.
+    it("never exposes the real database error message, hostname, or port to the caller — only a generic status", async () => {
+      prisma.$queryRaw.mockRejectedValue(
+        new Error("Can't reach database server at `internal-prod-db.example.internal:5432`\n\nPlease make sure your database server is running."),
+      );
+
+      let caught: ServiceUnavailableException | undefined;
+      try {
+        await controller.readiness();
+      } catch (error) {
+        caught = error as ServiceUnavailableException;
+      }
+
+      expect(caught).toBeInstanceOf(ServiceUnavailableException);
+      const body = caught!.getResponse() as { status: string; checks: { database: { ok: boolean; error: string } } };
+      const serialized = JSON.stringify(body);
+
+      expect(body.checks.database.ok).toBe(false);
+      expect(body.checks.database.error).toBe("unavailable");
+      expect(serialized).not.toMatch(/internal-prod-db/i);
+      expect(serialized).not.toMatch(/:5432/);
+      expect(serialized).not.toMatch(/reach database server/i);
+    });
+
     it("stays 200 but reports degraded when a watcher cursor is stale", async () => {
       depositWatcherService.listCursorStatus.mockResolvedValue([
         { assetSymbol: "BTC", networkCode: "bitcoin-mainnet", isScanStale: true },

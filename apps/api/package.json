@@ -22,7 +22,8 @@
     "prisma:migrate:diff-report": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url \"$DATABASE_URL\"",
     "backup:drill": "node scripts/backup-restore-drill.js",
     "check:integrity": "node scripts/financial-integrity-checks.js",
-    "check:production-readiness": "node scripts/production-readiness-check.js"
+    "check:production-readiness": "node scripts/production-readiness-check.js",
+    "bootstrap:super-admin": "node scripts/bootstrap-super-admin.js"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.15",

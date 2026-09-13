@@ -21,6 +21,7 @@ import { CustodyProviderConfigService } from "../wallet/provider-config/custody-
 import { ComplianceProviderConfigService } from "../wallet/provider-config/compliance-provider-config.service";
 import { PROVIDER_CAPABILITY_MATRIX } from "../wallet/provider-config/provider-capability-matrix";
 import { FireblocksWebhookService } from "../wallet/executors/fireblocks/fireblocks-webhook.service";
+import { UsersService } from "../users/users.service";
 import { AuditLogService } from "../audit/audit-log.service";
 import {
   CreateAssetNetworkDto,
@@ -72,8 +73,34 @@ export class AdminController {
     private readonly custodyProviderConfigService: CustodyProviderConfigService,
     private readonly complianceProviderConfigService: ComplianceProviderConfigService,
     private readonly fireblocksWebhookService: FireblocksWebhookService,
+    private readonly usersService: UsersService,
     private readonly auditLogService: AuditLogService,
   ) {}
+
+  // ── User account lifecycle (Phase 18 remediation — SUPER_ADMIN only) ──
+  // The operational escape hatch out of PENDING_VERIFICATION until a
+  // real email-sending integration exists — see AuthService.register's
+  // and UsersService.adminActivate's own docblocks for the full
+  // reasoning. Idempotent (never errors on an already-ACTIVE user);
+  // only audit-logged when it genuinely changed something, so repeated
+  // no-op calls don't spam the audit trail.
+  @Post("users/:id/activate")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  async activateUser(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
+    const result = await this.usersService.adminActivate(id);
+    if (result.changed) {
+      await this.auditLogService.record({
+        actorId: admin.id,
+        action: "user.admin_activated",
+        resourceType: "User",
+        resourceId: id,
+        before: { status: "PENDING_VERIFICATION" },
+        after: { status: result.status },
+      });
+    }
+    return result;
+  }
 
   // ── Asset / network configuration (SUPER_ADMIN only) ─────────────────
   @Post("asset-networks")
