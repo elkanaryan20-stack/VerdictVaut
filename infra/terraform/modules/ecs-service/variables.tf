@@ -110,3 +110,15 @@ variable "max_percent" {
   type    = number
   default = 200
 }
+
+variable "read_only_root_filesystem" {
+  description = "Phase 27 addition. Defaults to false — NOT independently verified against a real running container this session (no Docker available; see infra/terraform/README.md's own long-standing Docker-availability caveat), so it is not force-enabled for web/api/worker here. web (Next.js standalone) and api/worker (NestJS) are not known to require any other writable path than /tmp (already handled via tmpfs when this is true — see main.tf), but that has not been proven against a live container. Set true per-service only after verifying the specific image tolerates it."
+  type        = bool
+  default     = false
+}
+
+variable "tmpfs_size_mib" {
+  description = "Size (MiB) of the /tmp tmpfs mount added when read_only_root_filesystem = true. Only meaningful in that case."
+  type        = number
+  default     = 64
+}

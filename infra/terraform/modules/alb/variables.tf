@@ -25,6 +25,11 @@ variable "alb_security_group_id" {
   type = string
 }
 
+variable "enable_deletion_protection" {
+  description = "true for production (prevents an accidental console/API/terraform destroy of the public ALB). false for staging, so it can actually be torn down. No default, deliberately — same reasoning as modules/database's deletion_protection (docs/aws-terraform-security-review.md F2): a safety-critical flag should force every caller to make an explicit, conscious choice."
+  type        = bool
+}
+
 variable "create_certificate" {
   description = "true: this module creates + DNS-validates an ACM certificate (requires domain_name and route53_zone_id). false: certificate_arn must be supplied directly (e.g. a cert created/validated outside Terraform). Neither path is exercised by this phase — no domain has been chosen (docs/aws-production-architecture.md §10, REQUIRES HUMAN APPROVAL)."
   type        = bool

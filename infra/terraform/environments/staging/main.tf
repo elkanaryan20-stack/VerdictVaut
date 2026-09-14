@@ -12,6 +12,23 @@ locals {
   secret_names   = ["jwt-access-secret", "jwt-refresh-secret", "postmark-server-token", "fireblocks-sandbox-credentials", "fireblocks-webhook-public-key", "elliptic-sandbox-credentials"]
 }
 
+# Reads the shared ECR registry's state (environments/shared — see that
+# directory's own header note on why the registry is a single shared
+# resource, not duplicated per environment). EXAMPLE ONLY bucket/key,
+# matching backend.tf's own placeholder values — this data source
+# cannot resolve until the same real backend both files already require
+# exists; not usable by this phase regardless (§ this phase's brief:
+# no AWS account, no `terraform init` against a real backend).
+data "terraform_remote_state" "shared" {
+  backend = "s3"
+
+  config = {
+    bucket = "verdictvaut-terraform-state" # EXAMPLE ONLY — does not exist
+    key    = "shared/terraform.tfstate"
+    region = "us-east-1" # EXAMPLE ONLY — see docs/aws-production-architecture.md §10
+  }
+}
+
 module "network" {
   source = "../../modules/network"
 
@@ -53,9 +70,13 @@ module "database" {
 module "iam" {
   source = "../../modules/iam"
 
-  environment      = local.environment
-  task_role_names  = local.service_names
-  ecr_repository_arns = [] # no ECR repository exists yet — docs/aws-deployment-runbook.md §3
+  environment     = local.environment
+  task_role_names = local.service_names
+  # values(...) rather than [] now that modules/ecr is defined
+  # (environments/shared) — still resolves to an empty/unusable
+  # reference until a real backend exists, per this data source's own
+  # comment above.
+  ecr_repository_arns = values(data.terraform_remote_state.shared.outputs.ecr_repository_arns)
   log_group_arns   = [for name, arn in module.observability.log_group_names : "${arn}:*"]
   secret_arns = concat(
     values(module.secrets.secret_arns),
@@ -66,12 +87,13 @@ module "iam" {
 module "alb" {
   source = "../../modules/alb"
 
-  environment            = local.environment
-  vpc_id                 = module.network.vpc_id
-  public_subnet_ids      = module.network.public_subnet_ids
-  alb_security_group_id  = module.network.alb_security_group_id
-  create_certificate     = false
-  certificate_arn        = var.certificate_arn # no real value supplied by this phase
+  environment                = local.environment
+  vpc_id                     = module.network.vpc_id
+  public_subnet_ids          = module.network.public_subnet_ids
+  alb_security_group_id      = module.network.alb_security_group_id
+  create_certificate         = false
+  certificate_arn            = var.certificate_arn # no real value supplied by this phase
+  enable_deletion_protection = false                # staging must be destroyable
 }
 
 resource "aws_ecs_cluster" "this" {

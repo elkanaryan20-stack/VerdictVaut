@@ -78,7 +78,14 @@ phase's brief restates from every prior phase.
   its own cost — noted as available, not selected, since this is a
   cost/tooling decision outside this repository's authority.
 
-**No ECR repository is created by this phase.**
+**No ECR repository is created by this phase** — Phase 27 added the
+Terraform module that defines this exact configuration
+(`infra/terraform/modules/ecr`, wired from a new, separate
+`environments/shared` root module/state — see that module's header
+note for why the registry must be a single shared resource rather than
+duplicated per environment, given §4's build-once/promote pipeline),
+but that module has still never been applied against a real AWS
+account.
 
 ## 4. Deployment pipeline — current state and future design
 

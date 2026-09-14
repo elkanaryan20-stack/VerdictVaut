@@ -1,0 +1,5 @@
+# DESIGNED, NOT APPLIED — EXAMPLE ONLY. Copy to terraform.tfvars and
+# fill in a real value before ever running `terraform init`/`plan`
+# against a real backend — which this phase does not do.
+
+aws_region = "us-east-1" # EXAMPLE ONLY — see docs/aws-production-architecture.md §10, REQUIRES HUMAN APPROVAL. Should match staging/production's own region choice.

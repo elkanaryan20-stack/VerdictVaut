@@ -22,6 +22,33 @@ locals {
     image     = var.image
     essential = true
 
+    # Phase 27 addition — least-privilege container runtime. Fargate
+    # never supports `privileged` containers at all (there is no host
+    # to escalate onto), so that flag isn't set here; capability
+    # dropping is still meaningful independent of that. None of
+    # web/api/worker's Node.js processes bind a privileged (<1024)
+    # port or otherwise need any Linux capability — all three already
+    # run as the non-root "node" user (apps/api/Dockerfile,
+    # apps/web/Dockerfile), for which most default capabilities are
+    # already inert; dropping ALL closes the remainder.
+    #
+    # tmpfs is only populated when read_only_root_filesystem = true
+    # (see that variable's own comment) — a writable /tmp is what the
+    # worker's heartbeat file (WORKER_HEARTBEAT_FILE, default
+    # /tmp/verdictvaut-worker-heartbeat) needs once the root filesystem
+    # itself is read-only.
+    linuxParameters = merge(
+      { capabilities = { drop = ["ALL"] } },
+      var.read_only_root_filesystem ? {
+        tmpfs = [
+          {
+            containerPath = "/tmp"
+            size          = var.tmpfs_size_mib
+          }
+        ]
+      } : {}
+    )
+
     portMappings = var.container_port == null ? [] : [
       {
         containerPort = var.container_port
@@ -45,6 +72,8 @@ locals {
         "awslogs-stream-prefix" = var.name
       }
     }
+
+    readonlyRootFilesystem = var.read_only_root_filesystem
   }
 
   health_check_addition = var.health_check_command == null ? {} : {

@@ -48,9 +48,8 @@ variable "multi_az" {
 }
 
 variable "deletion_protection" {
-  description = "true for production (mandatory — docs/aws-disaster-recovery.md §1). false for staging, so it can actually be torn down."
+  description = "true for production (mandatory — docs/aws-disaster-recovery.md §1). false for staging, so it can actually be torn down. No default, deliberately (Phase 26 finding, docs/aws-terraform-security-review.md) — a safety-critical flag like this should force every caller to make an explicit, conscious choice rather than silently inheriting a permissive default if a future environment forgets to set it."
   type        = bool
-  default     = false
 }
 
 variable "backup_retention_days" {

@@ -45,10 +45,19 @@ infra/terraform/
     ecs-service/                Reusable module — instantiated 3x per environment
                                 (web, api, worker) with different inputs
     observability/             CloudWatch log groups
+    alb/                       Application Load Balancer, listeners, target groups, (optional) ACM cert
+    iam/                       ECS execution role + per-service task roles
+    ecr/                       Container repositories (Phase 27) — see its own header note
+                                on why this is a SHARED module, not per-environment
   environments/
     staging/                   Wires the modules together for staging
     production/                Wires the modules together for production
                                 — a SEPARATE state file from staging, always
+    shared/                    (Phase 27) Wires module.ecr only — a THIRD, separate
+                                state file, for the one resource (the container
+                                registry) that legitimately crosses the
+                                staging/production boundary by design (build-once,
+                                promote — docs/aws-deployment-runbook.md §4.2)
 ```
 
 ## State storage and locking design (DESIGNED, NOT PROVISIONED)
@@ -151,3 +160,40 @@ terraform apply       # NEVER run by this phase, and never without human review
 - Did not create any AWS resource.
 - Did not write a real account ID, credential, or region anywhere in
   this directory.
+
+## Phase 27 additions
+
+**Status unchanged: DESIGNED, NOT APPLIED, `terraform` still not
+installed in this development environment** (re-confirmed this
+session). What changed:
+
+- **`modules/ecr`** (new) + **`environments/shared`** (new) — the 3
+  container repositories (immutable tags, scan-on-push, lifecycle
+  policy — closing the gap that `docs/aws-deployment-runbook.md` §3
+  had specified since Phase 25 but no Terraform code had ever
+  implemented). Deliberately a third root module/state, not part of
+  either `environments/staging` or `environments/production` — see
+  `modules/ecr/main.tf`'s header note for why a build-once/promote
+  pipeline needs one shared registry, not two.
+- **`modules/alb`**: `enable_deletion_protection` is now a required
+  variable (no default) — the same "no unsafe default on a
+  safety-critical toggle" treatment `docs/aws-terraform-security-review.md`
+  F2 already applied to `modules/database`'s `deletion_protection`,
+  extended to the ALB. `true` in production, `false` in staging.
+- **`modules/ecs-service`**: every container definition now drops all
+  Linux capabilities (`linuxParameters.capabilities.drop = ["ALL"]`,
+  unconditional — Fargate has no `privileged` mode to worry about
+  separately, and none of web/api/worker's non-root Node.js processes
+  need any capability). `read_only_root_filesystem` is a new **opt-in,
+  default-false** variable (with a `/tmp` tmpfs mount wired in
+  automatically when enabled, for the worker's heartbeat file) — left
+  off by default because it has not been verified against a real
+  running container (Docker unavailable in every session to date).
+- CI (`.github/workflows/ci.yml`) gained a `terraform-validate` job:
+  `terraform fmt -check -recursive`, then `terraform init -backend=false`
+  + `terraform validate` for each of `staging`/`production`/`shared`.
+  No AWS credential is configured in CI — `-backend=false` means it
+  never attempts to reach the real (nonexistent) S3/DynamoDB backend.
+  This is the first time any of this Terraform code will actually be
+  parsed by a real `terraform` binary — previously it was reviewed by
+  eye only (`docs/aws-terraform-security-review.md` §0).

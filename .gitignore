@@ -43,5 +43,28 @@ apps/api/.devpg/
 apps/api/.backup-drill-primary/
 apps/api/.backup-drill-restored/
 
+# terraform (infra/terraform — see docs/aws-terraform-security-review.md)
+# .terraform.lock.hcl is deliberately NOT ignored — it should be
+# committed for reproducible provider version resolution, per
+# Terraform's own recommended practice.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# Real, filled-in tfvars can hold non-secret-but-still-environment-
+# specific values (image URIs, CORS origins, account-adjacent
+# identifiers) that shouldn't be committed even though they aren't
+# credentials — only the committed *.tfvars.example files are meant to
+# be tracked.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
 # misc
 .turbo/

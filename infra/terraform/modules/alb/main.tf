@@ -11,6 +11,12 @@ resource "aws_lb" "this" {
   subnets            = var.public_subnet_ids
   security_groups    = [var.alb_security_group_id]
 
+  # Phase 27 addition — the same "safety-critical toggle should not
+  # silently default to the less-protective value" reasoning as
+  # modules/database's deletion_protection (docs/aws-terraform-security-review.md
+  # F2): no default here either, forcing every caller to choose.
+  enable_deletion_protection = var.enable_deletion_protection
+
   # ALB access logs (docs/aws-production-architecture.md §9's "optional
   # but recommended" S3 destination) are deliberately NOT enabled here —
   # would require an S3 bucket + bucket policy this skeleton does not

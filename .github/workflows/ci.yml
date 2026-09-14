@@ -208,3 +208,38 @@ jobs:
 
           echo ""
           echo "Smoke test passed: image boots, connects to Postgres, and serves both health endpoints."
+
+  # Phase 27 addition. Static-only: no AWS credential is configured
+  # anywhere in this job (there is nothing to configure — no AWS
+  # account exists for this project), `terraform init` always runs
+  # with `-backend=false` (never attempts to reach the real S3/DynamoDB
+  # backend referenced by each environment's backend.tf, which does not
+  # exist), and `terraform plan`/`apply` are never invoked. This proves
+  # the Terraform source is syntactically valid and internally
+  # consistent — it does NOT prove a real `plan` would succeed against
+  # a real AWS account (that requires real credentials and is explicitly
+  # out of scope for CI, see docs/aws-production-change-control.md).
+  terraform-validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [staging, production, shared]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: terraform fmt (whole tree, once)
+        if: matrix.environment == 'staging'
+        run: terraform fmt -check -recursive infra/terraform
+
+      - name: terraform init (no backend, no credentials)
+        working-directory: infra/terraform/environments/${{ matrix.environment }}
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        working-directory: infra/terraform/environments/${{ matrix.environment }}
+        run: terraform validate
