@@ -55,6 +55,17 @@ jobs:
       - name: Web unit tests
         run: npm run test -w apps/web
 
+      # Phase 29 — informational only (continue-on-error): keeps known
+      # transitive-dependency CVEs visible on every run without turning
+      # every unrelated PR red over a package this application doesn't
+      # reach (see docs/security-and-operational-validation.md §15 for
+      # the per-package reachability assessment — multer/file-type/qs/
+      # postcss are all confirmed unreachable or build-time-only in this
+      # codebase; none is silently ignored, all are named there).
+      - name: Dependency vulnerability scan (informational)
+        continue-on-error: true
+        run: npm audit --omit=dev
+
   # Independent of the `ci` job above. `prisma validate` (schema syntax)
   # needs no database at all. The Postgres service below is used only by
   # the informational diff-report step — "migrations actually apply
@@ -80,6 +91,11 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # check-migration-safety.js (Phase 29) needs real history to
+          # diff against — a default shallow (depth-1) checkout would
+          # make every migration look "newly added" on every run.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -96,6 +112,18 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_validate
         run: npm run prisma:migrate:validate
+
+      # Phase 29 — a real gate (not continue-on-error, unlike the
+      # informational diff-report below): a NEWLY ADDED migration
+      # containing an unacknowledged DROP TABLE/DROP COLUMN/TRUNCATE/
+      # unconditional DELETE fails the build. See check-migration-safety.js's
+      # own docblock for exactly what "newly added" and "acknowledged"
+      # mean and why this never fails on pre-existing history.
+      - name: Migration safety scan (new migrations only)
+        working-directory: apps/api
+        env:
+          MIGRATION_SAFETY_BASE_REF: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+        run: npm run check:migration-safety
 
       # Report-only, never fails the build: run once against this repo's
       # real migration history and it reported several FK/index

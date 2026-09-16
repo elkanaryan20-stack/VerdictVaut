@@ -359,3 +359,62 @@ webhook `txHash`/`custodyReference` distinctness check.
 Typecheck, lint, build (all 3 workspaces), `prisma validate`, and
 `git diff --check` were all run clean — see the final report for the
 literal command output.
+
+## 15. Phase 29 addendum — dependency audit, re-confirmation, cookie/session review
+
+**Status: PASS / VERIFIED (re-confirmed unchanged), 1 new finding
+(dependency vulnerabilities, assessed and documented, not silently
+suppressed).**
+
+**Re-confirmation, not re-audit**: this phase re-ran the full test
+suites §14 lists (82/82 unit, 27/27 integration, 42/42 web — see the
+final report) and re-read `ProductionCustodyExecutor`/
+`ComplianceGateFactory` directly to confirm both still fail closed —
+Phase 17's exhaustive §1-§13 audit above is otherwise unchanged and not
+repeated here, consistent with this repository's "inspect first, don't
+redo completed work" practice.
+
+**Cookie/session security — reviewed, genuinely N/A.** This phase's
+brief asked for a cookie/session security check. Grepped
+`apps/api/src`/`apps/web/lib`/`apps/web/app` for any cookie usage: the
+only matches are `redact.util.ts`'s log-redaction pattern (which
+includes `cookie` defensively, in case one is ever introduced) and
+`apps/web/lib/auth/token-storage.ts`'s own docblock explicitly stating
+*why* no cookie is used — "there is no session cookie to piggyback
+on." Authentication is JWT-bearer-token-only, client-stored, sent via
+`Authorization` header — there is no session cookie to secure
+(`HttpOnly`/`Secure`/`SameSite` flags are inapplicable, not
+forgotten). Recorded as N/A rather than silently omitted.
+
+**Dependency vulnerabilities (`npm audit --omit=dev`) — new finding,
+assessed:**
+
+| Package | Severity | Reachable attack surface in THIS application |
+|---|---|---|
+| `multer` (via `@nestjs/platform-express`) | HIGH (6 advisories, DoS-class) | **Not reachable** — grepped `apps/api/src` for `multer`/`FileInterceptor`/`@UploadedFile`: zero matches. No file-upload endpoint exists anywhere in this codebase; the vulnerable code ships as a transitive dependency of the NestJS Express adapter regardless of use, but is never invoked. |
+| `file-type` (via `@nestjs/common`) | MODERATE (DoS-class) | Same — no code path reads/probes an uploaded file's type. |
+| `lodash` (via `@nestjs/config`) | HIGH (prototype pollution / code injection via `_.template`/`_.unset`/`_.omit`) | Used internally by `@nestjs/config`'s object-merging for configuration built from environment variables (operator-controlled), never from unauthenticated request input — no code path passes attacker-supplied data through a vulnerable lodash function. |
+| `postcss` (via `next`'s build tooling) | HIGH (XSS / arbitrary file read via `sourceMappingURL`) | **Build-time only** — processes this repository's own committed CSS during `next build`, never a runtime input, let alone attacker-supplied CSS. |
+| `qs` | MODERATE (DoS-class) | Transitive; not directly imported by any `apps/api`/`apps/web` source file (grepped, zero matches) — pulled in by a deeper dependency of the Express/Next.js stack. |
+| `body-parser` (via `@nestjs/platform-express`) | LOW (DoS when a request sets an invalid size limit — this app never overrides the default limit) | Reachable in principle (body-parser IS used, unlike multer/file-type) but the specific advisory requires the APPLICATION to explicitly set an invalid limit value, which this codebase never does (`main.ts` uses Express/Nest's own default `bodyParser.json()` configuration, re-confirmed by re-reading `main.ts` this phase — no `limit:` option is set anywhere). |
+
+**Not fixed this phase.** Every available fix requires a breaking major-
+version upgrade (`next@16`, `@nestjs/platform-express@12`) — out of
+proportion for a dependency-hygiene finding whose actual exploitable
+surface in this specific application is null-to-minimal per the table
+above, and a major-version bump of the web framework or the HTTP
+platform adapter is exactly the kind of unrelated, high-blast-radius
+change this phase's own "don't make sweeping unrelated changes"
+principle argues against. **This is a documented, assessed risk, not a
+suppressed one** — `npm audit --omit=dev` was added as an informational
+CI step (see workflow changes) so it stays visible on every future run,
+and a future phase should revisit these once the underlying packages'
+non-breaking patch versions catch up, or when a genuine reason to
+upgrade `next`/`@nestjs/platform-express` arises anyway.
+
+**CORS/debug-mode/insecure-defaults — re-confirmed unchanged**: grepped
+`main.ts`/`env.validation.ts` this phase — `NODE_ENV=development` is
+still the only condition that widens CORS, `helmet()` is still applied
+unconditionally, no debug/verbose-error flag exists anywhere in this
+codebase to accidentally leave on in production. Unchanged from §8's
+original Phase 17 findings.

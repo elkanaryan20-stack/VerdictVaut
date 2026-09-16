@@ -60,6 +60,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+        working-directory: .
+
+      # Phase 29 — informational only (continue-on-error): surfaces the
+      # full AWS/Terraform/GitHub structural-readiness picture in this
+      # run's log before attempting a real init/plan below. Never blocks
+      # by itself — `terraform init` against the real backend a few
+      # steps down already enforces the hard requirement (a real state
+      # bucket/table) on its own; this step exists for visibility, not
+      # as a second copy of that gate.
+      - name: Production deployment preflight (informational)
+        working-directory: apps/api
+        continue-on-error: true
+        run: npm run preflight:production
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"

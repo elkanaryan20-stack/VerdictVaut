@@ -218,3 +218,65 @@ jobs:
           aws ecs wait services-stable \
             --cluster "verdictvaut-${{ inputs.environment }}" \
             --services "verdictvaut-${{ inputs.environment }}-api" "verdictvaut-${{ inputs.environment }}-worker" "verdictvaut-${{ inputs.environment }}-web"
+
+  # Phase 29 — closes the deployment-sequence gap
+  # docs/aws-deployment-runbook.md §4.4 documents (steps 10-13: verify
+  # health checks, verify worker, verify observability, verify critical
+  # application flows) BEFORE this workflow is allowed to be considered
+  # successful. `deploy` reaching a steady state (previous job) proves
+  # ECS itself thinks the new tasks are healthy — it does NOT prove the
+  # application actually serves correct responses over the network; this
+  # job is the real, automated version of that check, using the same
+  # production-safe script an operator would run by hand
+  # (production-smoke-test.js — never places a real order, never
+  # submits a real withdrawal, never creates a real account).
+  #
+  # Needs `vars.STAGING_API_URL`/`vars.PRODUCTION_API_URL` (GitHub
+  # Actions variables, not secrets — these are public URLs) to be set;
+  # if unset, this job fails clearly rather than silently skipping
+  # verification. Deliberately requires NO AWS credential at all — it
+  # only makes ordinary HTTPS requests, the same as any other client.
+  verify-deployment:
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+
+      - name: Resolve the base URL for this environment
+        id: url
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            URL="${{ vars.PRODUCTION_API_URL }}"
+          else
+            URL="${{ vars.STAGING_API_URL }}"
+          fi
+          if [ -z "$URL" ]; then
+            echo "::error::vars.${{ inputs.environment == 'production' && 'PRODUCTION_API_URL' || 'STAGING_API_URL' }} is not set — cannot verify the deployment. Set this GitHub Actions variable to the real public API URL once DNS/ACM (docs/aws-network-design.md) is provisioned."
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Post-deploy smoke test (health, readiness, auth/admin boundaries, worker/watcher/reconciliation status)
+        working-directory: apps/api
+        env:
+          SMOKE_TEST_API_BASE_URL: ${{ steps.url.outputs.url }}
+          SMOKE_TEST_WEB_BASE_URL: ${{ inputs.environment == 'production' && vars.PRODUCTION_WEB_URL || vars.STAGING_WEB_URL }}
+          # SMOKE_TEST_USER_EMAIL/PASSWORD and SMOKE_TEST_ADMIN_TOKEN are
+          # deliberately NOT wired here — supplying a real, standing test
+          # account's credentials to a CI job is its own security
+          # decision (a real, persistent credential in GitHub Secrets)
+          # this phase does not make unilaterally. Every check that needs
+          # them is safely SKIPPED, not failed, without them (see the
+          # script's own docblock). A human/future phase can add
+          # STAGING_SMOKE_TEST_USER_EMAIL etc. as real GitHub secrets
+          # once a dedicated, non-financially-relevant smoke-test account
+          # exists for that environment.
+        run: npm run smoke-test:production
+
+      - name: Deployment verified — declare success
+        run: echo "verdictvaut-${{ inputs.environment }} is deployed and passes its post-deploy smoke test. See the previous step's output for the full checklist result."

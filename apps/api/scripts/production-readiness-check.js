@@ -404,6 +404,15 @@ async function main() {
   console.log(`P1 (blocks production launch): ${p1Failures.length}`);
   console.log(`P2 (should fix shortly after launch): ${p2Failures.length}`);
 
+  // Phase 29 — this script asks "does the APPLICATION's own config/code
+  // allow production financial activity." It deliberately does not
+  // check AWS account/Terraform/GitHub-secrets/DNS readiness — that is
+  // production-preflight.js's job. Pointing to both from here (and from
+  // there back to here) keeps neither script pretending to be the
+  // single source of truth on its own.
+  console.log("\nSee docs/production-readiness-checklist.md for the full READY/BLOCKED/UNVERIFIED breakdown across BOTH this script and the AWS/Terraform/CI-CD layer.");
+  console.log("Run `npm run preflight:production -w apps/api` for the deployment-infrastructure checks this script does not cover.");
+
   if (p0Failures.length > 0) {
     console.log("\nBLOCKED — at least one P0 condition failed. This is not a false alarm to silence; it reflects real, unimplemented prerequisites.");
     process.exit(1);

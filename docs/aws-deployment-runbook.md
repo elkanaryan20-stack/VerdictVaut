@@ -175,6 +175,36 @@ credentials step rather than silently or against a fabricated target.
    the workflow files reference these names but cannot create the
    protection rule itself.
 
+### 4.4 The full 14-step deployment sequence (Phase 29) — documented and, where practical, enforced in code
+
+This phase's brief asked for this exact sequence to be explicit, not
+left implicit across §4.1-4.3 and `docs/aws-production-change-control.md`.
+Each step names the real tool/workflow that performs it today, or
+states plainly that it is a manual/documented-only step and why.
+
+| # | Step | Enforced by |
+|---|---|---|
+| 1 | Validate source/tests | `.github/workflows/ci.yml` — runs on every push/PR, gates merging to `main` |
+| 2 | Build immutable images | `.github/workflows/ecr-publish.yml`'s `build-and-push` job — commit-SHA tag, `modules/ecr`'s `IMMUTABLE` tag policy makes this non-negotiable at the AWS level too |
+| 3 | Push images to ECR | Same job, same workflow |
+| 4 | Validate production readiness | `ecr-publish.yml`'s `production-readiness-gate` job (production only) — `production-readiness-check.js`, blocks `deploy` on failure |
+| 5 | Terraform plan | `.github/workflows/terraform-deploy.yml`'s `terraform-plan` job — a SEPARATE, manually-triggered workflow from image deploy, by design (infrastructure changes are far less frequent than image deploys; forcing a plan/apply on every image push would be both slower and riskier, re-litigating unrelated infrastructure on every deploy) |
+| 6 | Human approval | Two independent gates: `terraform-apply`'s `<environment>-infra-apply` GitHub Environment (step 7) and `deploy`'s `<environment>-deploy` GitHub Environment (step 9) — both require a human-configured required-reviewers rule neither workflow can create itself |
+| 7 | Terraform apply | `terraform-deploy.yml`'s `terraform-apply` job — applies the EXACT plan file step 5 produced, never a freshly recomputed one |
+| 8 | Apply database migrations | `ecr-publish.yml`'s `deploy` job, migration step — **documented placeholder only** (see that step's own comment): the real `aws ecs run-task` invocation needs subnet/security-group/task-definition ARNs this phase has no AWS account to verify against; a human/future phase must complete this once one exists, per `check-migration-safety.js`'s CI gate (step 1) having already confirmed no unacknowledged destructive statement exists in whatever is being applied |
+| 9 | Deploy ECS services | `ecr-publish.yml`'s `deploy` job — `register-task-definition` + `update-service` per service, behind the same `<environment>-deploy` gate as step 6 |
+| 10 | Verify health checks | `ecr-publish.yml`'s `verify-deployment` job (Phase 29) — `production-smoke-test.js`'s `/health`/`/health/ready` checks |
+| 11 | Verify worker | Same job — `production-smoke-test.js`'s `/admin/watchers` check (only runs if `SMOKE_TEST_ADMIN_TOKEN` is supplied — see that script's own docblock for why this is optional, not required) |
+| 12 | Verify observability | Same job, partially — the smoke test cannot query CloudWatch directly (no AWS credential in that job by design); it reports this item `UNVERIFIED` explicitly rather than silently skipping it. A human should separately confirm the CloudWatch log groups are receiving data post-deploy |
+| 13 | Verify critical application flows | Same job — `production-smoke-test.js`'s auth boundary, order-validation boundary, withdrawal-validation boundary, and admin-authorization checks (§F of this phase's brief) |
+| 14 | Declare deployment successful only after verification | `verify-deployment`'s final step only runs, and the workflow only reports success, after steps 10-13 all pass — `deploy` reaching ECS "steady state" alone is deliberately NOT treated as deployment success |
+
+**This workflow fails closed at every step**: a missing GitHub
+secret/variable, an unset Environment protection rule, a failed
+smoke-test check, or a failed migration-safety scan all stop the
+sequence rather than letting it silently proceed — re-verified by
+reading every job's `if:`/`needs:` condition this phase, not assumed.
+
 ## 5. Staging vs. production (AWS-level)
 
 Per this phase's brief, staging must be genuinely separate, never

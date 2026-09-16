@@ -1,4 +1,4 @@
-# Disaster Recovery Runbooks — Phase 22
+# Disaster Recovery Runbooks — Phase 22, extended Phase 29
 
 Operator-facing runbooks for the database-recovery scenarios the Phase
 22 brief lists (A–M). Where a scenario is already covered by
@@ -6,6 +6,15 @@ Operator-facing runbooks for the database-recovery scenarios the Phase
 that section rather than duplicating it, and adds the runbooks that
 didn't exist before this phase (corruption, accidental deletion,
 regional disaster, failover, migration failure, security incident).
+
+**Phase 29 addition: runbooks N–Q**, covering the AWS/Terraform/ECS/
+ECR/Secrets Manager infrastructure layer Phase 28 introduced — this
+entire layer did not exist when runbooks A–M were written (Phase 22
+predates any Terraform in this repository), so it has no prior
+recovery documentation at all. Same format, same "no fictional
+provider-specific command" discipline, same explicit NOT
+APPLICABLE/BLOCKED labeling where the real procedure requires an AWS
+account that does not exist.
 
 Every runbook states: prerequisites, who is authorized, the actual
 actions, safety checks, validation, escalation, and what must NOT be
@@ -541,3 +550,227 @@ not just the on-call database operator.
 **Do NOT**: treat this the same as an accidental-corruption/deletion
 event — a security incident requires credential rotation and a
 malicious-change audit that an accidental-cause incident does not.
+
+## N. Terraform state/infrastructure recovery
+
+**Status: NOT APPLICABLE TODAY** — no Terraform state has ever been
+applied against a real backend (`infra/terraform/README.md`); this
+runbook documents the procedure for once real infrastructure exists.
+
+**Prerequisites**: a corrupted, lost, or inconsistent Terraform state
+file (`staging`/`production`/`shared`), or infrastructure that has
+drifted from what the committed `.tf` source describes.
+
+**Authorization**: whoever holds the `AWS_TERRAFORM_ROLE_ARN` GitHub
+secret's access (i.e., can trigger `terraform-deploy.yml`), plus the
+same human-approval gate (`<environment>-infra-apply` GitHub
+Environment) any other `terraform apply` requires — a state-recovery
+apply is not exempt from that gate.
+
+**Actions**:
+1. The S3 backend (`infra/terraform/README.md`'s "State storage and
+   locking design") has versioning enabled once provisioned — a
+   corrupted/bad state write is recoverable by restoring a prior S3
+   object version, not by hand-editing `.tfstate`.
+2. For drift (real infrastructure no longer matches `.tf` source):
+   `terraform plan` (via `terraform-deploy.yml`) shows the exact diff —
+   review it like any other change before deciding whether to `apply`
+   (reconcile toward the committed source) or update the source to
+   match an intentional out-of-band change (e.g. `ecr-publish.yml`'s
+   own task-definition updates, which `lifecycle { ignore_changes =
+   [task_definition] }` already tells Terraform to expect and ignore).
+3. For a fully lost/unrecoverable state file: Terraform supports
+   re-importing existing resources (`terraform import`) one at a time —
+   tedious but never requires destroying and recreating real
+   infrastructure. **Never** run `terraform apply` against an empty
+   state pointed at existing real resources without importing first —
+   that would attempt to recreate everything, likely failing on
+   naming collisions or, worse, succeeding and orphaning the originals.
+4. The DynamoDB lock table prevents two concurrent `apply`s from
+   racing on the same state — if a previous run crashed mid-apply and
+   left a stale lock, `terraform force-unlock <lock-id>` clears it, but
+   only after confirming via the AWS Console/CLI that no other
+   `terraform apply` is actually still running.
+
+**Safety checks**: never hand-edit a `.tfstate` file's JSON directly —
+use `terraform state` subcommands (`mv`, `rm`, `import`), which
+validate consistency; a manually-edited state file is a common source
+of subsequent `apply` corruption.
+
+**Validation**: `terraform plan` shows no unexpected diff after
+recovery.
+
+**Escalation**: Sev2 unless the drift/corruption is actively blocking a
+required change, in which case Sev1 per `docs/operations-runbook.md`
+§11.
+
+**Do NOT**: run `terraform destroy` as a "clean slate" recovery
+strategy against any environment with real resources — this document's
+entire recovery philosophy (restated from runbooks A–M) is restore/
+reconcile, never destroy-and-hope.
+
+## O. ECS service recovery
+
+**Status: NOT APPLICABLE TODAY** — no ECS cluster/service has ever
+been provisioned. Documents the procedure for once one exists.
+
+**Prerequisites**: an ECS service (`verdictvaut-<environment>-{web,api,worker}`)
+stuck, crash-looping, or otherwise not serving traffic, where the
+deployment circuit breaker (`modules/ecs-service`, Phase 28) either
+isn't applicable (a non-deployment-related failure, e.g. a bad
+security-group change) or has already exhausted its own rollback.
+
+**Authorization**: any operator with `AWS_CI_DEPLOY_ROLE_ARN`-scoped
+access for a service-level fix; SUPER_ADMIN-equivalent + the
+`<environment>-deploy` GitHub Environment gate for anything touching
+production.
+
+**Actions**:
+1. `aws ecs describe-services --cluster verdictvaut-<environment>
+   --services verdictvaut-<environment>-<service>` — read the real
+   `events` array first; ECS's own event log usually states the exact
+   failure reason (task placement failure, health check failure,
+   repeated crash) rather than requiring guesswork.
+2. If the current task definition is simply bad (the running
+   deployment, not an infrastructure problem): `docs/rollback-runbook.md`
+   §1/§2 — redeploy the previous known-good image tag or task-
+   definition revision.
+3. If the cluster/service itself was accidentally deleted or
+   misconfigured (an infrastructure-level problem, not an application
+   one): this is runbook N (Terraform recovery) — the ECS
+   cluster/service/task-definition resources are Terraform-managed;
+   recreate them via `terraform apply` from the committed source,
+   never by hand via the AWS Console (a hand-created service would
+   immediately conflict with Terraform's own state on the next apply).
+4. The worker service specifically has no ALB target group — its
+   health signal is the container-level `HEALTHCHECK`
+   (`scripts/worker-healthcheck.js`) only; `aws ecs describe-tasks`
+   for the specific running task ARN shows its health status directly
+   when `GET /admin/watchers` is unreachable (e.g. the API itself is
+   also down).
+
+**Safety checks**: never manually scale a service to 0 and back up "to
+reset it" without first understanding why it's unhealthy — for the
+worker specifically (`desired_count = 1`), a manual scale-to-0 stops
+all deposit/withdrawal watching for the outage's duration; the
+lease/idempotency design (docs/deployment-architecture.md §3) makes
+this safe to resume, but it is not a free action to take repeatedly.
+
+**Validation**: `aws ecs describe-services` shows the service at its
+desired count, `runningCount == desiredCount`; `GET /health`,
+`GET /health/ready` (web/API), or a fresh worker heartbeat file
+timestamp (worker) confirm real traffic is being served, not just that
+ECS reports "steady state."
+
+**Escalation**: Sev1 if this is a production outage; Sev2 for staging.
+
+**Do NOT**: bypass the deployment circuit breaker by disabling it
+(`enable_deployment_circuit_breaker = false`) as a way to "force" a
+bad deployment through — fix the actual cause instead.
+
+## P. ECR image recovery
+
+**Status: NOT APPLICABLE TODAY** — no ECR repository has ever been
+provisioned.
+
+**Prerequisites**: a needed image tag appears to be missing, or the
+ECR lifecycle policy (`modules/ecr`) has expired an image still
+needed for a rollback.
+
+**Actions**:
+1. **Immutable tags mean no image is ever silently lost to a bad
+   push** — `image_tag_mutability = "IMMUTABLE"` guarantees a
+   successfully-pushed tag's content never changes. If a tag appears
+   to be missing, it was either never pushed, or expired by the
+   lifecycle policy (untagged images after N days; only the most
+   recent N tagged images retained — `modules/ecr/main.tf`'s exact
+   numbers).
+2. **If the needed image was expired by the retention policy**: it
+   must be rebuilt from source and re-pushed under a NEW tag (the
+   original commit SHA tag cannot be reused once expired and deleted —
+   ECR does not support "undelete"). `.github/workflows/ecr-publish.yml`,
+   run with a blank `image_tag` against the specific commit checked
+   out (`git checkout <old-sha>` before running the workflow, or a
+   manually-triggered build from that ref) reproduces it, assuming the
+   source code and Dockerfiles at that commit still build cleanly.
+3. **This is why the lifecycle policy's retention count matters for
+   real rollback capability** — `docs/aws-cost-governance.md` §2's
+   cost/retention tradeoff directly determines how far back a rollback
+   can reach before requiring a rebuild rather than a redeploy of an
+   existing image. Not re-decided here; flagged as the operational
+   consequence of that existing cost decision.
+
+**Safety checks**: a rebuilt image from old source is NOT guaranteed
+byte-identical to the original (dependency resolution, base image
+patches) — treat a rebuild-based recovery as a new deployment
+requiring the full `verify-deployment` smoke-test gate, not as
+equivalent to redeploying the original artifact.
+
+**Validation**: the new image passes `docker-build`'s CI smoke test
+(boots, serves `/health`/`/health/ready`) before being deployed.
+
+**Escalation**: Sev2 unless this is blocking an active incident
+rollback, in which case it inherits that incident's severity.
+
+**Do NOT**: increase the ECR lifecycle policy's retention indefinitely
+"just in case" without weighing the real storage cost
+(`docs/aws-cost-governance.md`) — a deliberate, bounded retention with
+a documented rebuild path (above) is the intended design, not a gap.
+
+## Q. Secrets Manager recovery
+
+**Status: NOT APPLICABLE TODAY** — no Secrets Manager secret has ever
+been created (`modules/secrets` creates OBJECTS only, no value, and
+nothing has been applied).
+
+**Prerequisites**: a Secrets Manager secret is accidentally deleted, or
+its value is lost/corrupted (e.g. an operator error during manual
+rotation).
+
+**Actions**:
+1. Secrets Manager's own `recovery_window_in_days` (set per-secret in
+   `modules/secrets`/`modules/database`, default 30 days) means an
+   accidental `DeleteSecret` is recoverable via `aws secretsmanager
+   restore-secret` within that window — **prefer this over recreating
+   the secret object**, since a recreated object gets a new ARN, which
+   would then require updating every ECS task definition's `secrets`
+   block that referenced the old ARN (a Terraform change, not a quick
+   fix).
+2. For the `DATABASE_URL` secret specifically
+   (`modules/database/main.tf`'s `aws_secretsmanager_secret_version.database_url`):
+   Terraform manages both the RDS master password (`random_password`)
+   and this secret's value together — if the secret's VALUE is lost
+   but the object still exists, the safest recovery is `terraform
+   apply` (which will detect the drift and can regenerate/reassert the
+   composed connection string) rather than manually reconstructing the
+   connection string from memory.
+3. For every other secret (JWT, Postmark, Fireblocks/Elliptic sandbox
+   credentials): these are never Terraform-managed VALUES (`modules/secrets`'
+   own design) — recovery means a human re-entering the real value via
+   the AWS Console/CLI from whatever the credential's own source of
+   truth is (e.g. re-generating a new JWT secret, or re-issuing a new
+   Postmark server token from the Postmark dashboard if the old one is
+   truly lost, not just misplaced).
+4. **After restoring any secret**, redeploy every ECS service that
+   reads it (no live-reload — `docs/operations-runbook.md` §10) and
+   confirm via `verify-deployment`'s smoke test that the affected
+   functionality (email sending, DB connectivity, custody/compliance
+   calls) actually works with the restored value.
+
+**Safety checks**: never log, paste into a ticket, or otherwise persist
+a secret value outside Secrets Manager itself while recovering it —
+the same discipline this repository already applies everywhere else
+(`redact.util.ts`, this phase's own scripts' "never print a secret
+value" rule).
+
+**Validation**: the dependent service(s) function correctly post-
+restore (§6, "After restoring any secret" above).
+
+**Escalation**: Sev1 if the lost secret is `DATABASE_URL` or a JWT
+secret (both are availability-affecting for the whole application);
+Sev2 for a single provider credential affecting only that integration.
+
+**Do NOT**: rotate every OTHER secret "while you're in there" during a
+single-secret recovery — an unplanned mass rotation is its own
+availability risk (forces every active session to re-authenticate) and
+is out of scope for a targeted recovery action.

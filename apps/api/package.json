@@ -23,6 +23,9 @@
     "backup:drill": "node scripts/backup-restore-drill.js",
     "check:integrity": "node scripts/financial-integrity-checks.js",
     "check:production-readiness": "node scripts/production-readiness-check.js",
+    "check:migration-safety": "node scripts/check-migration-safety.js",
+    "preflight:production": "node scripts/production-preflight.js",
+    "smoke-test:production": "node scripts/production-smoke-test.js",
     "bootstrap:super-admin": "node scripts/bootstrap-super-admin.js"
   },
   "dependencies": {
