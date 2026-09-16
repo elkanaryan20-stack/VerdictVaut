@@ -97,6 +97,50 @@ export class MarketsService {
   }
 
   /**
+   * Temporarily halts trading without touching any resting order/
+   * reservation — unlike close(), which is permanent and terminates the
+   * book. New order creation is already gated on status === OPEN
+   * elsewhere (OrdersService), so this alone is sufficient to stop new
+   * orders; existing resting orders remain exactly as they were and can
+   * still be cancelled by their owner (order cancellation has no
+   * market-status precondition) while paused. Intended for e.g. halting
+   * trading during a live dispute about a market's terms, without the
+   * irreversible step of closing/resolving it.
+   */
+  async pause(marketId: string, adminId: string) {
+    return this.transitionStatus(marketId, adminId, [MarketStatus.OPEN], MarketStatus.PAUSED, "market.pause");
+  }
+
+  /** Reverses pause() — the only path back to OPEN once paused. */
+  async resume(marketId: string, adminId: string) {
+    return this.transitionStatus(marketId, adminId, [MarketStatus.PAUSED], MarketStatus.OPEN, "market.resume");
+  }
+
+  /**
+   * Aborts a market before it was ever opened — deliberately restricted
+   * to DRAFT only. This is the one CANCELLED transition this phase
+   * implements: since order creation is gated on status === OPEN
+   * (OrdersService), a DRAFT market can structurally never have an
+   * order, fill, position, or reservation against it, so cancelling one
+   * is a pure status flip with zero financial side effects to unwind —
+   * safe to implement without any new settlement-like machinery.
+   *
+   * Deliberately NOT implemented here: cancelling an OPEN/PAUSED/CLOSED
+   * market that already has real trading activity. That would require
+   * unwinding filled positions and any minted complete-set collateral
+   * (effectively a second settlement path that refunds instead of pays
+   * a winner) — a genuinely new, high-risk financial feature, not a
+   * gap-closing fix, and explicitly out of this phase's scope. A market
+   * that already opened and needs to be aborted still has a safe path
+   * today: close() it, then resolve() it once a fair winning outcome
+   * can be determined (or leave it CLOSED indefinitely — resolution is
+   * never forced to happen immediately).
+   */
+  async cancel(marketId: string, adminId: string) {
+    return this.transitionStatus(marketId, adminId, [MarketStatus.DRAFT], MarketStatus.CANCELLED, "market.cancel");
+  }
+
+  /**
    * Unlike the generic transitionStatus() path open() uses, closing a
    * market also terminates every order still resting on its book — once
    * CLOSED, a market can never return to OPEN, and matching/new-order

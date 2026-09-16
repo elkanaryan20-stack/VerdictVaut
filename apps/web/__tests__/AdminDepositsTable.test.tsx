@@ -114,4 +114,40 @@ describe("AdminDepositsTable", () => {
     renderWithQueryClient(<AdminDepositsTable />);
     expect(await screen.findByText("Couldn't load deposits.")).toBeInTheDocument();
   });
+
+  describe("pagination (Phase 30)", () => {
+    it("requests page 1 on first render, and Previous is disabled", async () => {
+      mockedUseAuth.mockReturnValue({ user: { role: "ADMIN" } });
+      mockedApi.fetchAdminDeposits.mockResolvedValue([deposit()]);
+      renderWithQueryClient(<AdminDepositsTable />);
+      await screen.findByText("trader@example.com");
+
+      expect(mockedApi.fetchAdminDeposits).toHaveBeenCalledWith(1, 50);
+      expect(screen.getByRole("button", { name: /previous/i })).toBeDisabled();
+    });
+
+    it("Next is disabled when a page returns fewer rows than the page size (no more pages)", async () => {
+      mockedUseAuth.mockReturnValue({ user: { role: "ADMIN" } });
+      mockedApi.fetchAdminDeposits.mockResolvedValue([deposit()]); // 1 row, page size 50
+      renderWithQueryClient(<AdminDepositsTable />);
+      await screen.findByText("trader@example.com");
+
+      expect(screen.getByRole("button", { name: /next/i })).toBeDisabled();
+    });
+
+    it("Next is enabled and advances to page 2 when a page returns a full page of rows", async () => {
+      mockedUseAuth.mockReturnValue({ user: { role: "ADMIN" } });
+      const fullPage = Array.from({ length: 50 }, (_, i) => deposit({ id: `deposit-${i}`, txHash: `0x${i}`, user: { id: `user-${i}`, email: `trader-${i}@example.com` } }));
+      mockedApi.fetchAdminDeposits.mockResolvedValue(fullPage);
+      const user = userEvent.setup();
+      renderWithQueryClient(<AdminDepositsTable />);
+      await screen.findByText("trader-0@example.com");
+
+      const nextButton = screen.getByRole("button", { name: /next/i });
+      expect(nextButton).not.toBeDisabled();
+
+      await user.click(nextButton);
+      expect(mockedApi.fetchAdminDeposits).toHaveBeenCalledWith(2, 50);
+    });
+  });
 });

@@ -380,12 +380,54 @@ export class AuthService {
       throw new UnauthorizedException("Invalid or expired refresh token");
     }
 
+    // Phase 30 — deliberately NOT filtering revokedAt: null here (unlike
+    // the previous version of this query): finding the row AT ALL, even
+    // revoked, is what lets step below distinguish "this exact token was
+    // already rotated out and is now being REPLAYED" (a real theft
+    // signal — see below) from "this token never existed" (fabricated/
+    // already garbage-collected, no session-level action possible).
     const tokenHash = hashToken(refreshToken);
     const stored = await this.prisma.refreshToken.findFirst({
-      where: { userId: payload.sub, tokenHash, revokedAt: null },
+      where: { userId: payload.sub, tokenHash },
     });
 
-    if (!stored || stored.expiresAt < new Date()) {
+    if (!stored) {
+      throw new UnauthorizedException("Refresh token is no longer valid");
+    }
+
+    if (stored.revokedAt) {
+      // Reuse-detection: a legitimate client only ever presents each
+      // refresh token once (rotation immediately revokes it below) — a
+      // SECOND presentation of an already-revoked token means either an
+      // attacker replaying a captured token after the real client
+      // already rotated past it, or (far less likely) a client-side bug
+      // resubmitting a stale token. Either way, the safe response is the
+      // same standard OAuth "refresh token reuse" mitigation: treat the
+      // whole session chain as potentially compromised and revoke every
+      // active session for this user, not just reject this one request
+      // — an attacker holding a captured token could otherwise keep
+      // retrying indefinitely against whichever token they captured,
+      // and a legitimate still-valid token elsewhere would keep working
+      // for them too. This never happens on the honest rotation path
+      // (a fresh token's revokedAt is always null until its own next
+      // rotation), so it costs a genuine client nothing.
+      const revoked = await this.prisma.refreshToken.updateMany({
+        where: { userId: payload.sub, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      await this.auditLog.record({
+        actorId: payload.sub,
+        actorType: AuditActorType.USER,
+        action: "user.refresh_token_reuse_detected",
+        resourceType: "User",
+        resourceId: payload.sub,
+        reason: "an already-revoked (rotated-out) refresh token was presented again — every active session for this account has been revoked as a precaution",
+        after: { sessionsRevoked: revoked.count },
+      });
+      throw new UnauthorizedException("Refresh token is no longer valid");
+    }
+
+    if (stored.expiresAt < new Date()) {
       throw new UnauthorizedException("Refresh token is no longer valid");
     }
 

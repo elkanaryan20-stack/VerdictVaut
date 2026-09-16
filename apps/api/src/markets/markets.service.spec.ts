@@ -177,4 +177,82 @@ describe("MarketsService", () => {
       );
     });
   });
+
+  describe("pause/resume", () => {
+    it("pause() transitions OPEN -> PAUSED and audits the change", async () => {
+      prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "OPEN" });
+      prisma.market.updateMany.mockResolvedValue({ count: 1 });
+      prisma.market.findUniqueOrThrow.mockResolvedValue({ id: "market-1", status: "PAUSED" });
+
+      const result = await service.pause("market-1", "admin-1");
+
+      expect(result.status).toBe("PAUSED");
+      expect(prisma.market.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "market-1", status: { in: ["OPEN"] } }, data: { status: "PAUSED" } }),
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "market.pause", before: { status: "OPEN" }, after: { status: "PAUSED" } }),
+      );
+    });
+
+    it("pause() rejects a market that is not OPEN", async () => {
+      prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "DRAFT" });
+      prisma.market.updateMany.mockResolvedValue({ count: 0 });
+      await expect(service.pause("market-1", "admin-1")).rejects.toThrow(ConflictException);
+    });
+
+    it("resume() transitions PAUSED -> OPEN and audits the change", async () => {
+      prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "PAUSED" });
+      prisma.market.updateMany.mockResolvedValue({ count: 1 });
+      prisma.market.findUniqueOrThrow.mockResolvedValue({ id: "market-1", status: "OPEN" });
+
+      const result = await service.resume("market-1", "admin-1");
+
+      expect(result.status).toBe("OPEN");
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "market.resume", before: { status: "PAUSED" }, after: { status: "OPEN" } }),
+      );
+    });
+
+    it("resume() rejects a market that is not PAUSED", async () => {
+      prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "OPEN" });
+      prisma.market.updateMany.mockResolvedValue({ count: 0 });
+      await expect(service.resume("market-1", "admin-1")).rejects.toThrow(ConflictException);
+    });
+
+    it("pause() never touches resting orders — unlike close(), the book stays intact", async () => {
+      prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "OPEN" });
+      prisma.market.updateMany.mockResolvedValue({ count: 1 });
+      prisma.market.findUniqueOrThrow.mockResolvedValue({ id: "market-1", status: "PAUSED" });
+
+      await service.pause("market-1", "admin-1");
+
+      expect(ordersService.expireRestingOrdersForMarket).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("cancel", () => {
+    it("cancel() transitions DRAFT -> CANCELLED and audits the change", async () => {
+      prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "DRAFT" });
+      prisma.market.updateMany.mockResolvedValue({ count: 1 });
+      prisma.market.findUniqueOrThrow.mockResolvedValue({ id: "market-1", status: "CANCELLED" });
+
+      const result = await service.cancel("market-1", "admin-1");
+
+      expect(result.status).toBe("CANCELLED");
+      expect(prisma.market.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "market-1", status: { in: ["DRAFT"] } }, data: { status: "CANCELLED" } }),
+      );
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "market.cancel", before: { status: "DRAFT" }, after: { status: "CANCELLED" } }),
+      );
+    });
+
+    it("cancel() rejects a market that already left DRAFT (e.g. OPEN) — no cancellation path once real trading could have occurred", async () => {
+      prisma.market.findUnique.mockResolvedValue({ id: "market-1", status: "OPEN" });
+      prisma.market.updateMany.mockResolvedValue({ count: 0 });
+      await expect(service.cancel("market-1", "admin-1")).rejects.toThrow(ConflictException);
+      expect(ordersService.expireRestingOrdersForMarket).not.toHaveBeenCalled();
+    });
+  });
 });

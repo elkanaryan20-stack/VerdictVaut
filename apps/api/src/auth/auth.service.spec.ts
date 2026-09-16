@@ -312,11 +312,42 @@ describe("AuthService", () => {
       await expect(service.refresh("garbage")).rejects.toThrow(UnauthorizedException);
     });
 
-    it("rejects a refresh token that was already revoked (reuse after rotation)", async () => {
+    it("rejects a refresh token that never existed (fabricated or already garbage-collected)", async () => {
       jwt.verifyAsync.mockResolvedValue({ sub: "user-1" });
-      prisma.refreshToken.findFirst.mockResolvedValue(null); // revoked tokens are excluded by the query
+      prisma.refreshToken.findFirst.mockResolvedValue(null);
 
       await expect(service.refresh("some.jwt.token")).rejects.toThrow(UnauthorizedException);
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("Phase 30 — reuse of an already-revoked (rotated-out) token revokes EVERY active session for this user, not just this request", async () => {
+      jwt.verifyAsync.mockResolvedValue({ sub: "user-1" });
+      prisma.refreshToken.findFirst.mockResolvedValue({
+        id: "stored-token-1",
+        expiresAt: new Date(Date.now() + 1_000_000),
+        revokedAt: new Date(Date.now() - 60_000), // already rotated out earlier
+      });
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 3 });
+
+      await expect(service.refresh("replayed.jwt.token")).rejects.toThrow(UnauthorizedException);
+
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { userId: "user-1", revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorId: "user-1",
+          action: "user.refresh_token_reuse_detected",
+          resourceType: "User",
+          resourceId: "user-1",
+          after: { sessionsRevoked: 3 },
+        }),
+      );
+      // The token that was actually presented must never be re-marked
+      // "rotated" (it was already revoked) — only the blanket
+      // revoke-all above should run; no fresh token pair is issued.
+      expect(prisma.refreshToken.update).not.toHaveBeenCalled();
     });
 
     it("rotates a valid refresh token: revokes the old one and issues a new pair", async () => {
@@ -324,6 +355,7 @@ describe("AuthService", () => {
       prisma.refreshToken.findFirst.mockResolvedValue({
         id: "stored-token-1",
         expiresAt: new Date(Date.now() + 1_000_000),
+        revokedAt: null,
       });
       prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", role: "USER", status: "ACTIVE" });
       prisma.refreshToken.update.mockResolvedValue({});

@@ -65,6 +65,32 @@ export class MarketsController {
     return this.marketsService.close(id, user.id);
   }
 
+  @Post(":id/pause")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  pause(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.marketsService.pause(id, user.id);
+  }
+
+  @Post(":id/resume")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  resume(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.marketsService.resume(id, user.id);
+  }
+
+  // DRAFT-only (see MarketsService.cancel's own docblock for why) — but
+  // still reserved to SUPER_ADMIN, matching resolve()/retry-settlement's
+  // restriction: any irreversible terminal-status transition on a
+  // market is a platform-control action, not an ordinary ADMIN one.
+  @Post(":id/cancel")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  cancel(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.marketsService.cancel(id, user.id);
+  }
+
   // Decides the winning outcome and attempts settlement immediately.
   // Market resolution moves real money (settlement payouts) and is a
   // platform-control action reserved to the single SUPER_ADMIN authority

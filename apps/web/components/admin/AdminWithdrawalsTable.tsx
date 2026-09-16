@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useApproveWithdrawal, useAdminWithdrawals, useReconcileWithdrawal, useRejectWithdrawal } from "../../lib/admin/hooks";
 import { ApiError } from "../../lib/api-client";
 import { formatDateTime, formatExactAmount, truncateMiddle } from "../../lib/format";
@@ -12,6 +13,8 @@ import { Card, CardBody, CardHeader, CardTitle } from "../ui/Card";
 import { Dialog } from "../ui/Dialog";
 import { Skeleton } from "../ui/Skeleton";
 import { TextField } from "../ui/TextField";
+
+const PAGE_SIZE = 50;
 
 // Mirrors WithdrawalsService's own CAS-guarded allowed-from sets exactly
 // (see withdrawals.service.ts: approve() casTransition([RISK_REVIEW]),
@@ -32,7 +35,8 @@ const REJECTABLE = new Set(["REQUESTED", "RISK_REVIEW", "APPROVED"]);
 export function AdminWithdrawalsTable() {
   const { user } = useAuth();
   const canDecide = user?.role === "SUPER_ADMIN";
-  const withdrawalsQuery = useAdminWithdrawals();
+  const [page, setPage] = useState(1);
+  const withdrawalsQuery = useAdminWithdrawals(page, PAGE_SIZE);
   const approveMutation = useApproveWithdrawal();
   const rejectMutation = useRejectWithdrawal();
   const reconcileMutation = useReconcileWithdrawal();
@@ -44,6 +48,9 @@ export function AdminWithdrawalsTable() {
 
   const withdrawals = withdrawalsQuery.data ?? [];
   const reconcileReport = reconcileMutation.data;
+  // Same "no total count in this response shape" reasoning as
+  // AdminDepositsTable — see fetchAdminWithdrawals' own comment.
+  const mightHaveNextPage = withdrawals.length === PAGE_SIZE;
 
   function handleApprove() {
     if (!approvingId) return;
@@ -95,8 +102,9 @@ export function AdminWithdrawalsTable() {
       )}
 
       {!withdrawalsQuery.isLoading && !withdrawalsQuery.isError && withdrawals.length > 0 && (
+        <div className={withdrawalsQuery.isPlaceholderData ? "opacity-60 transition-opacity" : "transition-opacity"}>
         <div className="divide-y divide-vault-border">
-          {withdrawals.slice(0, 50).map((withdrawal) => (
+          {withdrawals.map((withdrawal) => (
             <div key={withdrawal.id} className="flex flex-wrap items-start justify-between gap-3 px-5 py-3">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
@@ -160,6 +168,29 @@ export function AdminWithdrawalsTable() {
               )}
             </div>
           ))}
+        </div>
+
+          <div className="flex items-center justify-between border-t border-vault-border px-5 py-3">
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page <= 1}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-xs font-medium text-white/70 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-30"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
+              Previous
+            </button>
+            <p className="text-xs text-white/40">Page {page}</p>
+            <button
+              type="button"
+              onClick={() => setPage((p) => p + 1)}
+              disabled={!mightHaveNextPage}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-xs font-medium text-white/70 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-30"
+            >
+              Next
+              <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
         </div>
       )}
 

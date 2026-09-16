@@ -14,8 +14,19 @@ import {
 import { apiFetch } from "../api-client";
 import { parseOrThrow } from "../api-validation";
 
-export async function fetchAdminDeposits(): Promise<AdminDeposit[]> {
-  const data = await apiFetch<unknown>("/admin/deposits");
+/**
+ * GET /admin/deposits deliberately returns a plain array, not
+ * {items, total} (Phase 11 — kept the response shape to avoid an
+ * API-contract break when pagination was first added server-side), so
+ * there is no real "total" this client can show. page/pageSize are
+ * still real query params the backend honors (deposits.service.ts's
+ * listAll) — callers use the returned array's length against the
+ * pageSize they requested to infer whether a next page might exist
+ * (see AdminDepositsTable's own pagination logic), never a guess.
+ */
+export async function fetchAdminDeposits(page = 1, pageSize = 50): Promise<AdminDeposit[]> {
+  const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+  const data = await apiFetch<unknown>(`/admin/deposits?${params.toString()}`);
   return parseOrThrow(AdminDepositListSchema, data, "GET /admin/deposits");
 }
 
@@ -49,8 +60,10 @@ export async function reprocessDeposit(depositId: string): Promise<void> {
   await apiFetch<unknown>(`/admin/deposits/${encodeURIComponent(depositId)}/reprocess`, { method: "POST" });
 }
 
-export async function fetchAdminWithdrawals(): Promise<AdminWithdrawal[]> {
-  const data = await apiFetch<unknown>("/admin/withdrawals");
+/** Same plain-array response-shape note as fetchAdminDeposits above applies here. */
+export async function fetchAdminWithdrawals(page = 1, pageSize = 50): Promise<AdminWithdrawal[]> {
+  const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+  const data = await apiFetch<unknown>(`/admin/withdrawals?${params.toString()}`);
   return parseOrThrow(AdminWithdrawalListSchema, data, "GET /admin/withdrawals");
 }
 

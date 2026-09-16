@@ -369,6 +369,29 @@ async function runDbChecks() {
       true, // informational only — a count alone can't tell us if the provider behind it is real
       `${productionCustodyConfigs} asset/network(s) configured for PRODUCTION_CUSTODY — verify each is backed by a real, tested integration, not just a config row`,
     );
+
+    // Phase 30 — RegisterDto/LoginDto now normalize a new user's email
+    // to lowercase before it reaches the DB (closing a real
+    // false-lockout gap), and migration 20260918000000 normalized every
+    // pre-existing row it could safely normalize — but it deliberately
+    // left any row alone where lowercasing would collide with another
+    // existing account, rather than guessing which to keep. This check
+    // surfaces any such residual collision so an operator can resolve
+    // it deliberately, rather than it silently persisting forever.
+    const duplicateCaseEmails = await prisma.$queryRaw`
+      SELECT LOWER(email) AS normalized, COUNT(*) AS count
+      FROM "users"
+      GROUP BY LOWER(email)
+      HAVING COUNT(*) > 1
+    `;
+    check(
+      "No two User accounts share a case-insensitive-duplicate email",
+      "P1",
+      duplicateCaseEmails.length === 0,
+      duplicateCaseEmails.length === 0
+        ? "none found"
+        : `${duplicateCaseEmails.length} colliding email(s) found — these predate email normalization (migration 20260918000000 deliberately left them untouched rather than guessing which account to keep) and need a human decision, not an automated merge`,
+    );
   } catch (error) {
     check("Database is reachable", "P0", false, error.message);
   } finally {

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useReprocessDeposit, useAdminDeposits, useStaleDeposits } from "../../lib/admin/hooks";
 import { ApiError } from "../../lib/api-client";
 import { formatExactAmount, formatDateTime, truncateMiddle } from "../../lib/format";
@@ -11,6 +12,8 @@ import { Card, CardBody, CardHeader, CardTitle } from "../ui/Card";
 import { Dialog } from "../ui/Dialog";
 import { Skeleton } from "../ui/Skeleton";
 import { DepositStatusBadge } from "../wallet/DepositStatusBadge";
+
+const PAGE_SIZE = 50;
 
 /**
  * ADMIN and SUPER_ADMIN can both view this (GET /admin/deposits and GET
@@ -24,7 +27,8 @@ import { DepositStatusBadge } from "../wallet/DepositStatusBadge";
 export function AdminDepositsTable() {
   const { user } = useAuth();
   const canReprocess = user?.role === "SUPER_ADMIN";
-  const depositsQuery = useAdminDeposits();
+  const [page, setPage] = useState(1);
+  const depositsQuery = useAdminDeposits(page, PAGE_SIZE);
   const staleQuery = useStaleDeposits();
   const reprocessMutation = useReprocessDeposit();
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
@@ -33,6 +37,11 @@ export function AdminDepositsTable() {
   const isError = depositsQuery.isError;
   const deposits = depositsQuery.data ?? [];
   const staleIds = new Set((staleQuery.data ?? []).map((d) => d.id));
+  // GET /admin/deposits returns a plain array, no total count (see
+  // fetchAdminDeposits' own comment) — a full page means there MIGHT be
+  // more, not a definite fact, so Next stays enabled until a
+  // short/empty page proves otherwise. Never shows a fabricated total.
+  const mightHaveNextPage = deposits.length === PAGE_SIZE;
 
   function handleConfirmReprocess() {
     if (!confirmingId) return;
@@ -73,30 +82,54 @@ export function AdminDepositsTable() {
       )}
 
       {!isLoading && !isError && deposits.length > 0 && (
-        <div className="divide-y divide-vault-border overflow-x-auto">
-          {deposits.slice(0, 50).map((deposit) => {
-            const needsAttention = staleIds.has(deposit.id);
-            return (
-              <div key={deposit.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="truncate text-sm text-white">{deposit.user.email}</span>
-                    <DepositStatusBadge status={deposit.status} />
-                    {needsAttention && <Badge tone="down">Needs attention</Badge>}
+        <div className={depositsQuery.isPlaceholderData ? "opacity-60 transition-opacity" : "transition-opacity"}>
+          <div className="divide-y divide-vault-border overflow-x-auto">
+            {deposits.map((deposit) => {
+              const needsAttention = staleIds.has(deposit.id);
+              return (
+                <div key={deposit.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="truncate text-sm text-white">{deposit.user.email}</span>
+                      <DepositStatusBadge status={deposit.status} />
+                      {needsAttention && <Badge tone="down">Needs attention</Badge>}
+                    </div>
+                    <p className="mt-1 text-xs text-white/40">
+                      {formatExactAmount(deposit.amount)} {deposit.assetNetwork.asset.symbol} on {deposit.assetNetwork.network.name} ·{" "}
+                      {truncateMiddle(deposit.txHash)} · {formatDateTime(deposit.detectedAt)}
+                    </p>
                   </div>
-                  <p className="mt-1 text-xs text-white/40">
-                    {formatExactAmount(deposit.amount)} {deposit.assetNetwork.asset.symbol} on {deposit.assetNetwork.network.name} ·{" "}
-                    {truncateMiddle(deposit.txHash)} · {formatDateTime(deposit.detectedAt)}
-                  </p>
+                  {canReprocess && (
+                    <Button type="button" variant="secondary" size="sm" onClick={() => setConfirmingId(deposit.id)}>
+                      Reprocess
+                    </Button>
+                  )}
                 </div>
-                {canReprocess && (
-                  <Button type="button" variant="secondary" size="sm" onClick={() => setConfirmingId(deposit.id)}>
-                    Reprocess
-                  </Button>
-                )}
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
+
+          <div className="flex items-center justify-between border-t border-vault-border px-5 py-3">
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page <= 1}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-xs font-medium text-white/70 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-30"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
+              Previous
+            </button>
+            <p className="text-xs text-white/40">Page {page}</p>
+            <button
+              type="button"
+              onClick={() => setPage((p) => p + 1)}
+              disabled={!mightHaveNextPage}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-xs font-medium text-white/70 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-30"
+            >
+              Next
+              <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
         </div>
       )}
 

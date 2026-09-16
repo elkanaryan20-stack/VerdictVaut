@@ -13,6 +13,18 @@ datasource db {
 
 enum UserRole {
   USER
+  // Phase 30 note: reserved, not yet wired to any permission anywhere
+  // in this codebase (grepped every @Roles(...) call site — zero
+  // matches) — a user assigned this role is authorization-equivalent
+  // to USER everywhere today, never anything more. Not removed via a
+  // migration (which would mean recreating this column's enum type)
+  // because that risk is disproportionate to what is otherwise a
+  // purely cosmetic/inert placeholder — it grants nothing, so it
+  // cannot be escalated-privilege-abused. If a real risk-operations
+  // capability (e.g. read-only access to reconciliation/watcher
+  // admin endpoints without full ADMIN mutation rights) is ever
+  // wanted, wire it deliberately at that time rather than assuming
+  // this placeholder already means something.
   RISK_OPS
   ADMIN
   SUPER_ADMIN
