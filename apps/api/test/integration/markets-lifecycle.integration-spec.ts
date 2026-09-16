@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException } from "@nestjs/common";
 import {
   createTestMarket,
+  createTestSuperAdmin,
   createTestUser,
   fundUserForTest,
   getUserAccount,
@@ -10,8 +11,22 @@ import {
   ordersService,
   positionReservations,
   prisma,
+  resolutionService,
+  resolveWithoutAutoSettle,
   reservations,
 } from "./helpers";
+
+/** Attempts a trivial BUY order against `marketId` and returns the rejection (or lack of one). */
+async function attemptOrder(traderId: string, marketId: string, outcomeId: string) {
+  return ordersService.create(traderId, {
+    marketId,
+    outcomeId,
+    side: "BUY",
+    type: "LIMIT",
+    quantity: "10",
+    price: "0.5",
+  } as never);
+}
 
 describe("Market lifecycle (real Postgres)", () => {
   it("creates a DRAFT market with outcomes belonging to it", async () => {
@@ -84,6 +99,62 @@ describe("Market lifecycle (real Postgres)", () => {
         price: "0.5",
       } as never),
     ).rejects.toThrow(BadRequestException);
+  });
+
+  // Phase 31 — OrdersService.create()'s market-status guard is a single
+  // `status !== OPEN` check (orders.service.ts), not a per-state
+  // allowlist, so PAUSED/RESOLVING/RESOLVED/CANCELLED are all mechanically
+  // rejected by the exact same code path already proven for DRAFT/CLOSED
+  // above. That shared mechanism was previously never exercised by name
+  // for these 4 states — closing that gap explicitly, one state at a
+  // time, rather than trusting "it's the same check" without a test to
+  // back it.
+  it("rejects trading on a PAUSED market", async () => {
+    const admin = await createTestUser();
+    const trader = await createTestUser();
+    const { market, yes } = await createTestMarket(admin.id);
+    await openMarketForTest(market.id, admin.id);
+    await marketsService.pause(market.id, admin.id);
+
+    await expect(attemptOrder(trader.id, market.id, yes.id)).rejects.toThrow(BadRequestException);
+  });
+
+  it("rejects trading on a RESOLVING market", async () => {
+    const admin = await createTestUser();
+    const trader = await createTestUser();
+    const { market, yes } = await createTestMarket(admin.id);
+    await openMarketForTest(market.id, admin.id);
+    await marketsService.close(market.id, admin.id);
+    await resolveWithoutAutoSettle(market.id, yes.id, admin.id);
+
+    const midway = await prisma.market.findUniqueOrThrow({ where: { id: market.id } });
+    expect(midway.status).toBe("RESOLVING"); // confirms the fixture actually reached the state under test
+
+    await expect(attemptOrder(trader.id, market.id, yes.id)).rejects.toThrow(BadRequestException);
+  });
+
+  it("rejects trading on a RESOLVED market", async () => {
+    const admin = await createTestUser();
+    const superAdmin = await createTestSuperAdmin(); // resolve() requires SUPER_ADMIN specifically
+    const trader = await createTestUser();
+    const { market, yes } = await createTestMarket(admin.id);
+    await openMarketForTest(market.id, admin.id);
+    await marketsService.close(market.id, admin.id);
+    const resolved = await resolutionService.resolve(market.id, superAdmin.id, yes.id, "test resolution");
+    expect(resolved.status).toBe("RESOLVED");
+
+    await expect(attemptOrder(trader.id, market.id, yes.id)).rejects.toThrow(BadRequestException);
+  });
+
+  it("rejects trading on a CANCELLED market", async () => {
+    const admin = await createTestUser();
+    const trader = await createTestUser();
+    const { market, yes } = await createTestMarket(admin.id);
+    // CANCELLED is DRAFT-only reachable (Phase 30) — never opened.
+    const cancelled = await marketsService.cancel(market.id, admin.id);
+    expect(cancelled.status).toBe("CANCELLED");
+
+    await expect(attemptOrder(trader.id, market.id, yes.id)).rejects.toThrow(BadRequestException);
   });
 
   it("rejects an order whose outcome belongs to a different market", async () => {

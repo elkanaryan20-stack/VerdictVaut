@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { ExecutionCoordinator } from "../../src/trading/execution/execution-coordinator.service";
+import { FeeCalculator, FeeContext, FillFeeContext, FillFeeResult } from "../../src/trading/fees/fee-calculator.interface";
 import { OrdersService } from "../../src/trading/orders.service";
 import { MatchingAttemptFailedException } from "../../src/trading/trading.errors";
 import {
@@ -10,7 +11,11 @@ import {
   fundUserForTest,
   getUserAccount,
   grantPositionForTest,
+  ledger,
+  matchingEngine,
+  mintEngine,
   openMarketForTest,
+  orderBookService,
   orderRiskValidator,
   ordersService,
   positionReservations,
@@ -360,6 +365,67 @@ describe("Matching engine + execution coordinator (real Postgres)", () => {
     expect(entries.every((e) => e.account.houseAccountKey !== "FEE_REVENUE")).toBe(true);
   });
 
+  // Phase 31 — the zero-fee test above proves NOTHING about
+  // postTradeLedger's actual fee arithmetic (buyerDebit = cost +
+  // buyerFee, sellerCredit = cost - sellerFee, FEE_REVENUE =
+  // buyerFee + sellerFee): with ZeroFeeCalculator, every one of those
+  // terms is zero, so a sign error, a swapped buyer/seller fee, or a
+  // dropped FEE_REVENUE posting would all still pass it. This test
+  // wires a real ExecutionCoordinator to a fake, INTENTIONALLY
+  // ASYMMETRIC FeeCalculator (buyerFee != sellerFee) against the same
+  // real Postgres reservation/ledger/position machinery `executionCoordinator`
+  // itself uses — only the fee numbers are fake, every dollar movement
+  // they cause is real and independently re-derived from account
+  // balances, not trusted from the fee calculator's own return value.
+  class AsymmetricTestFeeCalculator implements FeeCalculator {
+    estimateBuyReserveFee(_context: FeeContext): Prisma.Decimal {
+      return new Prisma.Decimal("1"); // conservative reserve buffer covering the real buyerFee below
+    }
+    calculateFillFee(_context: FillFeeContext): FillFeeResult {
+      return { buyerFee: new Prisma.Decimal("0.3"), sellerFee: new Prisma.Decimal("0.1") };
+    }
+  }
+
+  it("nonzero, asymmetric fees post correctly: buyer pays cost+buyerFee, seller receives cost-sellerFee, FEE_REVENUE gets exactly buyerFee+sellerFee", async () => {
+    const feeCalc = new AsymmetricTestFeeCalculator();
+    const coordinator = new ExecutionCoordinator(prisma, txRunner, orderBookService, ledger, reservations, positionReservations, matchingEngine, mintEngine, feeCalc);
+    const orders = new OrdersService(prisma, reservations, positionReservations, orderRiskValidator, feeCalc, txRunner, coordinator);
+
+    const { market, yes } = await setup();
+    const buyer = await createTestUser();
+    const seller = await createTestUser();
+    await fundUserForTest(buyer.id, "USDC", "100");
+    await grantPositionForTest(seller.id, market.id, yes.id, "10");
+
+    await orders.create(seller.id, { marketId: market.id, outcomeId: yes.id, side: "SELL", type: "LIMIT", quantity: "10", price: "0.5" } as never);
+    const buyOrder = await orders.create(buyer.id, { marketId: market.id, outcomeId: yes.id, side: "BUY", type: "LIMIT", quantity: "10", price: "0.5" } as never);
+
+    const fills = await fillsFor(buyOrder.id);
+    expect(fills).toHaveLength(1);
+    expect(fills[0].fee.toString()).toBe("0.4"); // buyerFee (0.3) + sellerFee (0.1)
+
+    const buyerAccount = await getUserAccount(buyer.id, "USDC");
+    const sellerAccount = await getUserAccount(seller.id, "USDC");
+    // cost = 10 * 0.5 = 5. Buyer started with 100, must end at 100 - 5 - 0.3 = 94.7.
+    expect(buyerAccount?.cachedBalance.toString()).toBe("94.7");
+    // Seller started with 0 (only a Position was granted, no cash), must end at 5 - 0.1 = 4.9.
+    expect(sellerAccount?.cachedBalance.toString()).toBe("4.9");
+
+    const entries = await prisma.ledgerEntry.findMany({
+      where: { transaction: { referenceType: "Fill", referenceId: fills[0].id } },
+      include: { account: true },
+    });
+    expect(entries).toHaveLength(3); // buyer debit, seller credit, FEE_REVENUE credit
+    const feeEntry = entries.find((e) => e.account.houseAccountKey === "FEE_REVENUE");
+    expect(feeEntry?.amount.toString()).toBe("0.4"); // exactly buyerFee + sellerFee, never more, never less
+
+    // The order is fully FILLED — nothing should remain earmarked against
+    // it. reservedBalance must return to 0 so the buyer's full remaining
+    // cachedBalance (94.7) is actually AVAILABLE to trade with again, not
+    // silently locked up forever.
+    expect(buyerAccount?.reservedBalance.toString()).toBe("0");
+  });
+
   it("rejects trading on a market that has closed since the resting order was placed", async () => {
     const { market, yes } = await setup();
     const buyer = await createTestUser();
@@ -432,6 +498,43 @@ describe("Matching engine + execution coordinator (real Postgres)", () => {
         expect(buyerAccount?.reservedBalance.toString()).toBe("0"); // consumed exactly once, not twice
         const sellerAccount = await getUserAccount(seller.id, "USDC");
         expect(sellerAccount?.cachedBalance.toString()).toBe("5"); // credited exactly once
+      },
+    );
+
+    it(
+      "TWO INDEPENDENTLY-CONSTRUCTED ExecutionCoordinator instances (simulating two real worker/API processes, " +
+        "not one process racing itself) never double-apply the same crossing pair " +
+        "(every test above races the SAME shared `executionCoordinator` singleton against itself, which never " +
+        "proves the DB-level guarantee — Fill.idempotencyKey's UNIQUE constraint plus SERIALIZABLE re-validation — " +
+        "actually holds across two genuinely separate service instances with no shared in-memory state at all, " +
+        "the same distinction independent-reconciliation.integration-spec.ts already draws for reconciliation. " +
+        "Since coordination here is 100% DB-level (no in-process lock/cache anywhere in ExecutionCoordinator), a " +
+        "second instance is expected to behave identically to the same instance called twice — this proves that " +
+        "expectation rather than assuming it)",
+      async () => {
+        const coordinatorA = new ExecutionCoordinator(prisma, txRunner, orderBookService, ledger, reservations, positionReservations, matchingEngine, mintEngine, feeCalculator);
+        const coordinatorB = new ExecutionCoordinator(prisma, txRunner, orderBookService, ledger, reservations, positionReservations, matchingEngine, mintEngine, feeCalculator);
+
+        const { market, yes } = await setup();
+        const buyer = await createTestUser();
+        const seller = await createTestUser();
+        await fundUserForTest(buyer.id, "USDC", "100");
+        await grantPositionForTest(seller.id, market.id, yes.id, "10");
+
+        const buyOrder = await placeRestingOrderNoAutoMatch(buyer.id, market.id, yes.id, "BUY", "10", "0.5");
+        const sellOrder = await placeRestingOrderNoAutoMatch(seller.id, market.id, yes.id, "SELL", "10", "0.5");
+
+        const results = await Promise.allSettled([coordinatorA.matchAndExecute(sellOrder.id), coordinatorB.matchAndExecute(sellOrder.id)]);
+        expect(results.every((r) => r.status === "fulfilled")).toBe(true);
+
+        const fills = await fillsFor(buyOrder.id);
+        expect(fills).toHaveLength(1); // exactly one Fill even across two real, independent instances
+        expect(fills[0].quantity.toString()).toBe("10");
+
+        const buyerAccount = await getUserAccount(buyer.id, "USDC");
+        expect(buyerAccount?.reservedBalance.toString()).toBe("0");
+        const sellerAccount = await getUserAccount(seller.id, "USDC");
+        expect(sellerAccount?.cachedBalance.toString()).toBe("5");
       },
     );
 
@@ -790,6 +893,21 @@ describe("Matching engine + execution coordinator (real Postgres)", () => {
       expect(buyerAccount?.reservedBalance.toString()).toBe("0"); // consumed exactly once, not twice
       const sellerAccount = await getUserAccount(seller.id, "USDC");
       expect(sellerAccount?.cachedBalance.toString()).toBe("5"); // credited exactly once, not twice
+
+      // Phase 31 — the assertions above only ever proved the CASH side
+      // (reservedBalance/cachedBalance) isn't double-applied on retry;
+      // nothing previously asserted the buyer's own POSITION isn't
+      // duplicated too, even though updatePositions() is gated behind
+      // the exact same idempotent-Fill check as the ledger/reservation
+      // writes above (see ExecutionCoordinator.applyExecution — all four
+      // are inside the same `if (alreadyExisted) return` short-circuit).
+      // Explicitly named in this phase's brief ("duplicate fills cannot
+      // duplicate positions") as its own scenario, not assumed from the
+      // cash-side proof alone.
+      const buyerPosition = await prisma.position.findUniqueOrThrow({
+        where: { userId_marketId_outcomeId: { userId: buyer.id, marketId: market.id, outcomeId: yes.id } },
+      });
+      expect(buyerPosition.quantity.toString()).toBe("10"); // exactly one fill's worth, not two
     });
   });
 });

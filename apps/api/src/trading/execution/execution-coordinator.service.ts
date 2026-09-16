@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
-import { CompleteSetMint, Fill, MarketStatus, OrderStatus, Prisma } from "@prisma/client";
+import { CompleteSetMint, Fill, MarketStatus, OrderSide, OrderStatus, Prisma } from "@prisma/client";
 import { AccountRef, LedgerService } from "../../ledger/ledger.service";
 import { ReservationService } from "../../ledger/reservation.service";
 import { createIdempotent } from "../../prisma/idempotent-create.util";
@@ -260,10 +260,68 @@ export class ExecutionCoordinator {
       await this.postTradeLedger(tx, fill, instruction, executedQuantity, executionPrice, feeResult);
       await this.updateOrders(tx, buyOrder, sellOrder, executedQuantity);
       await this.updatePositions(tx, instruction, executedQuantity, executionPrice);
+      // Phase 31 fix — see releaseReservationIfOrderNowFilled's own
+      // docblock for the real bug this closes: consumeReservations()
+      // above only ever consumes the trade's actual cost, never the
+      // reservation's FULL earmarked amount (which is sized off the
+      // order's own limit price / fee buffer, both >= actual cost by
+      // design) — so whenever price improvement or a fee buffer leaves
+      // a nonzero unconsumed remainder AND this fill is what brings the
+      // order to FILLED, that remainder was previously never released,
+      // permanently locking part of the user's real balance as
+      // phantom "reserved."
+      await this.releaseReservationIfOrderNowFilled(tx, buyOrder, executedQuantity);
+      await this.releaseReservationIfOrderNowFilled(tx, sellOrder, executedQuantity);
 
       this.logger.log(`Execution applied`, { ...this.logContext(instruction), fillId: fill.id, quantity: executedQuantity.toString() });
       return fill;
     });
+  }
+
+  /**
+   * Releases whatever remains unconsumed in an order's own reservation
+   * the instant that order reaches FILLED (remainingQuantity hits
+   * zero) — a no-op (releases exactly 0) when the reservation was
+   * already fully consumed, which is why this is safe to call
+   * unconditionally on every execution rather than only when a
+   * remainder is suspected. Still resting orders (remainingQuantity >
+   * 0 after this fill) are correctly left untouched: the unconsumed
+   * portion of their reservation legitimately still earmarks funds/
+   * shares for whatever quantity remains open, exactly as
+   * cancel()/expireRestingOrdersForMarket() already rely on.
+   *
+   * A genuine, previously-undiscovered bug (Phase 31 adversarial
+   * certification): before this fix, a BUY order that filled at a
+   * BETTER price than its own limit (ordinary price improvement — see
+   * PriceTimePriorityMatchingEngine's own docblock, always uses the
+   * MAKER's price) or whose fee-estimate buffer exceeded the real fee
+   * charged, left its FundReservation permanently ACTIVE with a
+   * nonzero unconsumed amount once FILLED — cancel() only accepts
+   * OPEN/PARTIALLY_FILLED, so a FILLED order's reservation could never
+   * reach RELEASED any other way. The user's real cachedBalance was
+   * always correct (the ledger is authoritative and unaffected by
+   * this bug), but their AVAILABLE balance was permanently understated
+   * by the stuck remainder — real funds a user owned but could never
+   * actually place a new order with. ZeroFeeCalculator (ceiling on
+   * both fee buffer and fee itself) masked the fee-based half of this;
+   * ordinary price improvement made the OTHER half reachable in
+   * completely ordinary trading, unrelated to fees at all.
+   */
+  private async releaseReservationIfOrderNowFilled(
+    tx: Prisma.TransactionClient,
+    order: { id: string; side: OrderSide; remainingQuantity: Prisma.Decimal },
+    executedQuantity: Prisma.Decimal,
+  ): Promise<void> {
+    if (!order.remainingQuantity.minus(executedQuantity).isZero()) {
+      return;
+    }
+    if (order.side === "BUY") {
+      const reservation = await this.reservations.findActiveByReference(tx, "Order", order.id);
+      if (reservation) await this.reservations.release(tx, reservation.id);
+    } else {
+      const reservation = await this.positionReservations.findActiveByReference(tx, "Order", order.id);
+      if (reservation) await this.positionReservations.release(tx, reservation.id);
+    }
   }
 
   private async consumeReservations(
@@ -494,6 +552,13 @@ export class ExecutionCoordinator {
       await this.updateOrders(tx, buyOrderA, buyOrderB, executedQuantity);
       await this.increaseBuyerPosition(tx, instruction.buyerAUserId, instruction.marketId, instruction.outcomeAId, executedQuantity, priceA);
       await this.increaseBuyerPosition(tx, instruction.buyerBUserId, instruction.marketId, instruction.outcomeBId, executedQuantity, priceB);
+      // Same Phase 31 fix as applyExecution's own — see
+      // releaseReservationIfOrderNowFilled's docblock. A mint's price
+      // improvement ("any gap is the incoming side's price improvement,
+      // never destroyed" — complete-set-mint-engine.ts's own comment) is
+      // exactly the same reservation-leak shape as an ordinary trade's.
+      await this.releaseReservationIfOrderNowFilled(tx, buyOrderA, executedQuantity);
+      await this.releaseReservationIfOrderNowFilled(tx, buyOrderB, executedQuantity);
 
       this.logger.log(`Complete set minted`, { ...this.mintLogContext(instruction), mintId: mint.id, quantity: executedQuantity.toString() });
       return mint;

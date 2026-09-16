@@ -305,3 +305,40 @@ export async function createTestMarket(adminId: string, overrides: { closeTime?:
 export async function openMarketForTest(marketId: string, adminId: string) {
   return marketsService.open(marketId, adminId);
 }
+
+/**
+ * Phase 31 — moved here from resolution-settlement.integration-spec.ts
+ * (where it originated) so other spec files can reach a genuine,
+ * real-Postgres RESOLVING state without waiting on/depending on
+ * SettlementService's own auto-settle behavior. Writes the exact same
+ * rows resolve() itself would as of the CLOSED -> RESOLVING transition
+ * (MarketResolution + one Settlement row per outcome), deliberately
+ * STOPPING there — this is a test-fixture-construction helper, not a
+ * production code path; markets.service.ts/resolution.service.ts are
+ * unchanged.
+ */
+export async function resolveWithoutAutoSettle(marketId: string, winningOutcomeId: string, resolverId: string) {
+  return txRunner.run(async (tx) => {
+    const market = await tx.market.findUniqueOrThrow({ where: { id: marketId }, include: { outcomes: true } });
+    await tx.market.updateMany({ where: { id: marketId, status: "CLOSED" }, data: { status: "RESOLVING" } });
+    await tx.marketResolution.create({ data: { marketId, winningOutcomeId, resolverId } });
+    await tx.settlement.createMany({
+      data: market.outcomes.map((o) => ({
+        marketId,
+        outcomeId: o.id,
+        payoutPerShare: o.id === winningOutcomeId ? "1" : "0",
+        status: "COMPLETED",
+        processedAt: new Date(),
+      })),
+    });
+  });
+}
+
+/** Also moved here from resolution-settlement.integration-spec.ts (Phase 31) — a SUPER_ADMIN-owned, opened-then-closed market, the common precondition for anything resolution/settlement-adjacent. */
+export async function setupClosedMarket(overrides: { closeTime?: string } = {}) {
+  const admin = await createTestSuperAdmin();
+  const { market, yes, no } = await createTestMarket(admin.id, overrides);
+  await openMarketForTest(market.id, admin.id);
+  await marketsService.close(market.id, admin.id);
+  return { admin, market, yes, no };
+}

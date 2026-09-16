@@ -130,6 +130,88 @@ async function runIntegrityChecks(prisma) {
     `${badDiscrepancies.length} violation(s)`,
   );
 
+  // 10. Phase 31 — cross-validates the INCREMENTALLY-maintained
+  // LedgerAccount.reservedBalance "cache" (updated by
+  // ReservationService.reserve/consume/release, never recomputed from
+  // scratch) against the actual source-of-truth FundReservation rows.
+  // These are two representations of the same fact that could in
+  // principle drift apart from an application bug; this does not
+  // create a second source of truth, it audits the existing cache
+  // against the existing ledger of reservations, the same "independently
+  // audit a derived/cached field" pattern check #2/#7 above already use.
+  const reservedBalanceMismatches = await prisma.$queryRaw`
+    SELECT la.id
+    FROM "ledger_accounts" la
+    LEFT JOIN "fund_reservations" fr ON fr."accountId" = la.id AND fr.status = 'ACTIVE'
+    GROUP BY la.id, la."reservedBalance"
+    HAVING la."reservedBalance" != COALESCE(SUM(fr.amount - fr."consumedAmount"), 0)
+  `;
+  check(
+    "every LedgerAccount.reservedBalance equals the sum of its ACTIVE FundReservations' unconsumed amounts",
+    reservedBalanceMismatches.length === 0,
+    `${reservedBalanceMismatches.length} account(s) with a drifted reservedBalance`,
+  );
+
+  // 11. Same cross-validation, for the position/share-reservation side
+  // (PositionReservationService.reserve/consume/release maintains
+  // Position.reservedQuantity the same incremental way).
+  const reservedQuantityMismatches = await prisma.$queryRaw`
+    SELECT p.id
+    FROM "positions" p
+    LEFT JOIN "position_reservations" pr ON pr."positionId" = p.id AND pr.status = 'ACTIVE'
+    GROUP BY p.id, p."reservedQuantity"
+    HAVING p."reservedQuantity" != COALESCE(SUM(pr.amount - pr."consumedAmount"), 0)
+  `;
+  check(
+    "every Position.reservedQuantity equals the sum of its ACTIVE PositionReservations' unconsumed amounts",
+    reservedQuantityMismatches.length === 0,
+    `${reservedQuantityMismatches.length} position(s) with a drifted reservedQuantity`,
+  );
+
+  // 12. Every Fill must have a backing LedgerTransaction — the trade
+  // that moved real value never happened without the double-entry
+  // record of it (ExecutionCoordinator.postTradeLedger posts this in
+  // the SAME transaction as the Fill row itself, so this should be
+  // structurally impossible to violate under normal operation; this
+  // audits it independently, the same "catch data that predates a
+  // guarantee, e.g. after a restore" reasoning as check #8/#9).
+  const fillsWithoutLedgerEntry = await prisma.$queryRaw`
+    SELECT f.id FROM "fills" f
+    WHERE NOT EXISTS (
+      SELECT 1 FROM "ledger_transactions" lt
+      WHERE lt."referenceType" = 'Fill' AND lt."referenceId" = f.id
+    )
+  `;
+  check(
+    "every Fill has a backing LedgerTransaction",
+    fillsWithoutLedgerEntry.length === 0,
+    `${fillsWithoutLedgerEntry.length} of however many Fills total, missing a ledger record`,
+  );
+
+  // 13. Fee reconciliation — sum(Fill.fee) must equal every FEE_REVENUE
+  // house account's total credited balance, per asset. Currently a
+  // trivial always-zero-equals-zero check (ZeroFeeCalculator — see
+  // trading/fees/zero-fee.calculator.ts's own docblock, unchanged by
+  // this phase), but the assertion is real and forward-safe: the
+  // moment a non-zero FeeCalculator is ever wired in, this starts
+  // meaningfully verifying fee revenue actually reconciles rather than
+  // silently never having been checked at all.
+  const feeReconciliation = await prisma.$queryRaw`
+    SELECT
+      COALESCE((SELECT SUM(fee) FROM "fills"), 0) AS "totalFillFees",
+      COALESCE((
+        SELECT SUM(la."cachedBalance")
+        FROM "ledger_accounts" la
+        WHERE la."ownerType" = 'HOUSE' AND la."houseAccountKey" = 'FEE_REVENUE'
+      ), 0) AS "totalFeeRevenue"
+  `;
+  const { totalFillFees, totalFeeRevenue } = feeReconciliation[0];
+  check(
+    "total Fill.fee across every fill equals the FEE_REVENUE house account balance",
+    new Prisma.Decimal(totalFillFees).equals(new Prisma.Decimal(totalFeeRevenue)),
+    `fills=${totalFillFees} feeRevenueAccount=${totalFeeRevenue}`,
+  );
+
   return results;
 }
 

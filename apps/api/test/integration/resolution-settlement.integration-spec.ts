@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, ForbiddenException } from "@nestjs/common";
 import {
-  createTestSuperAdmin,
   createTestMarket,
+  createTestSuperAdmin,
   createTestUser,
   fundUserForTest,
   getUserAccount,
@@ -12,42 +12,10 @@ import {
   openMarketForTest,
   prisma,
   resolutionService,
+  resolveWithoutAutoSettle,
   settlementService,
-  txRunner,
+  setupClosedMarket,
 } from "./helpers";
-
-async function setupClosedMarket(overrides: { closeTime?: string } = {}) {
-  const admin = await createTestSuperAdmin();
-  const { market, yes, no } = await createTestMarket(admin.id, overrides);
-  await openMarketForTest(market.id, admin.id);
-  await marketsService.close(market.id, admin.id);
-  return { admin, market, yes, no };
-}
-
-/**
- * Mirrors ResolutionService.resolve()'s own transaction body exactly,
- * minus the synchronous auto-settle call — so tests can construct a
- * RESOLVING market with real, still-unsettled positions and race
- * settleMarket() against it deliberately, the same way Phase 3's
- * placeRestingOrderNoAutoMatch bypasses OrdersService.create's
- * auto-match to construct matching races on purpose.
- */
-async function resolveWithoutAutoSettle(marketId: string, winningOutcomeId: string, resolverId: string) {
-  return txRunner.run(async (tx) => {
-    const market = await tx.market.findUniqueOrThrow({ where: { id: marketId }, include: { outcomes: true } });
-    await tx.market.updateMany({ where: { id: marketId, status: "CLOSED" }, data: { status: "RESOLVING" } });
-    await tx.marketResolution.create({ data: { marketId, winningOutcomeId, resolverId } });
-    await tx.settlement.createMany({
-      data: market.outcomes.map((o) => ({
-        marketId,
-        outcomeId: o.id,
-        payoutPerShare: o.id === winningOutcomeId ? "1" : "0",
-        status: "COMPLETED",
-        processedAt: new Date(),
-      })),
-    });
-  });
-}
 
 describe("Market resolution & settlement (real Postgres)", () => {
   describe("resolution", () => {
