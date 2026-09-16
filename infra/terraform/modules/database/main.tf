@@ -94,8 +94,8 @@ resource "aws_db_instance" "this" {
   deletion_protection = var.deletion_protection
 
   backup_retention_period = var.backup_retention_days
-  backup_window            = var.backup_window
-  maintenance_window       = var.maintenance_window
+  backup_window           = var.backup_window
+  maintenance_window      = var.maintenance_window
 
   username = "verdictvaut"
   password = random_password.master.result
@@ -138,6 +138,6 @@ resource "aws_secretsmanager_secret" "database_url" {
 }
 
 resource "aws_secretsmanager_secret_version" "database_url" {
-  secret_id = aws_secretsmanager_secret.database_url.id
+  secret_id     = aws_secretsmanager_secret.database_url.id
   secret_string = "postgresql://verdictvaut:${random_password.master.result}@${aws_db_instance.this.address}:${aws_db_instance.this.port}/${var.db_name}?sslmode=require"
 }

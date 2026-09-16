@@ -21,7 +21,7 @@ variable "secret_names" {
     "credential design note" in modules/database/main.tf for why),
     output as modules/database's own `database_url_secret_arn`.
   EOT
-  type = list(string)
+  type        = list(string)
 }
 
 variable "recovery_window_days" {

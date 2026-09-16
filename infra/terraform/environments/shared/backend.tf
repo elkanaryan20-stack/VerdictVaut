@@ -14,7 +14,7 @@ terraform {
     bucket         = "verdictvaut-terraform-state" # EXAMPLE ONLY — does not exist
     key            = "shared/terraform.tfstate"    # separate key from staging AND production
     region         = "us-east-1"                   # EXAMPLE ONLY — see docs/aws-production-architecture.md §10
-    dynamodb_table = "verdictvaut-terraform-locks"  # EXAMPLE ONLY — does not exist
+    dynamodb_table = "verdictvaut-terraform-locks" # EXAMPLE ONLY — does not exist
     encrypt        = true
   }
 }

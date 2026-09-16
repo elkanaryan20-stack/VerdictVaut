@@ -5,6 +5,18 @@
 # NAT gateway(s) per var.nat_gateway_per_az, and the 5 security groups
 # from that document's §5. No security group here ever allows inbound
 # from 0.0.0.0/0 except the ALB's own listener ports.
+#
+# Phase 28 fix: every aws_security_group/ingress/egress `description`
+# previously used an em-dash or an apostrophe, both outside the AWS
+# provider's own restricted regex for this field
+# (^[0-9A-Za-z_ .:/()#,@\[\]+=&;{}!$*-]*$). Invisible to every prior
+# phase's eye-only static review (Terraform was never installed in any
+# session before this one - see infra/terraform/README.md's own
+# long-standing caveat). Caught this phase by installing `terraform`
+# locally for the first time and running a real `terraform validate`
+# against every environment, which rejects this exact regex violation
+# at plan-time (not just at apply-time against a real account); all 9
+# occurrences reworded to plain ASCII.
 
 locals {
   name_prefix = "verdictvaut-${var.environment}"
@@ -169,7 +181,7 @@ resource "aws_route_table_association" "db" {
 
 resource "aws_security_group" "alb" {
   name        = "${local.name_prefix}-alb-sg"
-  description = "Public ALB — the only security group in this design with an inbound rule from 0.0.0.0/0."
+  description = "Public ALB - the only security group in this design with an inbound rule from 0.0.0.0/0."
   vpc_id      = aws_vpc.this.id
 
   ingress {
@@ -181,7 +193,7 @@ resource "aws_security_group" "alb" {
   }
 
   ingress {
-    description = "HTTP from the internet — redirect listener only, never forwards to a target"
+    description = "HTTP from the internet - redirect listener only, never forwards to a target"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -204,7 +216,7 @@ resource "aws_security_group" "alb" {
 
 resource "aws_security_group" "web_task" {
   name        = "${local.name_prefix}-web-task-sg"
-  description = "verdictvaut-web ECS tasks — inbound from the ALB security group only."
+  description = "verdictvaut-web ECS tasks - inbound from the ALB security group only."
   vpc_id      = aws_vpc.this.id
 
   ingress {
@@ -216,7 +228,7 @@ resource "aws_security_group" "web_task" {
   }
 
   egress {
-    description = "Outbound HTTPS (via NAT) to the API's public DNS and other HTTPS dependencies"
+    description = "Outbound HTTPS (via NAT) to the APIs public DNS and other HTTPS dependencies"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -231,7 +243,7 @@ resource "aws_security_group" "web_task" {
 
 resource "aws_security_group" "api_task" {
   name        = "${local.name_prefix}-api-task-sg"
-  description = "verdictvaut-api ECS tasks (incl. the Fireblocks webhook route) — inbound from the ALB security group only."
+  description = "verdictvaut-api ECS tasks (incl. the Fireblocks webhook route) - inbound from the ALB security group only."
   vpc_id      = aws_vpc.this.id
 
   ingress {
@@ -243,7 +255,7 @@ resource "aws_security_group" "api_task" {
   }
 
   egress {
-    description = "Outbound — RDS (below) plus HTTPS (via NAT) to Fireblocks/Elliptic/Postmark/Secrets Manager"
+    description = "Outbound - RDS (below) plus HTTPS (via NAT) to Fireblocks/Elliptic/Postmark/Secrets Manager"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -258,13 +270,13 @@ resource "aws_security_group" "api_task" {
 
 resource "aws_security_group" "worker_task" {
   name        = "${local.name_prefix}-worker-task-sg"
-  description = "verdictvaut-worker ECS tasks — NO inbound rule of any kind. The worker binds no HTTP port (worker.main.ts's own design)."
+  description = "verdictvaut-worker ECS tasks - NO inbound rule of any kind. The worker binds no HTTP port (worker.main.ts design)."
   vpc_id      = aws_vpc.this.id
 
   # Deliberately no ingress block at all.
 
   egress {
-    description = "Outbound — RDS (below) plus HTTPS (via NAT) to blockchain RPC endpoints and Fireblocks"
+    description = "Outbound - RDS (below) plus HTTPS (via NAT) to blockchain RPC endpoints and Fireblocks"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -279,7 +291,7 @@ resource "aws_security_group" "worker_task" {
 
 resource "aws_security_group" "rds" {
   name        = "${local.name_prefix}-rds-sg"
-  description = "RDS for PostgreSQL — inbound 5432 from the API and worker task security groups only. Never a public CIDR."
+  description = "RDS for PostgreSQL - inbound 5432 from the API and worker task security groups only. Never a public CIDR."
   vpc_id      = aws_vpc.this.id
 
   ingress {

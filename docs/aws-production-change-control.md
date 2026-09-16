@@ -1,16 +1,15 @@
-# AWS Production Change Control — Phase 26, extended Phase 27
+# AWS Production Change Control — Phase 26, extended Phase 27, Phase 28
 
-**Status: DESIGNED, NOT PROVISIONED, NOT IMPLEMENTED AS AUTOMATION.**
-No CI/CD deployment pipeline, deployment role, or protected environment
-exists — `.github/workflows/ci.yml` gained a Terraform *validation*
-job this phase (`docs/aws-terraform-security-review.md` "CI Terraform
-validation"), but it builds/tests/validates only, never deploys, never
-holds an AWS credential, and never runs `plan`/`apply` (re-verified
-this session by reading the full workflow). This document defines the
-guardrails a real production deployment pipeline must have before it
-is ever built, so that building it later is a matter of implementing
-an already-agreed design, not inventing safety controls under time
-pressure.
+**Status: DESIGNED AND IMPLEMENTED IN CODE, STILL NOT PROVISIONED.**
+Phase 28 added the deployment pipeline (`.github/workflows/terraform-deploy.yml`,
+`ecr-publish.yml`) and the CI deploy role (`infra/terraform/modules/ci-deploy-role`)
+this document previously said did not exist. Neither workflow has ever
+executed against a real AWS account (none exists), and the GitHub
+Environment protection rules they reference by name still require a
+human to configure them in Settings — this document still defines the
+guardrails a real production deployment must have, but "designed, not
+built" no longer describes the pipeline itself, only its live
+execution.
 
 ## 1. Guardrails against accidental production deployment
 
@@ -18,10 +17,10 @@ pressure.
 |---|---|---|
 | Separate AWS account/environment | `docs/aws-account-governance.md` §1 — a dedicated production account (recommended) is the strongest guardrail: an accidental `terraform apply`/`aws ecs update-service` against the wrong target requires actively assuming different credentials, not just picking a different CLI flag | **REQUIRES HUMAN APPROVAL** (account creation) |
 | Separate Terraform state | `infra/terraform/environments/{staging,production}` — distinct backend state keys (`staging/terraform.tfstate` vs. `production/terraform.tfstate`), distinct root modules, distinct `terraform.tfvars` — re-confirmed this session by reading both `backend.tf` files | DESIGNED, IMPLEMENTED IN CODE, NOT YET BACKED BY A REAL REMOTE BACKEND |
-| Manual production approval | `docs/aws-deployment-runbook.md` §4.2's pipeline design — production deployment is gated behind a human-reviewed approval step (e.g. GitHub Environments' "required reviewers"), never automatic on merge to `main` | DESIGNED, NOT IMPLEMENTED — no pipeline stage past build/test exists to gate |
+| Manual production approval | `docs/aws-deployment-runbook.md` §4.2's pipeline design — production deployment is gated behind a human-reviewed approval step (GitHub Environments' "required reviewers") | **Phase 28: workflow files reference `environment: production-deploy`/`production-infra-apply`** — the protection rule itself must still be configured by a human in GitHub Settings; the workflow cannot create it |
 | Explicit production variable | Every environment's `APP_ENVIRONMENT` is set explicitly per ECS task definition (`environments/production/main.tf`: `APP_ENVIRONMENT = "production"`; `environments/staging/main.tf`: `APP_ENVIRONMENT = "sandbox"`) — never inferred, never defaulted, never shared between the two `main.tf` files | DESIGNED, IMPLEMENTED IN CODE |
-| Protected CI environment | GitHub Environments (or equivalent) with required reviewers + a restricted set of principals allowed to trigger a production deploy — the natural mechanism, not independently verified against GitHub's current documentation this session since no pipeline exists yet to configure it against | DESIGNED, NOT IMPLEMENTED |
-| Restricted deployment role | `docs/aws-iam-and-secrets.md` §2.5 — the CI deploy role is scoped to exactly the 3 ECR repos + the 3 ECS services + a narrowly-scoped `iam:PassRole` (never `PassRole` on `*`) — no broader permission | DESIGNED, NOT PROVISIONED (no OIDC provider, no role, no AWS account) |
+| Protected CI environment | GitHub Environments with required reviewers + a restricted set of principals allowed to trigger a production deploy | **Phase 28: workflows reference the environment names**; the protection rule configuration itself remains a human, out-of-band GitHub Settings action |
+| Restricted deployment role | `docs/aws-iam-and-secrets.md` §2.5 — the CI deploy role is scoped to exactly the 3 ECR repos + the 3 ECS services + a narrowly-scoped `iam:PassRole` (never `PassRole` on `*`) — no broader permission | **Phase 28: DESIGNED, IMPLEMENTED IN TERRAFORM** (`modules/ci-deploy-role`), still NOT PROVISIONED (no AWS account) |
 | Immutable image SHA | `docs/aws-deployment-runbook.md` §3 — ECR repositories designed with `imageTagMutability: IMMUTABLE`; every image tagged with the full commit SHA it was built from, never `latest` as the deployment target | DESIGNED, IMPLEMENTED IN CODE this phase (`infra/terraform/modules/ecr`, `environments/shared`) — **still NOT PROVISIONED**, no ECR repository exists |
 | Production ALB deletion protection | `infra/terraform/modules/alb`'s `enable_deletion_protection` (Phase 27, `docs/aws-terraform-security-review.md` G1) — `true` in `environments/production`, `false` in staging | DESIGNED, IMPLEMENTED IN CODE, NOT YET PROVISIONED |
 | Migration safety gate | The existing `guard-destructive-migration.js` (unchanged, re-verified this session) plus the "migration first, as its own step, before any image rollout" sequencing in `docs/aws-deployment-runbook.md` §4.2 and `docs/production-deployment-plan.md` §6 | IMPLEMENTED IN APPLICATION CODE (the guard script), DESIGNED (the sequencing) |
@@ -59,27 +58,46 @@ infrastructure), never to skip or weaken the check. This is a
 restatement of a standing principle from every prior phase (Phase 13
 onward), not a new rule invented here.
 
-## 3. What a real future CI/CD deployment stage must additionally enforce (DESIGNED, NOT BUILT)
+## 3. What a real CI/CD deployment stage must additionally enforce
 
-1. **`production-readiness-check.js --with-db` must exit 0** before a
-   production deployment proceeds — today this is impossible (P0
-   custody/compliance failures are structural, not environmental), and
-   the pipeline should fail closed on that, not skip the check.
+1. **`production-readiness-check.js` must exit 0** before a production
+   deployment proceeds — **Phase 28: IMPLEMENTED** as `ecr-publish.yml`'s
+   `production-readiness-gate` job (production only, blocks `deploy`
+   on failure). Today this is impossible to pass for real (P0
+   custody/compliance failures are structural, not environmental), so
+   the pipeline correctly fails closed on that, exactly as designed —
+   this is the gate actually refusing a real production deploy, not a
+   hypothetical. **Runs the env/structural checks only, not `--with-db`**
+   — the GitHub-hosted runner has no network path to a real database,
+   and giving it one just to satisfy this gate would be a worse
+   tradeoff than the gap it closes; a future phase with a real VPC-
+   reachable runner should extend this to `--with-db`.
 2. **The Terraform plan for `environments/production` must be reviewed
-   by a human** before `apply` — no CI job should run
-   `terraform apply` unattended against production, ever, regardless
-   of how much other automation exists upstream of it.
+   by a human** before `apply` — **Phase 28: IMPLEMENTED** as
+   `terraform-deploy.yml`'s `terraform-apply` job, gated behind the
+   `production-infra-apply` GitHub Environment (protection rule itself
+   still requires human configuration) and applying only the exact
+   plan file `terraform-plan` produced, never a freshly recomputed one.
 3. **A migration, if present in the changeset, must run and succeed as
    its own gated step** before the ECS service update — matching
    `docs/aws-deployment-runbook.md` §4.2's pipeline order (migration →
    API → worker → web), never bundled into the same deploy action as
-   the application rollout.
-4. **Rollback path must be tested**, not just designed — restated from
+   the application rollout. **Partially implemented**: `ecr-publish.yml`'s
+   `deploy` job has a dedicated migration step in the right sequence
+   position, but its actual `prisma migrate deploy` invocation is left
+   as a documented placeholder (see that step's own comment) — the
+   real one-off ECS `run-task` invocation needs real subnet/security-
+   group/task-definition ARNs this phase has no AWS account to verify
+   against, and guessing that shape risked a wrong, untested command.
+4. **Rollback path must be a one-command action, not a manual
+   multi-step recovery under pressure** — restated from
    `docs/production-deployment-plan.md` §7 (redeploy the previous
-   immutable image tag; a migration is never auto-rolled-back) — a
-   real pipeline should make "redeploy the last known-good SHA" a
-   one-command action, not a manual multi-step recovery under
-   pressure.
+   immutable image tag; a migration is never auto-rolled-back).
+   **Phase 28: IMPLEMENTED as code** — `ecr-publish.yml`'s `image_tag`
+   input, when set to a previous commit SHA, skips the build entirely
+   and redeploys that exact already-pushed image via the same `deploy`
+   job. **Never tested against a real deployment** — no AWS account
+   exists to have ever exercised this path for real.
 
 ## 4. Provisioning sequence (Phase 27 addition — a PLAN, not execution)
 
@@ -163,6 +181,21 @@ documents' own content changes as a result of listing it here.
     §4.2 — never a direct `terraform apply` run ad hoc by an individual
     outside that gate.
 
+**Phase 28 addition, fits between steps 1 and 7 (needs an account, no
+earlier dependency on network/database/ECS):** configure
+`AWS_TERRAFORM_ROLE_ARN` and `AWS_CI_DEPLOY_ROLE_ARN` as real GitHub
+Actions secrets (the latter's value comes from step 7's own
+`module.ci_deploy_role.ci_deploy_role_arn` output — a real chicken-
+and-egg ordering: `environments/shared` must be applied once with the
+role's trust policy referencing this repository before the value
+exists to paste back into GitHub Settings), `AWS_REGION`/
+`NEXT_PUBLIC_API_URL` as GitHub Actions variables, and the
+`staging-infra-apply`/`staging-deploy`/`production-infra-apply`/
+`production-deploy` GitHub Environments with required reviewers on the
+production pair at minimum — `.github/workflows/terraform-deploy.yml`/
+`ecr-publish.yml` (Phase 28) reference all of these by name but cannot
+create any of them.
+
 **This sequence is a plan. No step has been executed.** Steps 1-3 are
 prerequisites for steps 4-10 to even be plannable against a real
 backend; steps 11-12 (staging) must fully succeed, independently
@@ -179,11 +212,17 @@ adds no capability toward, any step 3-14 action. It is not, and must
 never become, a gate that runs `terraform plan`/`apply` against a real
 backend from CI.
 
-## 5. What this document does not do
+## 5. What this document (and Phase 28) does not do
 
-- Does not create a GitHub Environment, protection rule, or CI/CD
-  workflow file.
-- Does not create an IAM role, OIDC provider, or ECR repository.
+- Does not create a real GitHub Environment protection rule (the
+  workflow files reference the names; a human configures the rule
+  itself in GitHub Settings) — restated because it's easy to
+  misread "the workflow references this environment" as "the gate is
+  active," which it is not until that configuration step happens.
+- Does not create a real IAM role, OIDC provider, or ECR repository —
+  Terraform defines them (`modules/ci-deploy-role`, `modules/ecr`);
+  `apply` has never been run against a real AWS account.
 - Does not weaken `production-readiness-check.js` or any application-
-  level safety gate — every one was re-verified unchanged this
-  session, not merely assumed unchanged from memory.
+  level safety gate — `ecr-publish.yml`'s new `production-readiness-gate`
+  job adds a NEW place that check is enforced (a CI gate before a real
+  production deploy), it does not touch the check's own logic.

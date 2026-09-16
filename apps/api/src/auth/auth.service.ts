@@ -326,6 +326,14 @@ export class AuthService {
       if (lockDurationMs > 0) {
         lockedUntil = new Date(Date.now() + lockDurationMs);
         await this.prisma.user.update({ where: { id: user.id }, data: { lockedUntil } });
+        // Phase 28 — the one metric this security-relevant path was
+        // missing (production-readiness-check.js §"Authentication abuse"
+        // already documented this as a known gap). Fires once per newly-
+        // APPLIED lock, never per failed attempt, so a single slow
+        // brute-force burst against one account produces one event, not
+        // a flood — a real operational signal for a CloudWatch alarm,
+        // not log noise.
+        this.metrics.increment("auth.account_locked", { failedAttempts: updated.failedLoginAttempts });
       }
 
       await this.auditLog.record({

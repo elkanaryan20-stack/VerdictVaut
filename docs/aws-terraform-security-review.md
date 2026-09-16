@@ -321,7 +321,45 @@ first run from pre-existing whitespace drift — a real, human/CI
 follow-up (not this phase, which cannot execute the tool) should run
 `terraform fmt -recursive` for real and commit the result.
 
-## 4. What this review does not do
+## 4. Phase 28 — first real `terraform validate` run, two real findings
+
+`terraform` was installed locally for the first time this phase
+(network access was available in this session's environment) and run
+for real against all three environments. Two genuine defects surfaced
+that every prior eye-only review (Phases 26-27, including this
+document's own §0/§3) missed:
+
+**H1 (LOW, fixed).** `=`-alignment formatting drift in 7 files —
+exactly what Phase 27's own G5 predicted and deliberately left
+unfixed pending a real `terraform fmt` run. Fixed by running
+`terraform fmt -recursive` for real.
+
+**H2 (MEDIUM, fixed).** Every `aws_security_group`/`ingress`/`egress`
+`description` argument in `modules/network/main.tf` that used an
+em-dash or an apostrophe (9 occurrences across all 5 security groups)
+violated the AWS provider's own restricted regex for that field
+(`^[0-9A-Za-z_ .:/()#,@\[\]+=&;{}!$*-]*$`) — confirmed by
+`terraform validate`'s real schema-level error output, not something
+any eye-only review (including this document's own "reviewed and
+found not to be a problem" RDS/security-group findings above) could
+have caught, since it is a provider-schema string-format constraint,
+not a logic or security-posture issue. This would have failed the
+first real `terraform apply` of the network module. Fixed by rewording
+all 9 descriptions to plain ASCII — see `modules/network/main.tf`'s
+own header note for the full list.
+
+All three environments now validate cleanly, including the new
+`modules/observability` alarm layer and `modules/ci-deploy-role`
+(both Phase 28 additions, see `infra/terraform/README.md`'s own Phase
+28 section and `docs/aws-production-architecture.md` §13/§14 for what
+the observability module actually implements). No new IAM wildcard,
+public ingress, or unsafe default was introduced by either addition —
+`modules/ci-deploy-role`'s `iam:PassRole` statement is condition-scoped
+to `ecs-tasks.amazonaws.com` on top of its ARN restriction, and its
+ECR/ECS statements are resource-scoped exactly like every pre-existing
+statement in `modules/iam`.
+
+## 5. What this review does not do
 
 - Does not run `terraform validate`/`plan`/`apply` locally — tool
   unavailable, and `apply`/`plan` against real credentials is

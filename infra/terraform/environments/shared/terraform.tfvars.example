@@ -3,3 +3,5 @@
 # against a real backend — which this phase does not do.
 
 aws_region = "us-east-1" # EXAMPLE ONLY — see docs/aws-production-architecture.md §10, REQUIRES HUMAN APPROVAL. Should match staging/production's own region choice.
+
+github_repository = "elkanaryan20-stack/VerdictVaut" # this repository's real owner/name — the GitHub Actions OIDC trust policy (modules/ci-deploy-role) is restricted to exactly this value

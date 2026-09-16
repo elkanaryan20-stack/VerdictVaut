@@ -1,0 +1,220 @@
+name: Build, push & deploy (manual)
+
+# Phase 28. Implements docs/aws-deployment-runbook.md §4.2's pipeline
+# for real: "Docker image build" -> "image registry (push to ECR,
+# tagged with the commit SHA)" -> an ECS service update — the exact
+# steps that document's own header explicitly said no prior phase
+# would build ("there is no AWS account/ECR/ECS cluster to deploy to
+# yet — writing a workflow that references real AWS resources now
+# would either fail on every run or require inventing resource
+# identifiers, both explicitly forbidden"). This phase resolves that:
+# every AWS-resource reference below is a GitHub secret/variable, never
+# an invented identifier, so this workflow fails CLEARLY (a missing-
+# secret error at the credentials step) rather than silently or with a
+# fabricated value — the same "fail clearly when required values are
+# missing" standard this phase's brief applies to Terraform variables.
+#
+# Manual trigger ONLY (workflow_dispatch) — never runs on push to
+# main, matching docs/aws-deployment-runbook.md §4.2's "production
+# deployment is never automatic" requirement. Staging can reasonably be
+# promoted to an automatic-on-merge trigger once this has actually been
+# exercised for real against a live AWS account; not changed
+# speculatively now.
+#
+# Rollback: pass an existing (older) `image_tag` input instead of
+# leaving it blank — this workflow's own "deploy" job then skips
+# building and redeploys that exact, already-pushed, immutable-tagged
+# image, matching docs/aws-deployment-runbook.md §5's "redeploy the
+# task definition revision that pointed at the previous commit SHA's
+# image" rollback design. No separate rollback workflow is needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Which environment's ECS services to update"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        description: "Leave blank to build+push the current commit SHA. Set to an existing tag (e.g. a previous commit SHA) to redeploy it unchanged — this is the rollback path."
+        required: false
+        type: string
+
+permissions:
+  id-token: write # OIDC — no long-lived AWS key anywhere in this workflow
+  contents: read
+
+jobs:
+  build-and-push:
+    if: inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: resolve-tag
+        run: echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC — fails clearly until a human provisions modules/ci-deploy-role for real and sets this secret)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to the shared ECR registry
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Immutable-tag repositories (modules/ecr) reject a re-push of an
+      # already-used tag outright — this step can never silently
+      # overwrite a previous commit's image, by AWS's own enforcement,
+      # not just this workflow's own discipline.
+      - name: Build & push API image (runtime target)
+        run: |
+          docker build -f apps/api/Dockerfile --target runtime \
+            -t "${{ steps.ecr-login.outputs.registry }}/verdictvaut-api:${{ steps.resolve-tag.outputs.tag }}" .
+          docker push "${{ steps.ecr-login.outputs.registry }}/verdictvaut-api:${{ steps.resolve-tag.outputs.tag }}"
+
+      - name: Build & push worker image (worker target)
+        run: |
+          docker build -f apps/api/Dockerfile --target worker \
+            -t "${{ steps.ecr-login.outputs.registry }}/verdictvaut-worker:${{ steps.resolve-tag.outputs.tag }}" .
+          docker push "${{ steps.ecr-login.outputs.registry }}/verdictvaut-worker:${{ steps.resolve-tag.outputs.tag }}"
+
+      - name: Build & push web image
+        run: |
+          docker build -f apps/web/Dockerfile \
+            --build-arg NEXT_PUBLIC_API_URL="${{ vars.NEXT_PUBLIC_API_URL }}" \
+            -t "${{ steps.ecr-login.outputs.registry }}/verdictvaut-web:${{ steps.resolve-tag.outputs.tag }}" .
+          docker push "${{ steps.ecr-login.outputs.registry }}/verdictvaut-web:${{ steps.resolve-tag.outputs.tag }}"
+
+  # docs/aws-production-change-control.md §3 item 1: "production-readiness-check.js
+  # --with-db must exit 0 before a production deployment proceeds."
+  # Staging deliberately does NOT need this to pass (it is expected,
+  # by design, to run with sandbox custody/compliance providers that
+  # this script correctly flags — those checks are production-only,
+  # see runEnvChecks()'s own `if (env.APP_ENVIRONMENT === "production")`
+  # guards). No DATABASE_URL secret is referenced here (`--with-db`
+  # is intentionally NOT passed) — this job has no network path to a
+  # real staging/production database and must not be given one just to
+  # satisfy this gate; a human/future phase should extend this to
+  # `--with-db` once this job can safely reach the real database
+  # (e.g. from within the VPC, not a public GitHub-hosted runner).
+  production-readiness-gate:
+    if: inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - name: production-readiness-check.js (env/structural checks only, no DB)
+        working-directory: apps/api
+        run: npm run check:production-readiness
+
+  deploy:
+    needs: [build-and-push, production-readiness-gate]
+    # needs.build-and-push completing is required for a fresh build;
+    # for a rollback (image_tag supplied) that job is skipped entirely
+    # (if: inputs.image_tag == '' above), and `always()` here lets this
+    # job still run in that case — `result != 'failure'` still blocks a
+    # genuinely failed build from ever reaching deploy.
+    # needs.production-readiness-gate is only ever non-skipped for a
+    # production run (see that job's own `if:`) — 'skipped' is treated
+    # as success here for staging, matching how `needs.build-and-push`
+    # is already handled above.
+    if: |
+      always() &&
+      needs.build-and-push.result != 'failure' &&
+      needs.production-readiness-gate.result != 'failure'
+    runs-on: ubuntu-latest
+    # A GitHub Environment named "<environment>-deploy" must be
+    # configured with required reviewers for production before this can
+    # run unattended for real — same restated caveat as
+    # terraform-deploy.yml's apply job; staging may reasonably have no
+    # protection rule at all.
+    environment: ${{ inputs.environment }}-deploy
+    steps:
+      - name: Resolve the image tag to deploy
+        id: tag
+        run: echo "tag=${{ inputs.image_tag != '' && inputs.image_tag || needs.build-and-push.outputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Migration-first sequencing (docs/aws-deployment-runbook.md §4.2 /
+      # docs/production-deployment-plan.md §6): run BEFORE any service
+      # update, as its own gated step, from a single one-off task — never
+      # bundled into a container's own startup (apps/api/Dockerfile's
+      # runtime CMD deliberately does not run migrations, see that
+      # file's own comment). Deliberately left as a documented step
+      # rather than a scripted one here: the exact "run this as a
+      # one-off ECS task" invocation depends on real subnet/security-
+      # group/task-definition ARNs this phase has no AWS account to
+      # verify against, and guessing that shape risks a wrong,
+      # untested command silently no-op'ing or (worse) targeting the
+      # wrong task definition. A human/future phase should replace this
+      # step with a verified `aws ecs run-task` invocation once a real
+      # account exists to test it against.
+      - name: Database migration (manual gate — see step comment)
+        run: |
+          echo "This step is intentionally a placeholder. Run 'prisma migrate deploy' as a one-off ECS task"
+          echo "(or an equivalent single-instance job) against verdictvaut-${{ inputs.environment }}-api:${{ steps.tag.outputs.tag }}"
+          echo "BEFORE proceeding, and only once it has succeeded. See docs/aws-deployment-runbook.md §4.2."
+
+      # Registers a NEW task definition revision per service (cloning
+      # the currently-registered one via describe-task-definition, then
+      # patching only that service's own container image) before
+      # calling update-service with that revision's ARN — a plain
+      # `update-service --force-new-deployment` would redeploy the
+      # SAME already-running image, never actually picking up the tag
+      # just pushed above. This is exactly what
+      # modules/ecs-service/main.tf's `lifecycle { ignore_changes =
+      # [task_definition] }` is designed to coexist with: Terraform
+      # manages the task definition's shape (CPU/memory/env/secrets/
+      # logging), this workflow manages which image tag it points at
+      # between applies, and neither ever fights the other.
+      - name: Register new task definitions & deploy (api, worker, web)
+        run: |
+          set -euo pipefail
+          # This job runs on its own runner (distinct from build-and-push's),
+          # so the registry URI is re-resolved here rather than read from
+          # that job's own step output.
+          REGISTRY=$(aws ecr describe-repositories --repository-names verdictvaut-api --query 'repositories[0].repositoryUri' --output text | sed 's#/verdictvaut-api$##')
+          TAG="${{ steps.tag.outputs.tag }}"
+
+          for SERVICE in api worker web; do
+            FAMILY="verdictvaut-${{ inputs.environment }}-${SERVICE}"
+            CURRENT=$(aws ecs describe-task-definition --task-definition "$FAMILY" --query 'taskDefinition')
+            NEW_DEF=$(echo "$CURRENT" | jq --arg IMAGE "${REGISTRY}/verdictvaut-${SERVICE}:${TAG}" \
+              '.containerDefinitions[0].image = $IMAGE
+               | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+            NEW_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_DEF" --query 'taskDefinition.taskDefinitionArn' --output text)
+            aws ecs update-service \
+              --cluster "verdictvaut-${{ inputs.environment }}" \
+              --service "$FAMILY" \
+              --task-definition "$NEW_ARN"
+          done
+
+      # The circuit breaker (modules/ecs-service, Phase 28) is what
+      # actually rolls a failed deployment back; `services-stable` here
+      # is what makes THIS WORKFLOW fail loudly (a red GitHub Actions
+      # run) rather than exiting 0 the instant update-service is
+      # accepted, regardless of whether the deployment ever succeeds —
+      # directly implementing this phase's "failed deployments do not
+      # silently become healthy" requirement at the pipeline level, not
+      # just the ECS level.
+      - name: Wait for all three services to reach a steady state
+        run: |
+          aws ecs wait services-stable \
+            --cluster "verdictvaut-${{ inputs.environment }}" \
+            --services "verdictvaut-${{ inputs.environment }}-api" "verdictvaut-${{ inputs.environment }}-worker" "verdictvaut-${{ inputs.environment }}-web"

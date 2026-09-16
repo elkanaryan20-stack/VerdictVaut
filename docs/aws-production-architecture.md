@@ -272,49 +272,57 @@ this phase's brief asked for:
 
 | Internal signal | AWS destination | Status |
 |---|---|---|
-| API structured JSON logs | CloudWatch Logs, `awslogs` driver, log group `/ecs/verdictvaut-api` (example naming — not provisioned) | DESIGNED |
-| Worker structured JSON logs + heartbeat file | CloudWatch Logs, log group `/ecs/verdictvaut-worker` | DESIGNED |
-| Web logs (Next.js server output) | CloudWatch Logs, log group `/ecs/verdictvaut-web` | DESIGNED |
-| ALB access logs | S3 bucket (§9 — optional but recommended) | DESIGNED, OPTIONAL |
-| Database metrics (CPU, connections, storage, replica lag if applicable) | RDS's own CloudWatch metrics (automatic once RDS exists — no application code involved) | DESIGNED |
-| Worker heartbeat / watcher staleness | Already-implemented `GET /admin/watchers`; CloudWatch has no native visibility into this without a log-based metric filter on the structured logs above | DESIGNED (log-based metric filter, not a native RDS/ECS metric) |
-| Deposit/withdrawal watcher failures | `wallet.deposit_watcher.scan_failed`/`wallet.withdrawal_watcher.*` — log-based metric filters on the JSON log lines | DESIGNED |
-| Reconciliation discrepancies | `wallet.reconciliation.discrepancy_found` — same | DESIGNED |
-| Custody/compliance provider failures | `provider_request_failures_total` — same | DESIGNED |
-| Backup failures | `infra/backups/backup-metadata.jsonl` today (local-tooling-only, unchanged) — once RDS-native automated backups are provisioned, backup *success* is an RDS/CloudWatch event; backup *failure* alerting on RDS-native backups is provider-native, not this repository's own log file | DESIGNED for RDS-native; local tooling's own file-based signal is **unchanged, still not wired to any external sink** |
-| Production readiness gate result | Not currently shipped anywhere — `production-readiness-check.js` is a CLI tool, run manually or in CI; no CloudWatch integration is designed for its own pass/fail result in this phase (it fails the CI job it runs in today, which is itself visible in GitHub Actions, not CloudWatch) | Not designed — out of scope, no evidence this needs a CloudWatch-specific integration beyond CI's own pass/fail |
+| API structured JSON logs | CloudWatch Logs, `awslogs` driver, log group `/ecs/verdictvaut-<env>-api` | DESIGNED, IMPLEMENTED IN TERRAFORM, NOT PROVISIONED |
+| Worker structured JSON logs + heartbeat file | CloudWatch Logs, log group `/ecs/verdictvaut-<env>-worker` | DESIGNED, IMPLEMENTED IN TERRAFORM, NOT PROVISIONED |
+| Web logs (Next.js server output) | CloudWatch Logs, log group `/ecs/verdictvaut-<env>-web` | DESIGNED, IMPLEMENTED IN TERRAFORM, NOT PROVISIONED |
+| ALB access logs | S3 bucket (§9 — optional but recommended) | DESIGNED, OPTIONAL, NOT IMPLEMENTED |
+| Database metrics (CPU, connections, storage, replica lag if applicable) | RDS's own CloudWatch metrics (automatic once RDS exists) | DESIGNED (automatic, no Terraform needed) |
+| Database availability events (failure/failover/low storage/maintenance) | `aws_db_event_subscription` → SNS | **Phase 28: IMPLEMENTED IN TERRAFORM** (`modules/observability`), NOT PROVISIONED |
+| Worker heartbeat / watcher staleness | Already-implemented `GET /admin/watchers`; no log-based alarm added this phase (the heartbeat is a file, not a JSON log line — see `modules/observability/main.tf`'s own note) | DESIGNED (log-based metric filter would need an application-code change, not made this phase) |
+| Deposit/withdrawal watcher failures | `wallet.deposit_watcher.scan_failed`/`wallet.withdrawal_watcher.*` — log-based metric filters | **Phase 28: IMPLEMENTED IN TERRAFORM**, NOT PROVISIONED |
+| Reconciliation discrepancies | `wallet.reconciliation.discrepancy_found`/`settlement.collateral_reconciliation.discrepancy_found` — same | **Phase 28: IMPLEMENTED IN TERRAFORM**, NOT PROVISIONED |
+| Custody/compliance provider failures | `provider_request_failures_total`/`provider_ambiguous_operations_total` — same | **Phase 28: IMPLEMENTED IN TERRAFORM**, NOT PROVISIONED |
+| Account lockout / brute-force signal | `auth.account_locked` — **new metric this phase**, `apps/api/src/auth/auth.service.ts` | **Phase 28: metric + Terraform alarm added**, NOT PROVISIONED |
+| API/web target health | ALB target-group `UnHealthyHostCount` | **Phase 28: IMPLEMENTED IN TERRAFORM**, NOT PROVISIONED |
+| ECS deployment failures | "ECS Service Action" EventBridge events | **Phase 28: IMPLEMENTED IN TERRAFORM**, NOT PROVISIONED |
+| Backup failures | `infra/backups/backup-metadata.jsonl` today (local-tooling-only, unchanged) — RDS-native automated-backup events now covered by the event subscription above | RDS-native: **Phase 28, IMPLEMENTED IN TERRAFORM**. Local tooling's own file-based signal is unchanged, still not wired to any external sink |
+| Production readiness gate result | `production-readiness-check.js` is a CLI tool, run manually or in CI — fails the CI job it runs in today, itself visible in GitHub Actions, not CloudWatch | Not designed — out of scope, no evidence this needs a CloudWatch-specific integration beyond CI's own pass/fail |
 
 **No dashboard is designed or built.** The underlying data (structured
 logs, RDS metrics, ECS task health) is real and queryable once shipped;
 no specific CloudWatch Dashboard/Grafana layout is assumed.
 
-## 14. Alerting — required conditions and severities (not configured)
+## 14. Alerting — required conditions and severities
 
-Per this phase's brief, listed here with the existing internal signal
-each maps to (§13 above / `docs/observability-and-alerting.md` §2).
-**No alerting service (paid or free) is configured by this phase** —
-this is a specification of what a human would wire up, using
-CloudWatch Alarms (§9's "optional" note) or any other aggregator, once
-authorized.
+**Phase 28 update: this table's alarms are now DESIGNED AND IMPLEMENTED
+IN TERRAFORM** (`infra/terraform/modules/observability`) — still not
+PROVISIONED (no AWS account exists to apply them against). No PAID
+third-party alerting vendor (Datadog/PagerDuty/etc.) is configured or
+selected — every mechanism below is CloudWatch Alarms/Events/SNS,
+already included in core AWS pricing, matching Phase 24's "optional
+recommendation, not a vendor decision" framing. All alarms publish to
+one shared SNS topic (`module.observability.alerts_topic_arn`); no real
+subscription (email or otherwise) is set unless a human supplies
+`alarm_email_subscriptions` in a real `terraform.tfvars` — see that
+module's own header note.
 
-| Severity | Condition | Existing signal |
-|---|---|---|
-| CRITICAL | Reconciliation discrepancy (severity=CRITICAL) | `wallet.reconciliation.discrepancy_found` / `settlement.collateral_reconciliation.discrepancy_found` |
-| CRITICAL | Custody provider failure | `provider_request_failures_total` (custody), `provider_ambiguous_operations_total` |
-| CRITICAL | Database unavailable | `GET /health/ready` 503, RDS CloudWatch status metrics |
-| CRITICAL | Worker stopped | Heartbeat file staleness / ECS task health (a stopped Fargate task is itself an ECS event, separately alarmable) |
-| CRITICAL | Backup failure | `infra/backups/backup-metadata.jsonl` (local tooling) or RDS-native automated-backup failure event, once real |
-| CRITICAL | Production readiness failure | `production-readiness-check.js` exit code — a CI/CD gate today (§`docs/aws-deployment-runbook.md` §7), not a CloudWatch alarm |
-| HIGH | Deposit processing failures | `wallet.deposit_watcher.scan_failed` |
-| HIGH | Withdrawal confirmation failures | `wallet.withdrawal_watcher.poll_failed`/`confirmation_check_failed`, `marked_failed` |
-| HIGH | Compliance failures | `provider_request_failures_total` (Elliptic-tagged) |
-| HIGH | Elevated API 5xx | ALB target-group 5xx metric (native once the ALB exists) or CloudWatch Logs metric filter on structured error logs |
-| MEDIUM | Authentication abuse | `AuthService.login()`'s `failedLoginAttempts`/`lockedUntil` — **no dedicated metric counter exists today** (a real, previously-documented gap — `docs/production-deployment-plan.md` §9, unchanged this phase) |
-| MEDIUM | Elevated latency | ALB target-group response-time metric (native) |
-| MEDIUM | Rate-limit spikes | HTTP 429 responses — **no dedicated internal counter exists today** (same gap category as above) |
+| Severity | Condition | Existing signal | Phase 28 mechanism |
+|---|---|---|---|
+| CRITICAL | Reconciliation discrepancy (severity=CRITICAL) | `wallet.reconciliation.discrepancy_found` / `settlement.collateral_reconciliation.discrepancy_found` | Log metric filter + alarm (`reconciliation_discrepancy_critical`) |
+| CRITICAL | Custody/compliance provider failure | `provider_request_failures_total`, `provider_ambiguous_operations_total` | Log metric filter + alarm (`custody_compliance_provider_failure`) |
+| CRITICAL | Database unavailable/failing over | `GET /health/ready` 503, RDS CloudWatch status metrics | `aws_db_event_subscription` (failure/low storage/maintenance/recovery categories) → SNS directly |
+| CRITICAL | API/web unhealthy | ALB target-group health | `aws_cloudwatch_metric_alarm` on `UnHealthyHostCount` per target group |
+| CRITICAL | ECS deployment failed / task placement failed | ECS "ECS Service Action" event, `eventName` in `SERVICE_DEPLOYMENT_FAILED`/`SERVICE_TASK_PLACEMENT_FAILURE`/`SERVICE_TASK_CONFIGURATION_FAILURE` (event schema verified live against AWS's own current docs this phase) | EventBridge rule → SNS directly, paired with `modules/ecs-service`'s new `deployment_circuit_breaker` (which performs the actual rollback) |
+| CRITICAL | Backup failure | `infra/backups/backup-metadata.jsonl` (local tooling) or RDS-native automated-backup failure event, once real | RDS-native: covered by the event subscription above. Local tooling's file-based signal remains unwired to any external sink — unchanged gap |
+| CRITICAL | Production readiness failure | `production-readiness-check.js` exit code | Unchanged — a CI/CD gate (`docs/aws-deployment-runbook.md` §7), not a CloudWatch alarm; out of scope for this module |
+| HIGH | Deposit processing failures | `wallet.deposit_watcher.scan_failed` | Log metric filter + alarm |
+| HIGH | Withdrawal confirmation failures | `wallet.withdrawal_watcher.poll_failed`/`marked_failed` | Log metric filter + alarm |
+| HIGH | Elevated API 5xx | ALB target-group 5xx metric / structured error-log rate | `HTTPCode_Target_5XX_Count` alarm (ALB-native) + `application_error` log-rate alarm (≥20/5min, avoids single-error noise) |
+| MEDIUM | Authentication abuse | `AuthService.login()`'s lockout path — **previously no dedicated metric existed** | **Closed this phase**: `auth.account_locked` metric added (`apps/api/src/auth/auth.service.ts`, fires once per newly-applied lock, never per attempt) + log metric filter/alarm (`account_lockout`, ≥5/15min) |
+| MEDIUM | Elevated latency | ALB target-group response-time metric (native) | Not alarmed this phase — no verified-safe threshold exists without real traffic data; left as a native, queryable metric only, consistent with "do not create noisy alarms" |
+| MEDIUM | Rate-limit spikes | HTTP 429 responses — no dedicated internal counter exists today | **Unchanged gap** — would need a new internal counter, same reasoning as the pre-Phase-28 authentication-abuse gap; out of this phase's scope |
 
-No paid alerting service is selected. CloudWatch Alarms (included in
-core AWS pricing, distinct from a third-party paid vendor) is the
-natural first destination if/when this is wired up, consistent with
-Phase 24's "optional recommendation, not a vendor decision" framing —
-restated, not re-argued, here.
+**Deliberately NOT alarmed** (avoiding the noisy/useless alarms this
+phase's brief explicitly warned against): any single `level=error` log
+line (elevated-rate only), latency (no baseline), and rate-limit spikes
+(no counter exists yet to alarm on safely).

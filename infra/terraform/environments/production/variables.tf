@@ -66,3 +66,9 @@ variable "certificate_arn" {
   type    = string
   default = null
 }
+
+variable "alarm_email_subscriptions" {
+  description = "Phase 28. Real production on-call email address(es) to subscribe to the CloudWatch alarm SNS topic. Defaults to empty — no notification destination is set by this phase; each address, once supplied, must still confirm its own SNS subscription (standard SNS behavior), and this repository does not choose who that should be."
+  type        = list(string)
+  default     = []
+}

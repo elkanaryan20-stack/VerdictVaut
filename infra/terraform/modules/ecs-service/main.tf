@@ -116,6 +116,24 @@ resource "aws_ecs_service" "this" {
   deployment_minimum_healthy_percent = var.min_healthy_percent
   deployment_maximum_percent         = var.max_percent
 
+  # Phase 28 — without this, a task definition that never passes its
+  # own container HEALTHCHECK (web/api's HTTP check, the worker's
+  # heartbeat-file check) still leaves the OLD, working tasks running
+  # at deployment_minimum_healthy_percent and the service just stops
+  # progressing — nothing ever fails loudly, and an operator watching
+  # only "is the service up" (not "did the deploy finish") would see a
+  # healthy service indefinitely stuck mid-rollout. Enabling the
+  # circuit breaker makes ECS itself detect that a deployment can never
+  # reach a steady state and roll the service back to the last known-
+  # good task definition automatically — this is the concrete mechanism
+  # behind this phase's "failed deployments do not silently become
+  # healthy" requirement. Surfaced operationally by the EventBridge rule
+  # in modules/observability (SERVICE_DEPLOYMENT_FAILED -> SNS).
+  deployment_circuit_breaker {
+    enable   = var.enable_deployment_circuit_breaker
+    rollback = var.enable_deployment_circuit_breaker
+  }
+
   network_configuration {
     subnets          = var.subnet_ids
     security_groups  = var.security_group_ids

@@ -7,9 +7,9 @@
 # APP_ENVIRONMENT value anywhere in this file.
 
 locals {
-  environment    = "staging"
-  service_names  = ["web", "api", "worker"]
-  secret_names   = ["jwt-access-secret", "jwt-refresh-secret", "postmark-server-token", "fireblocks-sandbox-credentials", "fireblocks-webhook-public-key", "elliptic-sandbox-credentials"]
+  environment   = "staging"
+  service_names = ["web", "api", "worker"]
+  secret_names  = ["jwt-access-secret", "jwt-refresh-secret", "postmark-server-token", "fireblocks-sandbox-credentials", "fireblocks-webhook-public-key", "elliptic-sandbox-credentials"]
 }
 
 # Reads the shared ECR registry's state (environments/shared — see that
@@ -32,13 +32,13 @@ data "terraform_remote_state" "shared" {
 module "network" {
   source = "../../modules/network"
 
-  environment          = local.environment
-  vpc_cidr             = var.vpc_cidr
-  availability_zones   = var.availability_zones
-  public_subnet_cidrs  = var.public_subnet_cidrs
-  app_subnet_cidrs     = var.app_subnet_cidrs
-  db_subnet_cidrs      = var.db_subnet_cidrs
-  nat_gateway_per_az   = false # staging — single shared NAT, docs/aws-network-design.md §4
+  environment         = local.environment
+  vpc_cidr            = var.vpc_cidr
+  availability_zones  = var.availability_zones
+  public_subnet_cidrs = var.public_subnet_cidrs
+  app_subnet_cidrs    = var.app_subnet_cidrs
+  db_subnet_cidrs     = var.db_subnet_cidrs
+  nat_gateway_per_az  = false # staging — single shared NAT, docs/aws-network-design.md §4
 }
 
 module "observability" {
@@ -46,6 +46,16 @@ module "observability" {
 
   environment   = local.environment
   service_names = local.service_names
+
+  # Phase 28 — see environments/production/main.tf's own comment on
+  # this block; identical wiring, staging's own resources.
+  rds_db_instance_id          = module.database.db_instance_identifier
+  alb_arn_suffix              = module.alb.alb_arn_suffix
+  web_target_group_arn_suffix = module.alb.web_target_group_arn_suffix
+  api_target_group_arn_suffix = module.alb.api_target_group_arn_suffix
+  ecs_cluster_arn             = aws_ecs_cluster.this.arn
+
+  alarm_topic_subscription_emails = var.alarm_email_subscriptions
 }
 
 module "secrets" {
@@ -59,12 +69,12 @@ module "secrets" {
 module "database" {
   source = "../../modules/database"
 
-  environment            = local.environment
-  db_subnet_ids          = module.network.db_subnet_ids
-  vpc_security_group_id  = module.network.rds_security_group_id
-  instance_class         = var.db_instance_class
-  multi_az               = false # staging — acceptable, docs/aws-disaster-recovery.md §1
-  deletion_protection    = false # staging must be destroyable
+  environment           = local.environment
+  db_subnet_ids         = module.network.db_subnet_ids
+  vpc_security_group_id = module.network.rds_security_group_id
+  instance_class        = var.db_instance_class
+  multi_az              = false # staging — acceptable, docs/aws-disaster-recovery.md §1
+  deletion_protection   = false # staging must be destroyable
 }
 
 module "iam" {
@@ -77,7 +87,7 @@ module "iam" {
   # reference until a real backend exists, per this data source's own
   # comment above.
   ecr_repository_arns = values(data.terraform_remote_state.shared.outputs.ecr_repository_arns)
-  log_group_arns   = [for name, arn in module.observability.log_group_names : "${arn}:*"]
+  log_group_arns      = [for name, arn in module.observability.log_group_names : "${arn}:*"]
   secret_arns = concat(
     values(module.secrets.secret_arns),
     [module.database.database_url_secret_arn],
@@ -93,7 +103,7 @@ module "alb" {
   alb_security_group_id      = module.network.alb_security_group_id
   create_certificate         = false
   certificate_arn            = var.certificate_arn # no real value supplied by this phase
-  enable_deletion_protection = false                # staging must be destroyable
+  enable_deletion_protection = false               # staging must be destroyable
 }
 
 resource "aws_ecs_cluster" "this" {
@@ -112,21 +122,21 @@ resource "aws_ecs_cluster" "this" {
 module "web_service" {
   source = "../../modules/ecs-service"
 
-  name                = "verdictvaut-${local.environment}-web"
-  environment         = local.environment
-  cluster_id          = aws_ecs_cluster.this.id
-  image               = var.web_image
-  container_port      = 3000
-  cpu                 = 256
-  memory              = 512
-  desired_count       = 2
-  subnet_ids          = module.network.app_subnet_ids
-  security_group_ids  = [module.network.web_task_security_group_id]
-  target_group_arn    = module.alb.web_target_group_arn
-  execution_role_arn  = module.iam.execution_role_arn
-  task_role_arn       = module.iam.task_role_arns["web"]
-  log_group_name      = module.observability.log_group_names["web"]
-  aws_region          = var.aws_region
+  name               = "verdictvaut-${local.environment}-web"
+  environment        = local.environment
+  cluster_id         = aws_ecs_cluster.this.id
+  image              = var.web_image
+  container_port     = 3000
+  cpu                = 256
+  memory             = 512
+  desired_count      = 2
+  subnet_ids         = module.network.app_subnet_ids
+  security_group_ids = [module.network.web_task_security_group_id]
+  target_group_arn   = module.alb.web_target_group_arn
+  execution_role_arn = module.iam.execution_role_arn
+  task_role_arn      = module.iam.task_role_arns["web"]
+  log_group_name     = module.observability.log_group_names["web"]
+  aws_region         = var.aws_region
 
   environment_variables = {
     NEXT_PUBLIC_APP_ENVIRONMENT = "sandbox"
@@ -136,21 +146,21 @@ module "web_service" {
 module "api_service" {
   source = "../../modules/ecs-service"
 
-  name                = "verdictvaut-${local.environment}-api"
-  environment         = local.environment
-  cluster_id          = aws_ecs_cluster.this.id
-  image               = var.api_image
-  container_port      = 4000
-  cpu                 = 512
-  memory              = 1024
-  desired_count       = 2
-  subnet_ids          = module.network.app_subnet_ids
-  security_group_ids  = [module.network.api_task_security_group_id]
-  target_group_arn    = module.alb.api_target_group_arn
-  execution_role_arn  = module.iam.execution_role_arn
-  task_role_arn       = module.iam.task_role_arns["api"]
-  log_group_name      = module.observability.log_group_names["api"]
-  aws_region          = var.aws_region
+  name               = "verdictvaut-${local.environment}-api"
+  environment        = local.environment
+  cluster_id         = aws_ecs_cluster.this.id
+  image              = var.api_image
+  container_port     = 4000
+  cpu                = 512
+  memory             = 1024
+  desired_count      = 2
+  subnet_ids         = module.network.app_subnet_ids
+  security_group_ids = [module.network.api_task_security_group_id]
+  target_group_arn   = module.alb.api_target_group_arn
+  execution_role_arn = module.iam.execution_role_arn
+  task_role_arn      = module.iam.task_role_arns["api"]
+  log_group_name     = module.observability.log_group_names["api"]
+  aws_region         = var.aws_region
 
   environment_variables = {
     PORT                       = "4000"
@@ -164,28 +174,28 @@ module "api_service" {
   }
 
   secret_arns = {
-    DATABASE_URL                    = module.database.database_url_secret_arn
-    JWT_ACCESS_SECRET               = module.secrets.secret_arns["jwt-access-secret"]
-    JWT_REFRESH_SECRET              = module.secrets.secret_arns["jwt-refresh-secret"]
-    POSTMARK_SERVER_TOKEN           = module.secrets.secret_arns["postmark-server-token"]
-    FIREBLOCKS_SANDBOX_CREDENTIALS  = module.secrets.secret_arns["fireblocks-sandbox-credentials"]
-    FIREBLOCKS_WEBHOOK_PUBLIC_KEY   = module.secrets.secret_arns["fireblocks-webhook-public-key"]
-    ELLIPTIC_SANDBOX_CREDENTIALS    = module.secrets.secret_arns["elliptic-sandbox-credentials"]
+    DATABASE_URL                   = module.database.database_url_secret_arn
+    JWT_ACCESS_SECRET              = module.secrets.secret_arns["jwt-access-secret"]
+    JWT_REFRESH_SECRET             = module.secrets.secret_arns["jwt-refresh-secret"]
+    POSTMARK_SERVER_TOKEN          = module.secrets.secret_arns["postmark-server-token"]
+    FIREBLOCKS_SANDBOX_CREDENTIALS = module.secrets.secret_arns["fireblocks-sandbox-credentials"]
+    FIREBLOCKS_WEBHOOK_PUBLIC_KEY  = module.secrets.secret_arns["fireblocks-webhook-public-key"]
+    ELLIPTIC_SANDBOX_CREDENTIALS   = module.secrets.secret_arns["elliptic-sandbox-credentials"]
   }
 }
 
 module "worker_service" {
   source = "../../modules/ecs-service"
 
-  name           = "verdictvaut-${local.environment}-worker"
-  environment    = local.environment
-  cluster_id     = aws_ecs_cluster.this.id
-  image          = var.worker_image
-  container_port = null # no HTTP surface — worker.main.ts's own design
-  cpu            = 256
-  memory         = 512
-  desired_count  = 1 # docs/aws-deployment-runbook.md §1 — more replicas don't parallelize useful work at current scale
-  subnet_ids     = module.network.app_subnet_ids
+  name               = "verdictvaut-${local.environment}-worker"
+  environment        = local.environment
+  cluster_id         = aws_ecs_cluster.this.id
+  image              = var.worker_image
+  container_port     = null # no HTTP surface — worker.main.ts's own design
+  cpu                = 256
+  memory             = 512
+  desired_count      = 1 # docs/aws-deployment-runbook.md §1 — more replicas don't parallelize useful work at current scale
+  subnet_ids         = module.network.app_subnet_ids
   security_group_ids = [module.network.worker_task_security_group_id]
   target_group_arn   = null # NEVER attached to the ALB — docs/aws-deployment-runbook.md §1/§2
   execution_role_arn = module.iam.execution_role_arn
@@ -199,10 +209,10 @@ module "worker_service" {
   health_check_command = ["CMD", "node", "scripts/worker-healthcheck.js"]
 
   environment_variables = {
-    APP_ENVIRONMENT            = "sandbox"
-    CHAIN_WATCHER_ENABLED      = "true"
-    WITHDRAWAL_WATCHER_ENABLED = "true"
-    WORKER_HEARTBEAT_FILE      = "/tmp/verdictvaut-worker-heartbeat"
+    APP_ENVIRONMENT              = "sandbox"
+    CHAIN_WATCHER_ENABLED        = "true"
+    WITHDRAWAL_WATCHER_ENABLED   = "true"
+    WORKER_HEARTBEAT_FILE        = "/tmp/verdictvaut-worker-heartbeat"
     WORKER_HEARTBEAT_INTERVAL_MS = "15000"
   }
 

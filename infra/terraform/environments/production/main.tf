@@ -55,6 +55,22 @@ module "observability" {
 
   environment   = local.environment
   service_names = local.service_names
+
+  # Phase 28 — wires every alarm/event source this module defines.
+  # Terraform resolves these via the dependency graph regardless of this
+  # block's textual position above module.database/module.alb/the ECS
+  # cluster resource below.
+  rds_db_instance_id          = module.database.db_instance_identifier
+  alb_arn_suffix              = module.alb.alb_arn_suffix
+  web_target_group_arn_suffix = module.alb.web_target_group_arn_suffix
+  api_target_group_arn_suffix = module.alb.api_target_group_arn_suffix
+  ecs_cluster_arn             = aws_ecs_cluster.this.arn
+
+  # No default subscription — a human adds the real production on-call
+  # address (or PagerDuty/Slack SNS integration) out-of-band once
+  # authorized, same "Terraform creates objects, a human wires the real
+  # destination" pattern as every secret value in this tree.
+  alarm_topic_subscription_emails = var.alarm_email_subscriptions
 }
 
 module "secrets" {
@@ -67,12 +83,12 @@ module "secrets" {
 module "database" {
   source = "../../modules/database"
 
-  environment            = local.environment
-  db_subnet_ids          = module.network.db_subnet_ids
-  vpc_security_group_id  = module.network.rds_security_group_id
-  instance_class          = var.db_instance_class
-  multi_az               = true # production — docs/aws-disaster-recovery.md §1
-  deletion_protection    = true # production — non-negotiable, same doc
+  environment           = local.environment
+  db_subnet_ids         = module.network.db_subnet_ids
+  vpc_security_group_id = module.network.rds_security_group_id
+  instance_class        = var.db_instance_class
+  multi_az              = true # production — docs/aws-disaster-recovery.md §1
+  deletion_protection   = true # production — non-negotiable, same doc
 }
 
 module "iam" {
@@ -139,7 +155,7 @@ module "web_service" {
   # Full-availability rolling deploy — never a capacity gap for a
   # public-facing service (docs/aws-deployment-runbook.md §1).
   min_healthy_percent = 100
-  max_percent          = 200
+  max_percent         = 200
 
   environment_variables = {
     NEXT_PUBLIC_APP_ENVIRONMENT = "production"
@@ -166,7 +182,7 @@ module "api_service" {
   aws_region         = var.aws_region
 
   min_healthy_percent = 100
-  max_percent          = 200
+  max_percent         = 200
 
   environment_variables = {
     PORT                       = "4000"
@@ -186,10 +202,10 @@ module "api_service" {
   # be correct for when that changes, not a claim that production can
   # boot today.
   secret_arns = {
-    DATABASE_URL           = module.database.database_url_secret_arn
-    JWT_ACCESS_SECRET      = module.secrets.secret_arns["jwt-access-secret"]
-    JWT_REFRESH_SECRET     = module.secrets.secret_arns["jwt-refresh-secret"]
-    POSTMARK_SERVER_TOKEN  = module.secrets.secret_arns["postmark-server-token"]
+    DATABASE_URL          = module.database.database_url_secret_arn
+    JWT_ACCESS_SECRET     = module.secrets.secret_arns["jwt-access-secret"]
+    JWT_REFRESH_SECRET    = module.secrets.secret_arns["jwt-refresh-secret"]
+    POSTMARK_SERVER_TOKEN = module.secrets.secret_arns["postmark-server-token"]
   }
 }
 
@@ -213,7 +229,7 @@ module "worker_service" {
   aws_region         = var.aws_region
 
   min_healthy_percent = 0 # safe at desired_count 1 — docs/production-deployment-plan.md §6
-  max_percent          = 200
+  max_percent         = 200
 
   health_check_command = ["CMD", "node", "scripts/worker-healthcheck.js"]
 

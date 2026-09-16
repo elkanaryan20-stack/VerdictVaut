@@ -70,3 +70,9 @@ variable "certificate_arn" {
   type        = string
   default     = null
 }
+
+variable "alarm_email_subscriptions" {
+  description = "Phase 28. Staging on-call/engineering email address(es) to subscribe to the CloudWatch alarm SNS topic. Defaults to empty — see environments/production/variables.tf's own comment."
+  type        = list(string)
+  default     = []
+}

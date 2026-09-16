@@ -22,3 +22,8 @@ email_base_url       = "https://staging.example.com"
 email_from_address   = "noreply@staging.example.com"
 
 # certificate_arn left unset — no domain/certificate exists yet.
+
+# alarm_email_subscriptions left unset (defaults to []) — no real
+# on-call address is invented here; uncomment and fill in once a human
+# authorizes real alerting for staging:
+# alarm_email_subscriptions = ["staging-alerts@example.com"] # EXAMPLE ONLY

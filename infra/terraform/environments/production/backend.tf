@@ -7,10 +7,10 @@
 
 terraform {
   backend "s3" {
-    bucket         = "verdictvaut-terraform-state" # EXAMPLE ONLY — does not exist
+    bucket         = "verdictvaut-terraform-state"  # EXAMPLE ONLY — does not exist
     key            = "production/terraform.tfstate" # separate key from staging
     region         = "us-east-1"                    # EXAMPLE ONLY — see docs/aws-production-architecture.md §10
-    dynamodb_table = "verdictvaut-terraform-locks"   # EXAMPLE ONLY — does not exist
+    dynamodb_table = "verdictvaut-terraform-locks"  # EXAMPLE ONLY — does not exist
     encrypt        = true
   }
 }

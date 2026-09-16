@@ -1,0 +1,136 @@
+name: Terraform plan/apply (manual)
+
+# Phase 28. Closes the gap docs/aws-production-change-control.md §3
+# named as "DESIGNED, NOT BUILT" since Phase 26/27 ("A real future
+# CI/CD deployment stage must... review the Terraform plan for
+# environments/production by a human before apply"). Distinct from
+# ci.yml's own `terraform-validate` job (fmt/init -backend=false/
+# validate, no credentials, runs on every push/PR) — THIS workflow is
+# the only place in this repository that ever runs `terraform plan` or
+# `terraform apply` against a real backend, and it does so only on an
+# explicit, human-triggered `workflow_dispatch` — never on push, never
+# on a schedule, never as a side effect of merging to main.
+#
+# As of this phase, running this workflow for real will fail at the
+# "configure AWS credentials" step: no AWS account exists, and the
+# AWS_TERRAFORM_ROLE_ARN secret referenced below is not set anywhere.
+# That is the correct, honest state — see infra/terraform/README.md and
+# docs/aws-production-change-control.md §4 for the full provisioning
+# sequence this depends on (state bucket/table first, then a human must
+# separately create and scope an IAM role for THIS workflow — seeded
+# but intentionally NOT auto-created by Terraform in this phase, since
+# a Terraform-apply-capable role's exact permission boundary across
+# every resource type this tree manages (VPC, RDS, ECS, IAM, ALB,
+# Secrets Manager, CloudWatch, SNS, EventBridge, ACM) is a distinct,
+# deliberate security decision this phase does not make on a human's
+# behalf — unlike modules/ci-deploy-role, which docs/aws-iam-and-secrets.md
+# §2.5 already fully specified). Failing clearly here, rather than
+# inventing a role ARN or a broad policy, matches this phase's own
+# "fail clearly when required values are missing" requirement.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Which environments/<x> root module to target"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+          - shared
+      action:
+        description: "plan (always safe, always runs) or apply (requires the environment's own GitHub Environment approval below)"
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+
+permissions:
+  id-token: write # required for aws-actions/configure-aws-credentials OIDC — no long-lived AWS key is used anywhere in this workflow
+  contents: read
+
+jobs:
+  terraform-plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC — fails clearly until a human provisions this role and secret)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive ../../
+
+      # Real backend — requires the S3 bucket/DynamoDB table from
+      # infra/terraform/README.md's "State storage and locking design"
+      # to already exist. Unlike ci.yml's terraform-validate job, this
+      # is NOT -backend=false.
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: terraform plan
+        run: terraform plan -input=false -out=tfplan
+
+      # The plan file, not just its text output, is what the apply job
+      # below applies — guarantees apply does exactly what was reviewed,
+      # never a plan re-computed (and possibly different, e.g. due to a
+      # race with another change) at apply time.
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}
+          path: infra/terraform/environments/${{ inputs.environment }}/tfplan
+          retention-days: 7
+
+  terraform-apply:
+    needs: terraform-plan
+    if: inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    # A GitHub Environment named "<environment>-infra-apply" must be
+    # configured (outside this file — Settings > Environments) with
+    # required reviewers before this job can ever run unattended. This
+    # workflow does not, and cannot, create that protection rule itself
+    # — restated from docs/aws-production-change-control.md §1's
+    # "Protected CI environment... DESIGNED, NOT IMPLEMENTED" row, which
+    # remains accurate until a human configures it in GitHub's own UI.
+    environment: ${{ inputs.environment }}-infra-apply
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: Download the exact plan reviewed above
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_id }}
+          path: infra/terraform/environments/${{ inputs.environment }}
+
+      - name: terraform apply (the reviewed plan file, never a fresh plan)
+        run: terraform apply -input=false tfplan

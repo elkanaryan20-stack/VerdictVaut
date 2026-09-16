@@ -1,15 +1,16 @@
-# VerdictVaut Terraform — Phase 25 skeleton
+# VerdictVaut Terraform — Phase 25 skeleton, hardened through Phase 28
 
 **Status: DESIGNED, NOT APPLIED.** Every file under this directory is
-a specification, reviewed for syntax by eye only. **`terraform` is not
-installed in any development environment this repository has been
-worked in to date (re-confirmed this session — `terraform -version`
-returns "command not found"), so `terraform fmt`, `terraform validate`,
-`terraform plan`, and `terraform apply` have never been run against
-this code, not even once.** Treat this exactly like this repository's
-own long-standing Docker-unavailability caveat on the Dockerfiles: a
-real, human/CI environment with the tool installed must validate this
-before it is trusted.
+a real specification, and — **as of Phase 28** — has actually been
+parsed by a real `terraform` binary (v1.9.8, installed locally this
+phase for the first time; `terraform fmt -check -recursive` and
+`terraform init -backend=false` + `terraform validate` all pass
+cleanly for `staging`/`production`/`shared`, see "Phase 28 additions"
+below for what that run actually caught). `terraform plan`/`apply`
+have still never been run — that requires a real AWS account and
+credentials, still neither obtained nor requested by any phase.
+Docker remains unavailable in every session to date (the Dockerfiles'
+own long-standing caveat, unrelated to Terraform).
 
 **No `terraform apply` has been, or should be, run using this code
 without an authorized AWS account, an explicit go-ahead from the human
@@ -44,18 +45,21 @@ infra/terraform/
     secrets/                   Secrets Manager secret OBJECTS ONLY (never a value)
     ecs-service/                Reusable module — instantiated 3x per environment
                                 (web, api, worker) with different inputs
-    observability/             CloudWatch log groups
+    observability/             CloudWatch log groups, alarms, SNS topic, RDS event
+                                subscription, ECS deployment-failure EventBridge rule (Phase 28)
     alb/                       Application Load Balancer, listeners, target groups, (optional) ACM cert
     iam/                       ECS execution role + per-service task roles
     ecr/                       Container repositories (Phase 27) — see its own header note
                                 on why this is a SHARED module, not per-environment
+    ci-deploy-role/            (Phase 28) GitHub Actions OIDC provider + CI deploy role
+                                — see its own header note on why this is account-level too
   environments/
     staging/                   Wires the modules together for staging
     production/                Wires the modules together for production
                                 — a SEPARATE state file from staging, always
-    shared/                    (Phase 27) Wires module.ecr only — a THIRD, separate
-                                state file, for the one resource (the container
-                                registry) that legitimately crosses the
+    shared/                    (Phase 27, extended Phase 28) Wires module.ecr and
+                                module.ci_deploy_role — a THIRD, separate state file,
+                                for the resources that legitimately cross the
                                 staging/production boundary by design (build-once,
                                 promote — docs/aws-deployment-runbook.md §4.2)
 ```
@@ -197,3 +201,84 @@ session). What changed:
   This is the first time any of this Terraform code will actually be
   parsed by a real `terraform` binary — previously it was reviewed by
   eye only (`docs/aws-terraform-security-review.md` §0).
+
+## Phase 28 additions
+
+**`terraform` was installed locally for the first time this phase**
+(v1.9.8, matching CI's pinned version — network access was available
+in this session's environment; downloaded from HashiCorp's own
+releases server) and run for real: `terraform fmt -check -recursive`,
+then `terraform init -backend=false` + `terraform validate` for
+`staging`, `production`, and `shared`. This immediately surfaced two
+real, previously-undetectable defects that six prior phases of
+eye-only review had missed:
+
+1. **Formatting drift** (7 files) — pre-existing `=` alignment
+   inconsistencies Phase 27 explicitly predicted and deliberately left
+   unfixed pending a real `terraform fmt` run (`docs/aws-terraform-security-review.md`
+   G5). Fixed by actually running `terraform fmt -recursive`.
+2. **A real `terraform validate` failure in `modules/network`**: every
+   `aws_security_group`/`ingress`/`egress` `description` field using an
+   em-dash or apostrophe violated the AWS provider's own restricted
+   regex for that argument (`^[0-9A-Za-z_ .:/()#,@\[\]+=&;{}!$*-]*$`) —
+   9 occurrences across all 5 security groups. This would have failed
+   the very first real `terraform apply` of the network module against
+   a real AWS account; no prior static review could have caught it
+   (`terraform validate` is the only tool that checks provider-schema
+   string-format constraints). Fixed by rewording all 9 to plain ASCII
+   — see `modules/network/main.tf`'s own header note.
+
+All three environments (`staging`, `production`, `shared`) now
+validate cleanly end-to-end, including every module added this phase.
+
+New this phase, all still **DESIGNED, NOT APPLIED**:
+
+- **`modules/observability`** gained the CloudWatch Alarms/SNS/RDS-event-
+  subscription/EventBridge layer `docs/aws-production-architecture.md`
+  §13/§14 specified since Phase 25 but no prior phase implemented in
+  Terraform — see that module's own header note and
+  `docs/aws-production-architecture.md` §14 for the full alarm-by-alarm
+  mapping. Every log-based filter pattern matches the real JSON shape
+  `JsonLoggerService`/`LoggingMetricsService` actually emit (re-read
+  this phase); every metric name matches a real `metrics.increment(...)`
+  call site (grepped this phase, none invented). One new application
+  metric was added to close a real, previously-flagged gap:
+  `auth.account_locked` (`apps/api/src/auth/auth.service.ts`, fires
+  once per newly-applied account lock).
+- **`modules/ecs-service`** gained `deployment_circuit_breaker` (default
+  **on**, `enable = true, rollback = true`) — the concrete mechanism
+  behind "failed deployments do not silently become healthy": ECS
+  itself now detects a deployment that can never reach a steady state
+  and rolls back automatically, surfaced to the new SNS topic via
+  `modules/observability`'s EventBridge rule.
+- **`modules/ci-deploy-role`** (new) + `environments/shared` extension —
+  implements `docs/aws-iam-and-secrets.md` §2.5's CI/CD deploy role
+  (GitHub OIDC provider + a role scoped to exactly ECR push + the 3 ECS
+  services' `UpdateService`/`DescribeServices`/`DescribeTaskDefinition`/
+  `RegisterTaskDefinition` + a narrowly-scoped `iam:PassRole`), which
+  that document had explicitly deferred as "not created or used by this
+  phase" since Phase 25. The OIDC provider's thumbprint was computed
+  THIS SESSION from `token.actions.githubusercontent.com`'s real live
+  certificate chain, not copied from a possibly-stale memorized value
+  (see that module's own comment).
+- **`.github/workflows/terraform-deploy.yml`** (new) — `workflow_dispatch`-only
+  real `terraform plan`/`apply` against a real backend (distinct from
+  `ci.yml`'s own `terraform-validate` job, which always uses
+  `-backend=false` and never plans/applies). `apply` is a separate job
+  gated behind a GitHub Environment (`<environment>-infra-apply`) a
+  human must configure with required reviewers.
+- **`.github/workflows/ecr-publish.yml`** (new) — `workflow_dispatch`-only
+  build+push of immutable commit-SHA-tagged images, a
+  `production-readiness-check.js` gate (production only, before
+  deploy), then an ECS task-definition-revision update per service,
+  gated behind `<environment>-deploy`. An `image_tag` input, when set
+  to a previous SHA, skips the build and redeploys that exact image —
+  the one-command rollback path `docs/aws-production-change-control.md`
+  §3 asked for.
+
+**Both new workflows will fail immediately at their AWS-credentials
+step today** — the `AWS_TERRAFORM_ROLE_ARN`/`AWS_CI_DEPLOY_ROLE_ARN`
+GitHub secrets they reference are not set anywhere, and no AWS account
+exists regardless. This is the correct, honest state, not a bug to
+fix: `docs/aws-production-change-control.md` §4 documents exactly what
+must happen first.

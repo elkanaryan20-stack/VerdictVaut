@@ -89,17 +89,27 @@ account.
 
 ## 4. Deployment pipeline — current state and future design
 
-### 4.1 Current state (audited this session, unchanged)
+### 4.1 Current state (Phase 28 update)
 
-`.github/workflows/ci.yml` — re-read in full this session:
-`typecheck` → `lint` → `build` → `API unit tests` → `API integration
-tests` → `Web unit tests` (all one job), plus two independent jobs
-(`prisma-migration-validation`, `docker-build`). **No job pushes an
-image anywhere, deploys anything, or holds any AWS credential.** This
-is the intentional stopping point Phase 16 chose, restated by Phase 23
-and still true today.
+`.github/workflows/ci.yml`, unchanged this phase: `typecheck` → `lint`
+→ `build` → `API unit tests` → `API integration tests` → `Web unit
+tests` (all one job), plus `prisma-migration-validation`,
+`docker-build`, and `terraform-validate` (Phase 27). **Still holds no
+AWS credential and still never pushes an image or deploys anything.**
 
-### 4.2 Future production pipeline (DESIGNED, NOT BUILT — requires the CI role in `docs/aws-iam-and-secrets.md` §2.5, which requires an AWS account)
+**New this phase**: `.github/workflows/terraform-deploy.yml` (real
+`terraform plan`, and `terraform apply` gated behind a GitHub
+Environment approval) and `.github/workflows/ecr-publish.yml` (build +
+push immutable commit-SHA-tagged images, then update the 3 ECS
+services via a new task-definition revision, gated behind a GitHub
+Environment approval for production). **Both are `workflow_dispatch`
+only — never triggered by a push to `main`** — and both will fail
+immediately at their AWS-credentials step today: the `AWS_TERRAFORM_ROLE_ARN`
+and `AWS_CI_DEPLOY_ROLE_ARN` GitHub secrets they reference are not set
+anywhere, and no AWS account exists regardless. This is the intended,
+honest state — see §4.3 below for exactly what must exist first.
+
+### 4.2 Production pipeline design (workflows exist in code — §4.1 — usable only once §4.3 is satisfied)
 
 ```
 commit
@@ -134,26 +144,36 @@ production deployment (ECS service update — only after the manual gate
 ```
 
 **Production deployment is never automatic** — the manual-approval gate
-is a hard requirement from this phase's brief, not an implementation
-detail left to discretion. No workflow file implementing any pipeline
-stage past "build/test" is added by this phase (there is no AWS
-account/ECR/ECS cluster to deploy to yet — writing a workflow that
-references real AWS resources now would either fail on every run or
-require inventing resource identifiers, both explicitly forbidden).
+is a hard requirement, implemented as a GitHub Environment reference
+(`environment: ${{ inputs.environment }}-deploy` in `ecr-publish.yml`,
+`${{ inputs.environment }}-infra-apply` in `terraform-deploy.yml`) that
+a human must separately configure with required reviewers in GitHub's
+own Settings UI — this repository's workflow files reference that gate
+by name but cannot create the protection rule itself (not a GitHub API
+this phase has credentials for, and not something Terraform manages).
+**Phase 28 update**: both workflows now exist in code (§4.1) — every
+AWS-resource reference inside them is a GitHub secret/variable, never
+an invented identifier, so running either today fails clearly at the
+credentials step rather than silently or against a fabricated target.
 
-### 4.3 What would need to exist before §4.2 can be built for real
+### 4.3 What must exist before §4.2 can actually run for real
 
 1. An authorized AWS account (§`docs/aws-production-architecture.md` —
    human approval).
-2. The 3 ECR repositories (§3) and the CI deploy IAM role
-   (`docs/aws-iam-and-secrets.md` §2.5).
-3. A real staging ECS cluster/services (§5 below) to deploy to
-   automatically — the "staging" stage above has nothing to target
-   today.
-4. A decision on the manual-approval mechanism (GitHub Environments is
-   the natural fit given this repo already uses GitHub Actions; not
-   independently verified against GitHub's current documentation this
-   session since it doesn't require inventing any AWS-specific claim).
+2. The full provisioning sequence in `docs/aws-production-change-control.md`
+   §4, run once for real — steps 1-9 at minimum, so the 3 ECR
+   repositories, the CI deploy role (`docs/aws-iam-and-secrets.md`
+   §2.5, `infra/terraform/modules/ci-deploy-role`), and both ECS
+   clusters/services actually exist.
+3. `AWS_TERRAFORM_ROLE_ARN` and `AWS_CI_DEPLOY_ROLE_ARN` set as real
+   GitHub Actions secrets, and `AWS_REGION`/`NEXT_PUBLIC_API_URL` set
+   as GitHub Actions variables — `.github/workflows/terraform-deploy.yml`/`ecr-publish.yml`
+   read these by name and fail clearly (not silently, not against a
+   fabricated value) until they exist.
+4. Two GitHub Environments actually configured with required reviewers
+   in Settings (e.g. `production-infra-apply`, `production-deploy`) —
+   the workflow files reference these names but cannot create the
+   protection rule itself.
 
 ## 5. Staging vs. production (AWS-level)
 
@@ -180,11 +200,16 @@ discipline requirement, not enforced by any new code this phase adds
 enforcement mechanism regardless of which AWS environment a container
 happens to run in).
 
-## 6. What this document does not do
+## 6. What this document (and Phase 28's workflows) does not do
 
-- Does not create an ECS cluster, service, task definition, ALB, ECR
-  repository, or CI/CD workflow step that deploys anywhere.
-- Does not push an image to any registry.
-- Does not grant the CI role in §4.3 any real AWS credential.
+- Does not create a real ECS cluster, service, task definition, ALB, or
+  ECR repository — Terraform defines them; `apply` has never been run.
+- Does not push an image to any registry — `ecr-publish.yml` exists in
+  code but has never executed against a real AWS account.
+- Does not grant the CI role in §4.3 any real AWS credential, and does
+  not create the GitHub Environment protection rules its workflows
+  reference by name.
 - Does not weaken the manual-approval requirement for production
   deployment under any condition.
+- Does not auto-trigger either new workflow on push/merge — both are
+  `workflow_dispatch` only.

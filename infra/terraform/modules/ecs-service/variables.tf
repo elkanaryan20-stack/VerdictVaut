@@ -122,3 +122,9 @@ variable "tmpfs_size_mib" {
   type        = number
   default     = 64
 }
+
+variable "enable_deployment_circuit_breaker" {
+  description = "Phase 28. Default true (a safe-by-default toggle, unlike deletion_protection/enable_deletion_protection which default-require an explicit choice because the unsafe value is also the AWS default) — ECS automatically rolls a deployment back to the last known-good task definition if the new one never reaches a steady state. Exposed as a variable, not hardcoded, only so a future caller with a documented reason (e.g. a deliberately manual rollout) can opt out explicitly rather than this module silently assuming every service wants it."
+  type        = bool
+  default     = true
+}

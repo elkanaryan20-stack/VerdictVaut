@@ -67,25 +67,36 @@ Phase 23/24). **Zero permissions.**
 
 ### 2.5 CI/CD deploy role (`verdictvaut-ci-deploy-role`, assumed by GitHub Actions via OIDC federation — not an IAM user with long-lived access keys)
 
-**Not created or used by this phase** — the existing `.github/workflows/ci.yml`
-pushes nothing to AWS today (re-verified this session by reading the
-full workflow — the `docker-build` job builds images locally on the
-runner and never pushes anywhere). This role is specified here for
-when a real production deployment pipeline is authorized
-(§`docs/aws-deployment-runbook.md` §7):
+**Phase 28 update: IMPLEMENTED IN TERRAFORM** (`infra/terraform/modules/ci-deploy-role`,
+instantiated once from `environments/shared` — see that module's own
+header note for why it is account-level, not per-environment), **still
+NOT PROVISIONED** — no AWS account exists, and `.github/workflows/ecr-publish.yml`
+(new this phase) references it only via the `AWS_CI_DEPLOY_ROLE_ARN`
+GitHub secret, which is not set anywhere. Every permission below is
+exactly what that Terraform module actually grants — not a broader
+aspiration:
 
 | Permission | Scope | Why |
 |---|---|---|
 | `ecr:GetAuthorizationToken`, `ecr:PutImage`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:BatchCheckLayerAvailability` | The 3 `verdictvaut-*` ECR repositories only | Push newly-built images |
 | `ecs:UpdateService`, `ecs:DescribeServices`, `ecs:DescribeTaskDefinition`, `ecs:RegisterTaskDefinition` | The `verdictvaut` ECS cluster's 3 services only | Roll out a new task definition revision |
-| `iam:PassRole` | Exactly the execution role + the specific task role being deployed — **never `iam:PassRole` on `*`** | ECS requires the deploying principal to be allowed to pass the task/execution roles to the new task definition; scoping this narrowly prevents the CI role from being used to launch a task with a *different*, more-privileged role |
+| `iam:PassRole` | Exactly the execution role + the specific task roles across both environments (`modules/ci-deploy-role`'s `local.execution_role_arns`/`local.task_role_arns`), further restricted by an `iam:PassedToService = ecs-tasks.amazonaws.com` condition — **never `iam:PassRole` on `*`** | ECS requires the deploying principal to be allowed to pass the task/execution roles to the new task definition; scoping this narrowly prevents the CI role from being used to launch a task with a *different*, more-privileged role |
 
-**Authentication**: GitHub Actions OIDC federation (`aws-actions/configure-aws-credentials`
+**Authentication**: GitHub Actions OIDC federation
+(`aws_iam_openid_connect_provider`, `aws-actions/configure-aws-credentials`
 with `role-to-assume`, no static AWS access keys stored as a GitHub
-secret) is the AWS-recommended pattern for exactly this use case —
-noted as the intended mechanism, not configured or verified against
-live GitHub/AWS OIDC trust-policy setup this session (would require a
-real AWS account to actually register the identity provider).
+secret) — implemented in `modules/ci-deploy-role/main.tf` this phase.
+The trust policy's `token.actions.githubusercontent.com:sub` condition
+is scoped to exactly this repository (`var.github_repository`, no
+default) via `StringLike "repo:<owner>/<repo>:*"` — not narrowed
+further to a specific branch/ref, since the real deployment workflow's
+final trigger conditions are not yet exercised against a real account;
+a human should tighten this once they are. The OIDC provider's
+`thumbprint_list` value was computed THIS SESSION from
+`token.actions.githubusercontent.com`'s actual live certificate chain
+(not a memorized/copied value — see that module's own comment for why,
+and for the caveat that AWS does not actually rely on this value for a
+publicly-trusted-CA-backed provider like this one).
 
 ## 3. Secrets Manager mapping
 
@@ -194,13 +205,13 @@ re-read this session, contains only those two public variables).
   section) — secret *values* are set out-of-band (AWS Console/CLI by a
   human, or a future secure CI step), never written into `.tf`/`.tfvars`.
 
-## 8. What this document does not do
+## 8. What this document (and the Terraform it describes) does not do
 
-- Does not create an IAM role, policy, or Secrets Manager secret — no
-  AWS account exists.
+- Does not create a real IAM role, policy, Secrets Manager secret, or
+  OIDC identity provider — no AWS account exists to create them in.
+  `infra/terraform/modules/ci-deploy-role` (Phase 28) defines what
+  would be created; `terraform apply` has never been run.
 - Does not set a real secret value anywhere.
-- Does not register a GitHub OIDC identity provider in any AWS
-  account.
 - Does not grant any role permissions beyond what this session could
   verify the corresponding application code actually needs by reading
   it directly (not by assuming a generic template's permission set).

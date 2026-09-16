@@ -20,3 +20,8 @@ email_base_url       = "https://app.example.com"
 email_from_address   = "noreply@example.com" # must be a Postmark-verified sending domain (SPF/DKIM) before this can actually deliver mail
 
 # certificate_arn left unset — no domain/certificate exists yet.
+
+# alarm_email_subscriptions left unset (defaults to []) — no real
+# on-call address is invented here; uncomment and fill in once a human
+# authorizes real production alerting:
+# alarm_email_subscriptions = ["oncall@example.com"] # EXAMPLE ONLY
