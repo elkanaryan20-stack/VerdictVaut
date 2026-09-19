@@ -88,6 +88,38 @@ async function main() {
   const user = await primaryPrisma.user.create({ data: { email: `${marker}@example.com`, passwordHash: "unused", status: "ACTIVE" } });
   const counterparty = await primaryPrisma.user.create({ data: { email: `${marker}-counterparty@example.com`, passwordHash: "unused", status: "ACTIVE" } });
   const usdc = await primaryPrisma.asset.findUniqueOrThrow({ where: { symbol: "USDC" } });
+
+  // Phase 32 — moved ahead of the ledger rows below (was created much
+  // later in this script) so the deposit-backing LedgerTransaction can
+  // carry a real referenceType: 'Deposit' / referenceId: deposit.id pair,
+  // exactly like DepositsService.creditDeposit's real shape
+  // (deposits.service.ts) — required for
+  // financial-integrity-checks.js's orphan-LedgerTransaction check
+  // (#15, Phase 32) to recognize this row rather than flag it.
+  const usdcSepoliaNetwork = await primaryPrisma.assetNetwork.findFirstOrThrow({
+    where: { asset: { symbol: "USDC" }, network: { code: "ethereum-sepolia" } },
+  });
+  const walletAddress = await primaryPrisma.walletAddress.create({
+    data: { assetNetworkId: usdcSepoliaNetwork.id, address: `0xdrill${Date.now()}`, role: "DEPOSIT_POOL", environment: "SANDBOX", status: "ASSIGNED" },
+  });
+  // Created PENDING (no ledgerTransactionId yet — deposits_credited_ledger_ref_consistency_check
+  // forbids a non-CREDITED deposit from carrying one) and credited further
+  // below once its backing LedgerTransaction exists, the same two-step
+  // order the real DepositsService.creditDeposit flow uses.
+  const deposit = await primaryPrisma.deposit.create({
+    data: {
+      userId: user.id,
+      assetId: usdc.id,
+      assetNetworkId: usdcSepoliaNetwork.id,
+      walletAddressId: walletAddress.id,
+      txHash: `0xdrilldeposit${Date.now()}`,
+      amount: "100",
+      confirmations: 0,
+      requiredConfirmations: 12,
+      status: "PENDING",
+    },
+  });
+
   const externalChain = await primaryPrisma.ledgerAccount.create({
     data: { ownerType: "HOUSE", houseAccountKey: "EXTERNAL_CHAIN", assetId: usdc.id, cachedBalance: "-100", reservedBalance: "0" },
   });
@@ -95,10 +127,22 @@ async function main() {
     data: { ownerType: "USER", userId: user.id, assetId: usdc.id, cachedBalance: "100", reservedBalance: "0" },
   });
   const txn = await primaryPrisma.ledgerTransaction.create({
-    data: { assetId: usdc.id, type: "DEPOSIT", referenceType: "BackupDrill", referenceId: marker, idempotencyKey: `drill:${marker}` },
+    data: { assetId: usdc.id, type: "DEPOSIT", referenceType: "Deposit", referenceId: deposit.id, idempotencyKey: `deposit:${deposit.id}` },
   });
-  await primaryPrisma.ledgerEntry.create({ data: { transactionId: txn.id, accountId: userAccount.id, amount: "100", balanceAfter: "100" } });
-  await primaryPrisma.ledgerEntry.create({ data: { transactionId: txn.id, accountId: externalChain.id, amount: "-100", balanceAfter: "-100" } });
+  // Phase 32 — both legs of one LedgerTransaction must commit together:
+  // ledger_entries_transaction_balance_check (a DEFERRED CONSTRAINT
+  // TRIGGER, migration 20260919010000) verifies at COMMIT time that
+  // every transactionId's entries sum to zero, so two separate
+  // auto-committing .create() calls would fail on the first one (its own
+  // implicit transaction sees only a single, unbalanced leg).
+  await primaryPrisma.$transaction([
+    primaryPrisma.ledgerEntry.create({ data: { transactionId: txn.id, accountId: userAccount.id, amount: "100", balanceAfter: "100" } }),
+    primaryPrisma.ledgerEntry.create({ data: { transactionId: txn.id, accountId: externalChain.id, amount: "-100", balanceAfter: "-100" } }),
+  ]);
+  await primaryPrisma.deposit.update({
+    where: { id: deposit.id },
+    data: { status: "CREDITED", confirmations: 12, ledgerTransactionId: txn.id, creditedAt: new Date() },
+  });
 
   // Phase 22 — broadened beyond the ledger core (Phase 12A's original
   // scope) to cover every table category the phase brief explicitly asks
@@ -111,6 +155,14 @@ async function main() {
   const reservation = await primaryPrisma.fundReservation.create({
     data: { accountId: userAccount.id, amount: "10", consumedAmount: "0", status: "ACTIVE", referenceType: "BackupDrill", referenceId: marker, idempotencyKey: `drill-reservation:${marker}` },
   });
+  // Phase 32 — ReservationService.reserve() always bumps the owning
+  // account's cachedBalance-adjacent reservedBalance in the same
+  // transaction as the FundReservation row (reservation.service.ts);
+  // this direct insert must mirror that or
+  // financial-integrity-checks.js's reservedBalance-vs-FundReservations
+  // cross-check (#10) reports a drift that was never real (nothing
+  // actually released or over-reserved — the fixture just never set it).
+  await primaryPrisma.ledgerAccount.update({ where: { id: userAccount.id }, data: { reservedBalance: "10" } });
 
   const category = await primaryPrisma.marketCategory.create({ data: { slug: `drill-category-${marker}`, name: "Backup Drill Category" } });
   const market = await primaryPrisma.market.create({
@@ -140,6 +192,22 @@ async function main() {
       idempotencyKey: `drill-fill:${marker}`,
     },
   });
+  // Phase 32 — ExecutionCoordinator.postTradeLedger (execution-coordinator.service.ts)
+  // always posts a real trade this same shape (referenceType: 'Fill',
+  // referenceId: fill.id, buyer debit / seller credit) in the SAME
+  // transaction as the Fill row itself; financial-integrity-checks.js's
+  // check #12 independently verifies every Fill has exactly this backing
+  // record, so the fixture must have one too.
+  const counterpartyAccount = await primaryPrisma.ledgerAccount.create({
+    data: { ownerType: "USER", userId: counterparty.id, assetId: usdc.id, cachedBalance: "2.5", reservedBalance: "0" },
+  });
+  const fillTxn = await primaryPrisma.ledgerTransaction.create({
+    data: { assetId: usdc.id, type: "TRADE", referenceType: "Fill", referenceId: fill.id, idempotencyKey: `trade:${fill.id}` },
+  });
+  await primaryPrisma.$transaction([
+    primaryPrisma.ledgerEntry.create({ data: { transactionId: fillTxn.id, accountId: userAccount.id, amount: "-2.5", balanceAfter: "97.5" } }),
+    primaryPrisma.ledgerEntry.create({ data: { transactionId: fillTxn.id, accountId: counterpartyAccount.id, amount: "2.5", balanceAfter: "2.5" } }),
+  ]);
   const position = await primaryPrisma.position.create({
     data: { userId: user.id, marketId: market.id, outcomeId: yesOutcome.id, quantity: "5", avgPrice: "0.5" },
   });
@@ -150,37 +218,27 @@ async function main() {
   const marketCollateralAccount = await primaryPrisma.ledgerAccount.create({
     data: { ownerType: "MARKET", marketId: market.id, assetId: usdc.id, cachedBalance: "5", reservedBalance: "0" },
   });
+  // Phase 32 — SettlementService's real settlement payout uses exactly
+  // this shape (referenceType: 'Position', referenceId: position.id —
+  // settlement.service.ts); financial-integrity-checks.js's orphan-
+  // LedgerTransaction check (#15) only recognizes that referenceType
+  // together with a real Position id, not an arbitrary marker string.
   const settlementTxn = await primaryPrisma.ledgerTransaction.create({
-    data: { assetId: usdc.id, type: "SETTLEMENT", referenceType: "BackupDrillSettlement", referenceId: marker, idempotencyKey: `drill-settlement-txn:${marker}` },
+    data: { assetId: usdc.id, type: "SETTLEMENT", referenceType: "Position", referenceId: position.id, idempotencyKey: `settlement-payout:${position.id}` },
   });
-  await primaryPrisma.ledgerEntry.create({ data: { transactionId: settlementTxn.id, accountId: userAccount.id, amount: "5", balanceAfter: "105" } });
-  await primaryPrisma.ledgerEntry.create({ data: { transactionId: settlementTxn.id, accountId: marketCollateralAccount.id, amount: "-5", balanceAfter: "0" } });
+  // Phase 32 — same reason as the deposit-leg pair above.
+  await primaryPrisma.$transaction([
+    primaryPrisma.ledgerEntry.create({ data: { transactionId: settlementTxn.id, accountId: userAccount.id, amount: "5", balanceAfter: "105" } }),
+    primaryPrisma.ledgerEntry.create({ data: { transactionId: settlementTxn.id, accountId: marketCollateralAccount.id, amount: "-5", balanceAfter: "0" } }),
+  ]);
   const settlement = await primaryPrisma.positionSettlement.create({
     data: { positionId: position.id, marketId: market.id, outcomeId: yesOutcome.id, userId: user.id, quantity: "5", payoutPerShare: "1", payoutAmount: "5", ledgerTransactionId: settlementTxn.id, idempotencyKey: `drill-settlement:${marker}` },
   });
   await primaryPrisma.position.update({ where: { id: position.id }, data: { settledAt: settlement.settledAt } });
 
-  const usdcSepoliaNetwork = await primaryPrisma.assetNetwork.findFirstOrThrow({
-    where: { asset: { symbol: "USDC" }, network: { code: "ethereum-sepolia" } },
-  });
-  const walletAddress = await primaryPrisma.walletAddress.create({
-    data: { assetNetworkId: usdcSepoliaNetwork.id, address: `0xdrill${Date.now()}`, role: "DEPOSIT_POOL", environment: "SANDBOX", status: "ASSIGNED" },
-  });
-  const deposit = await primaryPrisma.deposit.create({
-    data: {
-      userId: user.id,
-      assetId: usdc.id,
-      assetNetworkId: usdcSepoliaNetwork.id,
-      walletAddressId: walletAddress.id,
-      txHash: `0xdrilldeposit${Date.now()}`,
-      amount: "100",
-      confirmations: 12,
-      requiredConfirmations: 12,
-      status: "CREDITED",
-      ledgerTransactionId: txn.id,
-      creditedAt: new Date(),
-    },
-  });
+  // usdcSepoliaNetwork/walletAddress/deposit were created earlier
+  // (Phase 32 — moved up so the deposit-backing LedgerTransaction can
+  // reference a real deposit.id); reused here for the withdrawal fixture.
   const withdrawal = await primaryPrisma.withdrawal.create({
     data: {
       userId: user.id,

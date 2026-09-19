@@ -1,0 +1,18 @@
+-- Phase 32 — a real transaction hash must belong to exactly one
+-- withdrawal. Without this, two withdrawal rows sharing the same
+-- txHash (an admin data-entry error, or a provider bug) would let
+-- WithdrawalWatcherService independently confirm/credit BOTH off the
+-- same single real on-chain event.
+--
+-- Deliberately a plain UNIQUE constraint, not a defensive/conditional
+-- one: standard Postgres NULL semantics (NULL never equals NULL)
+-- already make this safe for the many withdrawals sitting in a
+-- pre-broadcast state with txHash IS NULL — only two REAL, equal,
+-- non-null hashes would collide. Unlike the email-normalization
+-- migration (20260918000000), there is no legitimate reason for this
+-- migration to succeed in the presence of an existing collision: if
+-- one exists in real data, that is itself evidence of the exact
+-- double-credit risk this constraint exists to prevent, and the
+-- correct behavior is for this migration to fail loudly and require
+-- human investigation, not silently skip the offending rows.
+ALTER TABLE "withdrawals" ADD CONSTRAINT "withdrawals_tx_hash_key" UNIQUE ("txHash");

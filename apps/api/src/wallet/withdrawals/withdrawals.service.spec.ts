@@ -421,7 +421,13 @@ describe("WithdrawalsService", () => {
     });
 
     it("CONFIRMED_BROADCAST moves EXECUTION_AMBIGUOUS -> BROADCAST with the admin-supplied txHash, never fabricating one", async () => {
-      prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", status: "EXECUTION_AMBIGUOUS" });
+      // findUnique is used for two distinct lookups here — the Phase 32
+      // assertTxHashNotAlreadyUsed() guard (by txHash, should find nothing)
+      // and, on some paths, a plain id lookup — so the mock must
+      // distinguish them rather than answer every call the same way.
+      prisma.withdrawal.findUnique.mockImplementation(async ({ where }: { where: { id?: string; txHash?: string } }) =>
+        where.id ? { id: "wd-1", status: "EXECUTION_AMBIGUOUS" } : null,
+      );
 
       const result = await service.resolveAmbiguousExecution(
         "wd-1",
@@ -440,6 +446,17 @@ describe("WithdrawalsService", () => {
       expect(auditLog.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: "withdrawal.ambiguous_execution_resolved", reason: "Confirmed via Fireblocks dashboard directly" }),
       );
+    });
+
+    it("CONFIRMED_BROADCAST refuses to resolve with a txHash another withdrawal already used (Phase 32 hardening)", async () => {
+      prisma.withdrawal.findUnique.mockImplementation(async ({ where }: { where: { id?: string; txHash?: string } }) =>
+        where.txHash ? { id: "wd-other", status: "CREDITED", txHash: where.txHash } : { id: "wd-1", status: "EXECUTION_AMBIGUOUS" },
+      );
+
+      await expect(
+        service.resolveAmbiguousExecution("wd-1", "admin-1", { outcome: "CONFIRMED_BROADCAST", txHash: "0xalreadyused" }, "notes"),
+      ).rejects.toThrow(ConflictException);
+      expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
     });
 
     it("CONFIRMED_NOT_EXECUTED moves EXECUTION_AMBIGUOUS -> APPROVED, safe for a retry or a subsequent reject()", async () => {

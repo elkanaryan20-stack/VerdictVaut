@@ -1,5 +1,5 @@
 import { Prisma } from "@prisma/client";
-import { createTestUser, getAsset, getAssetNetwork, prisma, provisionAddress } from "./helpers";
+import { createTestUser, fundUserForTest, getAsset, getAssetNetwork, getUserAccount, prisma, provisionAddress } from "./helpers";
 
 /**
  * These bypass the application layer entirely (raw SQL, or Prisma calls
@@ -118,7 +118,44 @@ describe("Database-level financial invariants (real Postgres)", () => {
     await expect(
       prisma.$executeRaw`
         INSERT INTO "withdrawals" ("id", "userId", "assetNetworkId", "destinationAddress", "amount", "status", "txHash", "clientWithdrawalId", "createdAt", "updatedAt")
-        VALUES (gen_random_uuid()::text, ${user.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 'BROADCAST', '0xrealhash', ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
+        VALUES (gen_random_uuid()::text, ${user.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 'BROADCAST', ${"0xrealhash" + Date.now() + Math.random()}, ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
+      `,
+    ).resolves.toBeDefined();
+  });
+
+  it("rejects two withdrawals sharing the same real txHash (Phase 32 hardening)", async () => {
+    const userA = await createTestUser();
+    const userB = await createTestUser();
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+    const sharedHash = "0xshared" + Date.now() + Math.random();
+
+    await prisma.$executeRaw`
+      INSERT INTO "withdrawals" ("id", "userId", "assetNetworkId", "destinationAddress", "amount", "status", "txHash", "clientWithdrawalId", "createdAt", "updatedAt")
+      VALUES (gen_random_uuid()::text, ${userA.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 'BROADCAST', ${sharedHash}, ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
+    `;
+
+    await expect(
+      prisma.$executeRaw`
+        INSERT INTO "withdrawals" ("id", "userId", "assetNetworkId", "destinationAddress", "amount", "status", "txHash", "clientWithdrawalId", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid()::text, ${userB.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 'BROADCAST', ${sharedHash}, ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
+      `,
+    ).rejects.toThrow(/Unique constraint failed|txHash.*already exists/);
+  });
+
+  it("allows multiple withdrawals with NULL txHash (pre-broadcast) despite the unique constraint (Phase 32 hardening)", async () => {
+    const userA = await createTestUser();
+    const userB = await createTestUser();
+    const assetNetwork = await getAssetNetwork("USDC", "ethereum-sepolia");
+
+    await prisma.$executeRaw`
+      INSERT INTO "withdrawals" ("id", "userId", "assetNetworkId", "destinationAddress", "amount", "status", "clientWithdrawalId", "createdAt", "updatedAt")
+      VALUES (gen_random_uuid()::text, ${userA.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 'REQUESTED', ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
+    `;
+
+    await expect(
+      prisma.$executeRaw`
+        INSERT INTO "withdrawals" ("id", "userId", "assetNetworkId", "destinationAddress", "amount", "status", "clientWithdrawalId", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid()::text, ${userB.id}, ${assetNetwork.id}, '0x000000000000000000000000000000000000dEaD', 10, 'REQUESTED', ${"ck-" + Date.now() + Math.random()}, NOW(), NOW())
       `,
     ).resolves.toBeDefined();
   });
@@ -193,5 +230,74 @@ describe("Database-level financial invariants (real Postgres)", () => {
         data: { assetId: asset.id, type: "ADJUSTMENT", referenceType: "Test", referenceId: "t-2", idempotencyKey: key },
       }),
     ).rejects.toThrow(Prisma.PrismaClientKnownRequestError);
+  });
+
+  it("rejects a single unbalanced leg written directly to ledger_entries, bypassing LedgerService entirely (Phase 32 hardening)", async () => {
+    const user = await createTestUser();
+    await fundUserForTest(user.id, "USDC", "100");
+    const asset = await getAsset("USDC");
+    const userAccount = await getUserAccount(user.id, "USDC");
+
+    const txn = await prisma.ledgerTransaction.create({
+      data: {
+        assetId: asset.id,
+        type: "ADJUSTMENT",
+        referenceType: "Test",
+        referenceId: `unbalanced-${Date.now()}-${Math.random()}`,
+        idempotencyKey: `unbalanced-test-${Date.now()}-${Math.random()}`,
+      },
+    });
+
+    // A single leg with no zero-summing counterparty — exactly what
+    // LedgerService.postTransaction's own UnbalancedTransactionError check
+    // already rejects at the application level (ledger.service.ts). This
+    // proves the database independently refuses it too, for a write that
+    // skips LedgerService entirely (e.g. a future repair script or
+    // migration, the same shape as apps/api/scripts/backup-restore-drill.js's
+    // direct ledgerEntry.create calls).
+    await expect(
+      prisma.ledgerEntry.create({
+        data: { transactionId: txn.id, accountId: userAccount!.id, amount: "10", balanceAfter: "110" },
+      }),
+    ).rejects.toThrow(/do not sum to zero/);
+  });
+
+  it("allows a balanced pair of ledger_entries committed together in one transaction (Phase 32 hardening)", async () => {
+    const user = await createTestUser();
+    await fundUserForTest(user.id, "USDC", "100");
+    const asset = await getAsset("USDC");
+    const userAccount = await getUserAccount(user.id, "USDC");
+    const externalChain = await prisma.ledgerAccount.findUniqueOrThrow({
+      where: { houseAccountKey_assetId: { houseAccountKey: "EXTERNAL_CHAIN", assetId: asset.id } },
+    });
+
+    const txn = await prisma.ledgerTransaction.create({
+      data: {
+        assetId: asset.id,
+        type: "ADJUSTMENT",
+        referenceType: "Test",
+        referenceId: `balanced-${Date.now()}-${Math.random()}`,
+        idempotencyKey: `balanced-test-${Date.now()}-${Math.random()}`,
+      },
+    });
+
+    // The deferred constraint trigger only evaluates at COMMIT — this is
+    // the legitimate shape (multiple legs of one transactionId, written
+    // together, summing to zero) that must keep working.
+    await expect(
+      prisma.$transaction([
+        prisma.ledgerEntry.create({
+          data: { transactionId: txn.id, accountId: userAccount!.id, amount: "10", balanceAfter: "110" },
+        }),
+        prisma.ledgerEntry.create({
+          data: {
+            transactionId: txn.id,
+            accountId: externalChain.id,
+            amount: "-10",
+            balanceAfter: externalChain.cachedBalance.minus(10).toString(),
+          },
+        }),
+      ]),
+    ).resolves.toBeDefined();
   });
 });

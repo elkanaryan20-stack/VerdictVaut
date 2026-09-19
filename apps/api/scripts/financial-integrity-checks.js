@@ -212,6 +212,68 @@ async function runIntegrityChecks(prisma) {
     `fills=${totalFillFees} feeRevenueAccount=${totalFeeRevenue}`,
   );
 
+  // 14. Orphan ACTIVE reservations (Phase 32) — an ACTIVE FundReservation/
+  // PositionReservation earmarks real balance/shares against a specific
+  // Order or Withdrawal (see reservation.service.ts's `referenceType`/
+  // `referenceId`); if that referenced row no longer exists at all, the
+  // earmark can never be released or consumed by anything (every release/
+  // consume path is reached BY loading the order/withdrawal first), so
+  // the user's available balance would be permanently understated with
+  // no code path left that could ever fix it — the same category of harm
+  // as the Phase 31 stranded-reservation bug, but from the row-existence
+  // side rather than the consumed-amount side.
+  const orphanFundReservations = await prisma.$queryRaw`
+    SELECT fr.id FROM "fund_reservations" fr
+    WHERE fr.status = 'ACTIVE'
+      AND (
+        (fr."referenceType" = 'Order' AND NOT EXISTS (SELECT 1 FROM "orders" o WHERE o.id = fr."referenceId"))
+        OR (fr."referenceType" = 'Withdrawal' AND NOT EXISTS (SELECT 1 FROM "withdrawals" w WHERE w.id = fr."referenceId"))
+      )
+  `;
+  check(
+    "every ACTIVE FundReservation references a real, still-existing Order or Withdrawal",
+    orphanFundReservations.length === 0,
+    `${orphanFundReservations.length} orphaned ACTIVE FundReservation(s)`,
+  );
+
+  const orphanPositionReservations = await prisma.$queryRaw`
+    SELECT pr.id FROM "position_reservations" pr
+    WHERE pr.status = 'ACTIVE'
+      AND pr."referenceType" = 'Order'
+      AND NOT EXISTS (SELECT 1 FROM "orders" o WHERE o.id = pr."referenceId")
+  `;
+  check(
+    "every ACTIVE PositionReservation references a real, still-existing Order",
+    orphanPositionReservations.length === 0,
+    `${orphanPositionReservations.length} orphaned ACTIVE PositionReservation(s)`,
+  );
+
+  // 15. Orphan LedgerTransaction (Phase 32) — every LedgerTransaction
+  // carries a `referenceType`/`referenceId` back to the real-world event
+  // that caused it (Fill, CompleteSetMint, Deposit, Withdrawal, or
+  // Position for a settlement payout — the complete, exhaustive set of
+  // referenceType values every postTransaction() call site in the
+  // codebase ever uses). A LedgerTransaction whose reference resolves to
+  // nothing is a real money movement with no recoverable explanation of
+  // WHY it happened — unauditable by construction, and a signal that
+  // either the referenced row was wrongly deleted or the ledger entry
+  // itself doesn't belong.
+  const orphanLedgerTransactions = await prisma.$queryRaw`
+    SELECT lt.id, lt."referenceType" FROM "ledger_transactions" lt
+    WHERE
+      (lt."referenceType" = 'Fill' AND NOT EXISTS (SELECT 1 FROM "fills" f WHERE f.id = lt."referenceId"))
+      OR (lt."referenceType" = 'CompleteSetMint' AND NOT EXISTS (SELECT 1 FROM "complete_set_mints" csm WHERE csm.id = lt."referenceId"))
+      OR (lt."referenceType" = 'Deposit' AND NOT EXISTS (SELECT 1 FROM "deposits" d WHERE d.id = lt."referenceId"))
+      OR (lt."referenceType" = 'Withdrawal' AND NOT EXISTS (SELECT 1 FROM "withdrawals" w WHERE w.id = lt."referenceId"))
+      OR (lt."referenceType" = 'Position' AND NOT EXISTS (SELECT 1 FROM "positions" p WHERE p.id = lt."referenceId"))
+      OR lt."referenceType" NOT IN ('Fill', 'CompleteSetMint', 'Deposit', 'Withdrawal', 'Position')
+  `;
+  check(
+    "every LedgerTransaction references a real, still-existing Fill/CompleteSetMint/Deposit/Withdrawal/Position",
+    orphanLedgerTransactions.length === 0,
+    `${orphanLedgerTransactions.length} orphaned/unrecognized-reference LedgerTransaction(s)`,
+  );
+
   return results;
 }
 

@@ -839,6 +839,11 @@ model LedgerTransaction {
   @@map("ledger_transactions")
 }
 
+// Phase 32 — beyond LedgerService.postTransaction's own application-level
+// zero-sum check, the ledger_entries_transaction_balance_check DEFERRED
+// CONSTRAINT TRIGGER (see migration 20260919010000) independently
+// enforces at the database level that every set of rows sharing one
+// transactionId sums to zero, for any write path — not just this one.
 model LedgerEntry {
   id            String   @id @default(uuid())
   transactionId String
@@ -1111,6 +1116,16 @@ model Withdrawal {
   sourceWalletAddress WalletAddress? @relation(fields: [sourceWalletAddressId], references: [id])
 
   @@unique([userId, clientWithdrawalId])
+  // Phase 32 — a real transaction hash must belong to exactly one
+  // withdrawal; without this, two withdrawal rows sharing the same
+  // txHash (an admin data-entry error, or a provider bug) would let
+  // WithdrawalWatcherService independently confirm/credit BOTH off the
+  // same single real on-chain event, understating that only one
+  // transfer actually happened. Standard Postgres unique-index NULL
+  // semantics (NULL never equals NULL) mean this never blocks the many
+  // withdrawals still in a pre-broadcast state with txHash = NULL —
+  // only two REAL, equal, non-null hashes collide.
+  @@unique([txHash])
   @@index([userId, status])
   @@index([assetNetworkId, status])
   @@map("withdrawals")

@@ -510,17 +510,24 @@ export class WithdrawalsService {
   ) {
     await this.assertSuperAdmin(actorId);
 
-    const updated = await this.txRunner.run((tx) =>
-      resolution.outcome === "CONFIRMED_BROADCAST"
-        ? this.casTransition(tx, withdrawalId, [WithdrawalStatus.EXECUTION_AMBIGUOUS], {
-            status: WithdrawalStatus.BROADCAST,
-            txHash: resolution.txHash,
-            broadcastAt: new Date(),
-          })
-        : this.casTransition(tx, withdrawalId, [WithdrawalStatus.EXECUTION_AMBIGUOUS], {
-            status: WithdrawalStatus.APPROVED,
-          }),
-    );
+    const updated = await this.txRunner.run(async (tx) => {
+      if (resolution.outcome === "CONFIRMED_BROADCAST") {
+        // Phase 32 — same duplicate-txHash guard as recordManualBroadcast/
+        // recordProviderBroadcast: an admin resolving an ambiguous
+        // execution with a real txHash must get the same clean,
+        // typed ConflictException, not a raw Prisma unique-constraint
+        // error surfacing from the write below.
+        await this.assertTxHashNotAlreadyUsed(tx, resolution.txHash);
+        return this.casTransition(tx, withdrawalId, [WithdrawalStatus.EXECUTION_AMBIGUOUS], {
+          status: WithdrawalStatus.BROADCAST,
+          txHash: resolution.txHash,
+          broadcastAt: new Date(),
+        });
+      }
+      return this.casTransition(tx, withdrawalId, [WithdrawalStatus.EXECUTION_AMBIGUOUS], {
+        status: WithdrawalStatus.APPROVED,
+      });
+    });
 
     await this.auditLog.record({
       actorId,
@@ -552,14 +559,38 @@ export class WithdrawalsService {
     // AdminController.broadcastWithdrawal) — same convention every other
     // admin-HTTP-triggered mutation in this codebase follows, so there is
     // exactly one "withdrawal.manual_broadcast" row per call, not two.
-    return this.txRunner.run((tx) =>
-      this.casTransition(tx, withdrawalId, [WithdrawalStatus.PENDING_MANUAL_BROADCAST], {
+    return this.txRunner.run(async (tx) => {
+      // Phase 32 — a clear, typed rejection ahead of the real DB
+      // constraint (withdrawals_tx_hash_key) it's also backed by: an
+      // admin fat-fingering the same hash twice gets an honest
+      // ConflictException here rather than an opaque Prisma unique-
+      // constraint error surfacing from the write below.
+      await this.assertTxHashNotAlreadyUsed(tx, txHash);
+      return this.casTransition(tx, withdrawalId, [WithdrawalStatus.PENDING_MANUAL_BROADCAST], {
         status: WithdrawalStatus.BROADCAST,
         txHash,
         broadcastByAdminId: adminId,
         broadcastAt: new Date(),
-      }),
-    );
+      });
+    });
+  }
+
+  /**
+   * Defense-in-depth ahead of the DB-level `withdrawals_tx_hash_key`
+   * unique constraint (Phase 32) — the constraint is the real,
+   * race-safe guarantee; this is only for a clean, typed error message
+   * on the honest-mistake path. A genuine race between two concurrent
+   * callers both trying to claim the same txHash still resolves
+   * correctly: this check can pass for both, but only one of the two
+   * subsequent writes can ever succeed under the real constraint, and
+   * the loser's raw Prisma unique-violation error is still a safe,
+   * fail-closed outcome (no double credit), just a less polished one.
+   */
+  private async assertTxHashNotAlreadyUsed(tx: Prisma.TransactionClient, txHash: string): Promise<void> {
+    const existing = await tx.withdrawal.findUnique({ where: { txHash } });
+    if (existing) {
+      throw new ConflictException(`txHash ${txHash} is already recorded against withdrawal ${existing.id} — a real transaction hash can never settle two withdrawals`);
+    }
   }
 
   /**
@@ -577,12 +608,18 @@ export class WithdrawalsService {
    * reasoning as recordConfirmation below.
    */
   async recordProviderBroadcast(withdrawalId: string, txHash: string, providerReference?: string): Promise<Withdrawal | null> {
-    const result = await this.txRunner.run((tx) =>
-      tx.withdrawal.updateMany({
+    const result = await this.txRunner.run(async (tx) => {
+      // Phase 32 — same duplicate-txHash guard as recordManualBroadcast.
+      // This path is provider/webhook-driven rather than admin-driven, so
+      // a collision is more likely a genuine provider-side anomaly than a
+      // typo; still fail closed with a typed error rather than let a raw
+      // constraint violation surface from the write below.
+      await this.assertTxHashNotAlreadyUsed(tx, txHash);
+      return tx.withdrawal.updateMany({
         where: { id: withdrawalId, status: WithdrawalStatus.PENDING_MANUAL_BROADCAST },
         data: { status: WithdrawalStatus.BROADCAST, txHash, custodyReference: providerReference, broadcastAt: new Date() },
-      }),
-    );
+      });
+    });
     if (result.count === 0) return null;
 
     const updated = await this.getOrThrow(withdrawalId);

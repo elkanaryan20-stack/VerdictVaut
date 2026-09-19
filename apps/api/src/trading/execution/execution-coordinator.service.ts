@@ -226,6 +226,18 @@ export class ExecutionCoordinator {
         makerUserId: instruction.makerOrderId === instruction.buyOrderId ? instruction.buyerUserId : instruction.sellerUserId,
         takerUserId: instruction.takerOrderId === instruction.buyOrderId ? instruction.buyerUserId : instruction.sellerUserId,
       });
+      // Phase 32 — the DB-level fills_fee_non_negative_check only
+      // constrains the SUMMED fee column; it would silently accept a
+      // buggy/malicious FeeCalculator returning e.g. buyerFee: -5,
+      // sellerFee: +5 (totalFee 0 passes the check) while actually
+      // discounting the buyer and shorting the seller by 5 each,
+      // undetectable in aggregate. Reject either leg going negative at
+      // the source, before it ever reaches a ledger posting.
+      if (feeResult.buyerFee.isNegative() || feeResult.sellerFee.isNegative()) {
+        throw new Error(
+          `FeeCalculator returned a negative fee leg (buyerFee=${feeResult.buyerFee}, sellerFee=${feeResult.sellerFee}) for instruction ${instruction.idempotencyKey} — refusing to post trade ledger`,
+        );
+      }
       const totalFee = feeResult.buyerFee.plus(feeResult.sellerFee);
 
       const { row: fill, alreadyExisted } = await createIdempotent(
