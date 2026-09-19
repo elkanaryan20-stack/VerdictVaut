@@ -520,6 +520,48 @@ describe("WithdrawalsService", () => {
     });
   });
 
+  describe("recordConfirmation — Phase 33 destination/amount mismatch guard", () => {
+    beforeEach(() => {
+      prisma.withdrawal.findUnique.mockResolvedValue({
+        id: "wd-1",
+        status: "CONFIRMING",
+        amount: new Prisma.Decimal(100),
+        fee: new Prisma.Decimal(0),
+        destinationAddress: "0x000000000000000000000000000000000000dEaD",
+      });
+    });
+
+    it("refuses to credit when the observed on-chain destination does not match the withdrawal's recorded destination", async () => {
+      await service.recordConfirmation("wd-1", 12, 12, {
+        amount: "100",
+        destinationAddress: "0x1111111111111111111111111111111111111f",
+      });
+
+      expect(ledger.postTransaction).not.toHaveBeenCalled();
+      expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+      expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "withdrawal.confirmation_mismatch_refused" }));
+    });
+
+    it("refuses to credit when the observed on-chain amount does not match the withdrawal's recorded net amount", async () => {
+      await service.recordConfirmation("wd-1", 12, 12, {
+        amount: "1",
+        destinationAddress: "0x000000000000000000000000000000000000dEaD",
+      });
+
+      expect(ledger.postTransaction).not.toHaveBeenCalled();
+      expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("still credits normally when the observed on-chain destination/amount match what was recorded", async () => {
+      await service.recordConfirmation("wd-1", 12, 12, {
+        amount: "100",
+        destinationAddress: "0x000000000000000000000000000000000000dEaD",
+      });
+
+      expect(ledger.postTransaction).toHaveBeenCalled();
+    });
+  });
+
   describe("fail", () => {
     it("releases the reservation, transitions to FAILED, and records a SYSTEM-actor audit row (no admin HTTP caller wraps this — see WithdrawalWatcherService)", async () => {
       prisma.withdrawal.findUnique.mockResolvedValue({ id: "wd-1", status: "CONFIRMING" });

@@ -1,5 +1,5 @@
-import { Prisma } from "@prisma/client";
-import { createTestUser, fundUserForTest, getAsset, getAssetNetwork, getUserAccount, prisma, provisionAddress } from "./helpers";
+import { AssetClass, Prisma } from "@prisma/client";
+import { createTestUser, fundUserForTest, getAsset, getAssetNetwork, getNetwork, getUserAccount, prisma, provisionAddress } from "./helpers";
 
 /**
  * These bypass the application layer entirely (raw SQL, or Prisma calls
@@ -230,6 +230,49 @@ describe("Database-level financial invariants (real Postgres)", () => {
         data: { assetId: asset.id, type: "ADJUSTMENT", referenceType: "Test", referenceId: "t-2", idempotencyKey: key },
       }),
     ).rejects.toThrow(Prisma.PrismaClientKnownRequestError);
+  });
+
+  it("rejects a second ACTIVE AssetNetwork claiming a contract address already active on the same network (Phase 33 hardening)", async () => {
+    // Fresh, test-only assets on a real seeded network — never mutates any
+    // shared/seeded AssetNetwork row (e.g. USDC/USDT on ethereum-sepolia),
+    // which every asset already has one of (assetId+networkId is unique),
+    // leaving no "spare" seeded asset to attach a duplicate row to safely.
+    const network = await getNetwork("ethereum-sepolia");
+    const marker = `${Date.now()}-${Math.random()}`;
+    const assetA = await prisma.asset.create({ data: { symbol: `TESTA-${marker}`, name: "Test Asset A", decimals: 6, assetClass: AssetClass.TOKEN } });
+    const assetB = await prisma.asset.create({ data: { symbol: `TESTB-${marker}`, name: "Test Asset B", decimals: 6, assetClass: AssetClass.TOKEN } });
+    const sharedContract = `0xshared${marker}`;
+
+    await prisma.assetNetwork.create({
+      data: { assetId: assetA.id, networkId: network.id, isNative: false, contractAddress: sharedContract, isActive: true },
+    });
+
+    // Prisma reports a partial-unique-index violation by column names
+    // (P2002), not the raw Postgres constraint name — matching the same
+    // convention as the existing "(userId, clientWithdrawalId)" test below.
+    await expect(
+      prisma.assetNetwork.create({
+        data: { assetId: assetB.id, networkId: network.id, isNative: false, contractAddress: sharedContract, isActive: true },
+      }),
+    ).rejects.toThrow(/Unique constraint failed on the fields: \(`networkId`,`contractAddress`\)/);
+  });
+
+  it("allows a second INACTIVE AssetNetwork to share a contract address with an active one on the same network (Phase 33 hardening)", async () => {
+    const network = await getNetwork("ethereum-sepolia");
+    const marker = `${Date.now()}-${Math.random()}`;
+    const assetA = await prisma.asset.create({ data: { symbol: `TESTC-${marker}`, name: "Test Asset C", decimals: 6, assetClass: AssetClass.TOKEN } });
+    const assetB = await prisma.asset.create({ data: { symbol: `TESTD-${marker}`, name: "Test Asset D", decimals: 6, assetClass: AssetClass.TOKEN } });
+    const sharedContract = `0xshared${marker}`;
+
+    await prisma.assetNetwork.create({
+      data: { assetId: assetA.id, networkId: network.id, isNative: false, contractAddress: sharedContract, isActive: true },
+    });
+
+    await expect(
+      prisma.assetNetwork.create({
+        data: { assetId: assetB.id, networkId: network.id, isNative: false, contractAddress: sharedContract, isActive: false },
+      }),
+    ).resolves.toBeDefined();
   });
 
   it("rejects a single unbalanced leg written directly to ledger_entries, bypassing LedgerService entirely (Phase 32 hardening)", async () => {

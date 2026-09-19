@@ -247,7 +247,15 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     }
 
     const requiredConfirmations = await this.confirmationPolicy.getRequiredConfirmations(assetNetworkId);
-    await this.withdrawalsService.recordConfirmation(withdrawalId, status.confirmations, requiredConfirmations);
+    // Phase 33 — pass through the same amount/destinationAddress this
+    // status call already fetched, so recordConfirmation can refuse to
+    // credit a withdrawal whose real on-chain transaction doesn't match
+    // what was recorded (requirement #12/#13), instead of checking only
+    // confirmation count.
+    await this.withdrawalsService.recordConfirmation(withdrawalId, status.confirmations, requiredConfirmations, {
+      amount: status.amount,
+      destinationAddress: status.destinationAddress,
+    });
   }
 
   /**

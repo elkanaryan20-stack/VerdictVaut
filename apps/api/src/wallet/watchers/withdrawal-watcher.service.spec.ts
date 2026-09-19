@@ -61,7 +61,7 @@ describe("WithdrawalWatcherService", () => {
 
   it("forwards a real observed confirmation count to WithdrawalsService.recordConfirmation", async () => {
     await service.pollOnce();
-    expect(withdrawalsService.recordConfirmation).toHaveBeenCalledWith("wd-1", 6, 12);
+    expect(withdrawalsService.recordConfirmation).toHaveBeenCalledWith("wd-1", 6, 12, { amount: "10", destinationAddress: undefined });
   });
 
   it("never mutates withdrawal state itself when the chain reports the transaction not_found — leaves it for admin reconciliation", async () => {
@@ -80,7 +80,7 @@ describe("WithdrawalWatcherService", () => {
   it("still calls recordConfirmation for a merely pending (0-confirmation) transaction", async () => {
     getTransactionStatus.mockResolvedValue({ status: "pending", confirmations: 0, amount: "10", txHash: "0xhash1", assetNetworkId: "an-1" });
     await service.pollOnce();
-    expect(withdrawalsService.recordConfirmation).toHaveBeenCalledWith("wd-1", 0, 12);
+    expect(withdrawalsService.recordConfirmation).toHaveBeenCalledWith("wd-1", 0, 12, { amount: "10", destinationAddress: undefined });
   });
 
   it("continues to the next withdrawal when one check fails, rather than aborting the whole pass", async () => {
@@ -97,7 +97,7 @@ describe("WithdrawalWatcherService", () => {
     await service.pollOnce();
 
     expect(withdrawalsService.recordConfirmation).toHaveBeenCalledTimes(1);
-    expect(withdrawalsService.recordConfirmation).toHaveBeenCalledWith("wd-1b", 6, 12);
+    expect(withdrawalsService.recordConfirmation).toHaveBeenCalledWith("wd-1b", 6, 12, { amount: "10", destinationAddress: undefined });
   });
 
   it("pollOnce is a no-op re-entry guard while a previous pass is still running", async () => {

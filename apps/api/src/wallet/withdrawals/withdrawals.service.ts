@@ -56,6 +56,36 @@ function destinationsMatch(observed: string, recorded: string): boolean {
 }
 
 /**
+ * Requirement #12/#13 ("verify destination/amount where practical") — the
+ * one comparison shared by reconcile() (manual, SUPER_ADMIN-triggered) and
+ * recordConfirmation() (automatic, watcher-triggered, Phase 33). Only
+ * called once the chain already shows real activity (confirmed/pending) —
+ * a genuine mismatch means the broadcast transaction that actually exists
+ * on-chain paid a different address or amount than this withdrawal
+ * recorded, e.g. from an admin's manually-typed txHash
+ * (recordManualBroadcast/resolveAmbiguousExecution never verify their
+ * input on-chain by design) or a provider-side error.
+ */
+function findChainMismatch(withdrawal: Withdrawal, chainStatus: { amount: string; destinationAddress?: string }): string | null {
+  if (chainStatus.destinationAddress && !destinationsMatch(chainStatus.destinationAddress, withdrawal.destinationAddress)) {
+    // Requirement #12/#13: "verify destination where practical". Only
+    // checked when the provider actually reports one (EVM/XRP today —
+    // see ChainTransactionStatus's own docblock for why Bitcoin/Solana
+    // don't) — a genuine mismatch here would mean the broadcast paid a
+    // DIFFERENT address than the one this withdrawal recorded.
+    return "The broadcast transaction's on-chain destination does not match this withdrawal's recorded destination address.";
+  }
+  // The amount actually delivered on-chain should equal amount - fee (see
+  // request()'s own accounting docblock) — never `amount` alone.
+  const expectedNet = withdrawal.amount.minus(withdrawal.fee);
+  const observed = new Prisma.Decimal(chainStatus.amount);
+  if (observed.minus(expectedNet).abs().greaterThan(WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE)) {
+    return `The broadcast transaction's on-chain amount (${chainStatus.amount}) does not match the expected net amount (${expectedNet.toString()}).`;
+  }
+  return null;
+}
+
+/**
  * Explicit withdrawal state machine:
  *
  *   REQUESTED -> RISK_REVIEW -> APPROVED -> BROADCASTING (execution lease — see approve())
@@ -727,8 +757,21 @@ export class WithdrawalsService {
    * than erroring, since watchers naturally re-poll and redeliver. Never
    * called from any HTTP endpoint — a withdrawal can only reach CREDITED
    * from genuine blockchain evidence, never from an admin's word alone.
+   *
+   * `observedChain` (Phase 33) is the same amount/destinationAddress the
+   * caller's ChainTransactionStatus already carries — passing it enables
+   * the identical requirement #12/#13 mismatch check reconcile() already
+   * performs, but on THIS automatic path, before ever crediting. Optional
+   * (rather than required) so existing callers/tests that only care about
+   * confirmation-count behavior are unaffected; the real production
+   * caller (WithdrawalWatcherService) always supplies it.
    */
-  async recordConfirmation(withdrawalId: string, confirmations: number, requiredConfirmations: number) {
+  async recordConfirmation(
+    withdrawalId: string,
+    confirmations: number,
+    requiredConfirmations: number,
+    observedChain?: { amount: string; destinationAddress?: string },
+  ) {
     if (confirmations < requiredConfirmations) {
       return this.txRunner.run(async (tx) => {
         const result = await tx.withdrawal.updateMany({
@@ -740,6 +783,37 @@ export class WithdrawalsService {
         }
         return tx.withdrawal.findUniqueOrThrow({ where: { id: withdrawalId } });
       });
+    }
+
+    if (observedChain) {
+      const current = await this.getOrThrow(withdrawalId);
+      // Only meaningful pre-credit — an already-CREDITED/terminal
+      // withdrawal has nothing left to guard (and re-checking it on every
+      // redelivered poll would just be wasted work).
+      if (current.status === WithdrawalStatus.BROADCAST || current.status === WithdrawalStatus.CONFIRMING) {
+        const mismatch = findChainMismatch(current, observedChain);
+        if (mismatch) {
+          // Fail closed: never advance to CONFIRMED/CREDITED on evidence
+          // that doesn't match what this withdrawal actually recorded —
+          // leave it in CONFIRMING (reservation stays held, no money
+          // moves) and require a human to resolve it via the existing
+          // POST /admin/withdrawals/:id/reconcile path, exactly like the
+          // "not_found" case WithdrawalWatcherService.checkOne already
+          // leaves untouched for the same reason.
+          this.logger.error(
+            `Withdrawal ${withdrawalId} has enough on-chain confirmations to credit, but the observed transaction does not match its recorded destination/amount: ${mismatch} — refusing to credit; use POST /admin/withdrawals/:id/reconcile to investigate.`,
+          );
+          this.metrics.increment("wallet.withdrawal.confirmation_mismatch", { withdrawalId });
+          await this.auditLog.record({
+            actorType: "SYSTEM",
+            action: "withdrawal.confirmation_mismatch_refused",
+            resourceType: "Withdrawal",
+            resourceId: withdrawalId,
+            after: { status: current.status, mismatch },
+          });
+          return current;
+        }
+      }
     }
 
     const { withdrawal: settled, justCredited } = await this.txRunner.run(async (tx) => {
@@ -886,22 +960,15 @@ export class WithdrawalsService {
       // balance was also restored internally.
       discrepancy = true;
       note = "This withdrawal's reservation was released, but the chain shows the transaction actually exists — funds may already have left.";
-    } else if (chainShowsRealActivity && chainStatus.destinationAddress && !destinationsMatch(chainStatus.destinationAddress, withdrawal.destinationAddress)) {
-      // Requirement #12/#13: "verify destination where practical". Only
-      // checked when the provider actually reports one (EVM/XRP today —
-      // see ChainTransactionStatus's own docblock for why Bitcoin/Solana
-      // don't) — a genuine mismatch here would mean the broadcast paid a
-      // DIFFERENT address than the one this withdrawal recorded.
-      discrepancy = true;
-      note = "The broadcast transaction's on-chain destination does not match this withdrawal's recorded destination address.";
     } else if (chainShowsRealActivity) {
-      // The amount actually delivered on-chain should equal amount - fee
-      // (see request()'s own accounting docblock) — never `amount` alone.
-      const expectedNet = withdrawal.amount.minus(withdrawal.fee);
-      const observed = new Prisma.Decimal(chainStatus.amount);
-      if (observed.minus(expectedNet).abs().greaterThan(WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE)) {
+      // Requirement #12/#13: "verify destination/amount where practical" —
+      // shared with recordConfirmation's own pre-credit check (Phase 33)
+      // so the automatic and manual paths can never silently disagree on
+      // what counts as a mismatch.
+      const mismatch = findChainMismatch(withdrawal, chainStatus);
+      if (mismatch) {
         discrepancy = true;
-        note = `The broadcast transaction's on-chain amount (${chainStatus.amount}) does not match the expected net amount (${expectedNet.toString()}).`;
+        note = mismatch;
       }
     }
 

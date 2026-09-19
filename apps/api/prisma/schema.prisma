@@ -933,6 +933,13 @@ model Network {
 // ethereum-sepolia row for exactly the case this exists to catch: no
 // real Sepolia USDT contract exists, so that row is seeded isActive:
 // false, honestly non-functional, rather than inventing an address.
+// Phase 33 — asset_networks_active_contract_address_key (migration
+// 20260919020000) is a partial unique index on (networkId, contractAddress)
+// WHERE isActive AND contractAddress IS NOT NULL — Prisma has no native
+// syntax for a WHERE-scoped unique constraint, so it isn't expressed as
+// an @@unique here. It guarantees two active AssetNetwork rows on one
+// network can never claim the same contract, closing a wrong-asset-credit
+// risk a simple admin copy-paste error could otherwise cause.
 model AssetNetwork {
   id                  String   @id @default(uuid())
   assetId             String
