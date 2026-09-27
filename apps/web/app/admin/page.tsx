@@ -2,6 +2,7 @@ import { AdminDepositsTable } from "../../components/admin/AdminDepositsTable";
 import { AdminWithdrawalsTable } from "../../components/admin/AdminWithdrawalsTable";
 import { AuditLogFeed } from "../../components/admin/AuditLogFeed";
 import { MarketsNeedingAttention } from "../../components/admin/MarketsNeedingAttention";
+import { OperationsStatus } from "../../components/admin/OperationsStatus";
 
 export default function AdminPage() {
   return (
@@ -16,6 +17,7 @@ export default function AdminPage() {
 
       <MarketsNeedingAttention />
       <AdminWithdrawalsTable />
+      <OperationsStatus />
       <AdminDepositsTable />
       <AuditLogFeed />
     </div>

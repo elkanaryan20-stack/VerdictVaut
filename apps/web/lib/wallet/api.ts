@@ -48,7 +48,7 @@ export async function fetchDeposits(page: number, pageSize: number): Promise<Pag
 }
 
 export async function fetchDeposit(depositId: string): Promise<Deposit> {
-  const data = await apiFetch<unknown>(`/wallet/deposits/${depositId}`);
+  const data = await apiFetch<unknown>(`/wallet/deposits/${encodeURIComponent(depositId)}`);
   return parseOrThrow(DepositSchema, data, "GET /wallet/deposits/:id");
 }
 
@@ -73,11 +73,11 @@ export async function fetchWithdrawals(): Promise<Withdrawal[]> {
 }
 
 export async function fetchWithdrawal(withdrawalId: string): Promise<Withdrawal> {
-  const data = await apiFetch<unknown>(`/wallet/withdrawals/${withdrawalId}`);
+  const data = await apiFetch<unknown>(`/wallet/withdrawals/${encodeURIComponent(withdrawalId)}`);
   return parseOrThrow(WithdrawalSchema, data, "GET /wallet/withdrawals/:id");
 }
 
 export async function cancelWithdrawal(withdrawalId: string): Promise<Withdrawal> {
-  const data = await apiFetch<unknown>(`/wallet/withdrawals/${withdrawalId}/cancel`, { method: "POST" });
+  const data = await apiFetch<unknown>(`/wallet/withdrawals/${encodeURIComponent(withdrawalId)}/cancel`, { method: "POST" });
   return parseOrThrow(WithdrawalSchema, data, "POST /wallet/withdrawals/:id/cancel");
 }

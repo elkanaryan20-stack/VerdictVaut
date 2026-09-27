@@ -1,4 +1,4 @@
-import { apiFetch, ApiError } from "../lib/api-client";
+import { apiFetch, ApiError, SESSION_EXPIRED_EVENT } from "../lib/api-client";
 import { clearTokens, getAccessToken, setTokens } from "../lib/auth/token-storage";
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -82,5 +82,52 @@ describe("apiFetch", () => {
       expect(err).toBeInstanceOf(ApiError);
       expect((err as ApiError).isRateLimited).toBe(true);
     }
+  });
+
+  describe("Phase 36 — error handling", () => {
+    it("preserves the backend's requestId on an error, for support correlation", async () => {
+      (global.fetch as jest.Mock).mockResolvedValue(jsonResponse(409, { message: "Withdrawal wd-1 is in status CANCELLED", requestId: "req-abc" }));
+      await expect(apiFetch("/wallet/withdrawals/wd-1/cancel", { method: "POST" })).rejects.toMatchObject({ status: 409, requestId: "req-abc" });
+    });
+
+    it("turns a network failure into a typed ApiError that never claims nothing was submitted", async () => {
+      (global.fetch as jest.Mock).mockRejectedValue(new TypeError("Failed to fetch"));
+      try {
+        await apiFetch("/wallet/withdrawals", { method: "POST", body: "{}" });
+        fail("expected apiFetch to throw");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ApiError);
+        expect((err as ApiError).isNetworkError).toBe(true);
+        expect((err as ApiError).message).toMatch(/check whether it went through/);
+      }
+    });
+
+    it("gives a 429 a human message and does not retry it", async () => {
+      (global.fetch as jest.Mock).mockResolvedValue(jsonResponse(429, { message: "ThrottlerException: Too Many Requests" }));
+      await expect(apiFetch("/wallet/withdrawals", { method: "POST", body: "{}" })).rejects.toMatchObject({ status: 429, message: expect.stringMatching(/wait a moment/) });
+      expect((global.fetch as jest.Mock).mock.calls).toHaveLength(1);
+    });
+
+    it("signals session expiry (so the app returns to /login) when the backend rejects a session the refresh cannot rescue", async () => {
+      setTokens({ accessToken: "stale-access", refreshToken: "dead-refresh" });
+      const listener = jest.fn();
+      window.addEventListener(SESSION_EXPIRED_EVENT, listener);
+      (global.fetch as jest.Mock)
+        .mockResolvedValueOnce(jsonResponse(401, { message: "Unauthorized" }))
+        .mockResolvedValueOnce(jsonResponse(401, { message: "Invalid refresh token" }));
+
+      await expect(apiFetch("/wallet/balances")).rejects.toMatchObject({ status: 401 });
+      expect(listener).toHaveBeenCalledTimes(1);
+      window.removeEventListener(SESSION_EXPIRED_EVENT, listener);
+    });
+
+    it("does not signal session expiry for a failed login (no session existed)", async () => {
+      const listener = jest.fn();
+      window.addEventListener(SESSION_EXPIRED_EVENT, listener);
+      (global.fetch as jest.Mock).mockResolvedValue(jsonResponse(401, { message: "Invalid credentials" }));
+      await expect(apiFetch("/auth/login", { method: "POST", skipAuth: true, body: "{}" })).rejects.toMatchObject({ status: 401 });
+      expect(listener).not.toHaveBeenCalled();
+      window.removeEventListener(SESSION_EXPIRED_EVENT, listener);
+    });
   });
 });

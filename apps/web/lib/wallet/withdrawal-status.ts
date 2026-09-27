@@ -24,12 +24,13 @@ export const WITHDRAWAL_STATUS_LABEL: Record<WithdrawalStatus, string> = {
   REJECTED: "Rejected",
   FAILED: "Failed",
   CANCELLED: "Cancelled",
+  EXECUTION_AMBIGUOUS: "Under verification",
 };
 
 export const WITHDRAWAL_STATUS_DESCRIPTION: Record<WithdrawalStatus, string> = {
   REQUESTED: "Just submitted — funds are being reserved.",
   VALIDATED: "Passed initial validation.",
-  RISK_REVIEW: "Funds are reserved and this withdrawal is awaiting SUPER_ADMIN review.",
+  RISK_REVIEW: "Funds are reserved and this withdrawal is awaiting review by the platform.",
   APPROVED: "Approved — a broadcast attempt is in progress.",
   PENDING_MANUAL_BROADCAST: "Approved and awaiting an administrator to broadcast the transaction.",
   BROADCASTING: "The transaction is being submitted to the network.",
@@ -40,4 +41,6 @@ export const WITHDRAWAL_STATUS_DESCRIPTION: Record<WithdrawalStatus, string> = {
   REJECTED: "Rejected before broadcast — your reserved funds were released.",
   FAILED: "This withdrawal failed — your reserved funds were released.",
   CANCELLED: "You cancelled this withdrawal — your reserved funds were released.",
+  EXECUTION_AMBIGUOUS:
+    "We could not confirm whether this transaction was sent. Your funds are still reserved on the platform — they are not lost — while an administrator verifies the outcome with the custody provider. You don't need to do anything, and please don't submit a duplicate withdrawal for the same funds.",
 };

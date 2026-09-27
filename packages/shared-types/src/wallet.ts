@@ -163,6 +163,11 @@ export const WITHDRAWAL_STATUSES = [
   "REJECTED",
   "FAILED",
   "CANCELLED",
+  // Phase 14A backend status (synced in Phase 36): the custody call's
+  // outcome is genuinely unknown; funds stay reserved until a SUPER_ADMIN
+  // resolves it. While missing here, a single such withdrawal made every
+  // list response containing it fail schema validation in the web client.
+  "EXECUTION_AMBIGUOUS",
 ] as const;
 export const WithdrawalStatusSchema = z.enum(WITHDRAWAL_STATUSES);
 export type WithdrawalStatus = z.infer<typeof WithdrawalStatusSchema>;

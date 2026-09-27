@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowLeft, AlertTriangle } from "lucide-react";
+import { ArrowLeft, AlertTriangle, ShieldQuestion } from "lucide-react";
 import { Card, CardBody, CardHeader, CardTitle } from "../ui/Card";
 import { Skeleton } from "../ui/Skeleton";
 import { CopyButton } from "../ui/CopyButton";
@@ -86,6 +86,22 @@ export function WithdrawalDetail({ withdrawalId }: { withdrawalId: string }) {
               </div>
             )}
 
+            {withdrawal.status === "EXECUTION_AMBIGUOUS" && (
+              // Deliberately informational, never red and never a retry/cancel
+              // control: funds are still reserved, and any resubmission could
+              // double-execute if the original transaction did go out.
+              <div role="status" className="flex items-start gap-2 rounded-lg border border-vault-gold/30 bg-vault-gold/5 p-3">
+                <ShieldQuestion className="mt-0.5 h-4 w-4 shrink-0 text-vault-gold" aria-hidden="true" />
+                <div>
+                  <p className="text-sm font-medium text-vault-gold">Awaiting verification — your funds are safe and still reserved</p>
+                  <p className="mt-0.5 text-xs text-white/60">
+                    This page updates automatically once the outcome is confirmed. Please don&apos;t start a new withdrawal for the same
+                    funds in the meantime.
+                  </p>
+                </div>
+              </div>
+            )}
+
             {isCancellableWithdrawalStatus(withdrawal.status) && (
               <div className="flex flex-col items-start gap-2 rounded-lg border border-vault-border bg-white/[0.02] p-3">
                 <p className="text-xs text-white/60">
@@ -120,9 +136,16 @@ export function WithdrawalDetail({ withdrawalId }: { withdrawalId: string }) {
               {withdrawal.destinationTag && <Row label="Destination tag">{withdrawal.destinationTag}</Row>}
               {withdrawal.txHash && (
                 <Row label="Transaction">
-                  <span className="inline-flex items-center gap-2">
-                    <code className="break-all font-mono text-xs">{truncateMiddle(withdrawal.txHash, 10, 8)}</code>
-                    <CopyButton value={withdrawal.txHash} label="Copy" />
+                  <span className="inline-flex flex-col items-start gap-1 sm:items-end">
+                    <span className="inline-flex items-center gap-2">
+                      <code className="break-all font-mono text-xs">{truncateMiddle(withdrawal.txHash, 10, 8)}</code>
+                      <CopyButton value={withdrawal.txHash} label="Copy" />
+                    </span>
+                    {withdrawal.status !== "CREDITED" && (
+                      // A txHash alone is not completion — only the backend's
+                      // CREDITED status (after verified on-chain confirmation) is.
+                      <span className="text-[11px] text-white/40">For reference only — not yet confirmed as completed.</span>
+                    )}
                   </span>
                 </Row>
               )}

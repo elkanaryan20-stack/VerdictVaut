@@ -35,3 +35,20 @@ export function subtractDecimalStrings(a: string, b: string): string {
 
   return negative && absDiff !== 0n ? `-${result}` : result;
 }
+
+/**
+ * Phase 36 — exact comparison of two decimal strings (BigInt-scaled, never
+ * Number()), for client-side pre-validation that must agree with the
+ * backend's Prisma.Decimal checks at every precision.
+ */
+export function compareDecimalStrings(a: string, b: string): -1 | 0 | 1 {
+  const diff = subtractDecimalStrings(a, b);
+  if (/^0(\.0*)?$/.test(diff)) return 0;
+  return diff.startsWith("-") ? -1 : 1;
+}
+
+/** Significant digits after the decimal point (trailing zeros ignored) — the same count as the backend's Prisma.Decimal.decimalPlaces(). */
+export function decimalPlaces(value: string): number {
+  const fraction = value.split(".")[1] ?? "";
+  return fraction.replace(/0+$/, "").length;
+}

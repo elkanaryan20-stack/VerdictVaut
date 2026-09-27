@@ -187,4 +187,18 @@ describe("WithdrawFlow", () => {
     expect(await screen.findByText("Amount exceeds available balance")).toBeInTheDocument();
     expect(screen.queryByText("Withdrawal submitted")).not.toBeInTheDocument();
   });
+
+  it("Phase 36: blocks an amount finer than the asset's precision before calling the backend", async () => {
+    mockedApi.requestWithdrawal.mockClear();
+    const user = userEvent.setup();
+    renderWithQueryClient(<WithdrawFlow />);
+    await selectUsdcSepolia(user);
+
+    await user.type(await screen.findByLabelText("Destination address"), "0xSomeDestinationAddress");
+    await user.type(screen.getByLabelText(/Amount/), "1.0000001");
+    await user.click(screen.getByRole("button", { name: "Review withdrawal" }));
+
+    expect(await screen.findByText(/at most 6 decimal places/i)).toBeInTheDocument();
+    expect(mockedApi.requestWithdrawal).not.toHaveBeenCalled();
+  });
 });

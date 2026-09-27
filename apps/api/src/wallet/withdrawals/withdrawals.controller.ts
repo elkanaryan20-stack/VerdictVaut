@@ -6,8 +6,12 @@ import { RequireActiveUser } from "../../common/decorators/require-active-user.d
 import { ActiveUserGuard } from "../../common/guards/active-user.guard";
 import { WITHDRAWAL_REQUEST_THROTTLE } from "../../common/throttle-presets";
 import { RequestWithdrawalDto } from "./dto/request-withdrawal.dto";
+import { toUserWithdrawalView } from "./user-withdrawal-view";
 import { WithdrawalsService } from "./withdrawals.service";
 
+// Phase 36 — every response is passed through toUserWithdrawalView (see
+// its docblock): the owner never receives compliance/provider/operator
+// internals, only their withdrawal's own user-meaningful fields.
 @Controller("wallet/withdrawals")
 @UseGuards(JwtAuthGuard)
 export class WithdrawalsController {
@@ -21,12 +25,12 @@ export class WithdrawalsController {
   @RequireActiveUser()
   @Throttle(WITHDRAWAL_REQUEST_THROTTLE)
   request(@CurrentUser() user: AuthenticatedUser, @Body() dto: RequestWithdrawalDto) {
-    return this.withdrawalsService.request(user.id, dto);
+    return this.withdrawalsService.request(user.id, dto).then(toUserWithdrawalView);
   }
 
   @Get()
   listMine(@CurrentUser() user: AuthenticatedUser) {
-    return this.withdrawalsService.listMine(user.id);
+    return this.withdrawalsService.listMine(user.id).then((rows) => rows.map(toUserWithdrawalView));
   }
 
   // Registered after the bare listing route above — Nest matches
@@ -36,7 +40,7 @@ export class WithdrawalsController {
   // DepositsController's own ordering convention regardless.
   @Get(":id")
   getMine(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string) {
-    return this.withdrawalsService.getOwned(user.id, id);
+    return this.withdrawalsService.getOwned(user.id, id).then(toUserWithdrawalView);
   }
 
   // Deliberately NOT @RequireActiveUser() — cancellation only reduces
@@ -46,6 +50,6 @@ export class WithdrawalsController {
   @Post(":id/cancel")
   @Throttle(WITHDRAWAL_REQUEST_THROTTLE)
   cancel(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string) {
-    return this.withdrawalsService.cancel(user.id, id);
+    return this.withdrawalsService.cancel(user.id, id).then(toUserWithdrawalView);
   }
 }

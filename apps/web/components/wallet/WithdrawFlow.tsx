@@ -6,7 +6,7 @@ import { AlertTriangle } from "lucide-react";
 import { generateClientOrderId } from "../../lib/trading/client-order-id";
 import { ApiError } from "../../lib/api-client";
 import { formatAmount, formatExactAmount } from "../../lib/format";
-import { subtractDecimalStrings } from "../../lib/wallet/decimal";
+import { compareDecimalStrings, decimalPlaces, subtractDecimalStrings } from "../../lib/wallet/decimal";
 import { useAssetNetworks, useBalances, useRequestWithdrawal } from "../../lib/wallet/hooks";
 import { Button } from "../ui/Button";
 import { Card, CardBody, CardHeader, CardTitle } from "../ui/Card";
@@ -80,11 +80,17 @@ export function WithdrawFlow() {
     if (!selectedAssetNetwork) return "Choose an asset and network.";
     if (!destinationAddress.trim()) return "Enter a destination address.";
     if (selectedAssetNetwork.memoRequired && !destinationTag.trim()) return "This network requires a destination tag/memo.";
-    if (!DECIMAL_STRING.test(amount) || Number(amount) <= 0) return "Enter a valid amount greater than zero.";
-    if (Number(amount) <= Number(selectedAssetNetwork.withdrawalMinAmount)) {
+    // Phase 36 — exact decimal comparisons (never Number()), so these
+    // pre-checks agree with the backend at every precision. The server
+    // still re-validates everything; these only save a doomed round trip.
+    if (!DECIMAL_STRING.test(amount) || compareDecimalStrings(amount, "0") <= 0) return "Enter a valid amount greater than zero.";
+    if (decimalPlaces(amount) > selectedAssetNetwork.asset.decimals) {
+      return `${selectedAssetNetwork.asset.symbol} amounts support at most ${selectedAssetNetwork.asset.decimals} decimal places.`;
+    }
+    if (compareDecimalStrings(amount, selectedAssetNetwork.withdrawalMinAmount) <= 0) {
       return `Amount must be greater than the minimum withdrawal of ${formatExactAmount(selectedAssetNetwork.withdrawalMinAmount)} ${selectedAssetNetwork.asset.symbol}.`;
     }
-    if (balance && Number(amount) > Number(balance.availableBalance)) {
+    if (balance && compareDecimalStrings(amount, balance.availableBalance) > 0) {
       return `Amount exceeds your available balance of ${formatExactAmount(balance.availableBalance)} ${selectedAssetNetwork.asset.symbol}.`;
     }
     return null;

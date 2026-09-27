@@ -1,5 +1,5 @@
 import type { WithdrawalStatus } from "@verdictvaut/shared-types";
-import { AlertTriangle, CheckCircle2, Clock, Hourglass, Send, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock, Hourglass, Send, ShieldQuestion, XCircle } from "lucide-react";
 import { Badge, BadgeTone } from "../ui/Badge";
 import { WITHDRAWAL_STATUS_LABEL } from "../../lib/wallet/withdrawal-status";
 
@@ -17,6 +17,7 @@ const TONE: Record<WithdrawalStatus, BadgeTone> = {
   REJECTED: "down",
   FAILED: "down",
   CANCELLED: "neutral",
+  EXECUTION_AMBIGUOUS: "gold",
 };
 
 const ICON: Record<WithdrawalStatus, typeof Clock> = {
@@ -33,6 +34,7 @@ const ICON: Record<WithdrawalStatus, typeof Clock> = {
   REJECTED: XCircle,
   FAILED: AlertTriangle,
   CANCELLED: XCircle,
+  EXECUTION_AMBIGUOUS: ShieldQuestion,
 };
 
 export function WithdrawalStatusBadge({ status }: { status: WithdrawalStatus }) {

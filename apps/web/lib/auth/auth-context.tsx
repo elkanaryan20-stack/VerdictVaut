@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { apiFetch } from "../api-client";
+import { apiFetch, SESSION_EXPIRED_EVENT } from "../api-client";
 import { clearTokens, getAccessToken, getRefreshToken, setTokens, TokenPair } from "./token-storage";
 
 export interface CurrentUser {
@@ -64,6 +64,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     loadCurrentUser();
   }, [loadCurrentUser]);
+
+  // Phase 36 — a previously valid session is never assumed to still be
+  // authorized: when any API call learns the backend rejected it (see
+  // SESSION_EXPIRED_EVENT), drop to "unauthenticated" so AuthGuard sends
+  // the user to /login rather than leaving stale signed-in UI up.
+  useEffect(() => {
+    const onSessionExpired = () => {
+      setUser(null);
+      setStatus("unauthenticated");
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, onSessionExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onSessionExpired);
+  }, []);
 
   const login = useCallback(
     async (email: string, password: string) => {

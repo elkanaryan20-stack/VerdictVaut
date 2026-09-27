@@ -22,6 +22,11 @@ const PAGE_SIZE = 50;
 // gates only, the backend re-enforces the real transition legality itself.
 const APPROVABLE = new Set(["RISK_REVIEW"]);
 const REJECTABLE = new Set(["REQUESTED", "RISK_REVIEW", "APPROVED"]);
+const OPERATOR_API_ACTION: Partial<Record<string, string>> = {
+  PENDING_MANUAL_BROADCAST: "Awaiting operator: record the broadcast txHash via the admin API (runbook §13).",
+  BROADCASTING: "If this stays here, the execution lease may be abandoned — see runbook §13 before acting.",
+  EXECUTION_AMBIGUOUS: "Execution outcome unknown — verify with the provider, then resolve via the admin API (runbook §14). Never re-submit.",
+};
 
 /**
  * ADMIN and SUPER_ADMIN can both view this (GET /admin/withdrawals is
@@ -118,6 +123,12 @@ export function AdminWithdrawalsTable() {
                   {withdrawal.destinationTag && <> (tag {withdrawal.destinationTag})</>} · {formatDateTime(withdrawal.createdAt)}
                 </p>
                 {withdrawal.txHash && <p className="mt-0.5 font-mono text-[11px] text-white/30">tx {truncateMiddle(withdrawal.txHash, 10, 8)}</p>}
+                {OPERATOR_API_ACTION[withdrawal.status] && (
+                  // Phase 36 — these states are resolved only through the
+                  // audited admin API with out-of-band evidence (runbook
+                  // §13/§14); there is intentionally no button for them here.
+                  <p className="mt-1 text-[11px] text-vault-gold/80">{OPERATOR_API_ACTION[withdrawal.status]}</p>
+                )}
 
                 {reconciledId === withdrawal.id && reconcileReport && reconcileReport.withdrawal.id === withdrawal.id && (
                   <div

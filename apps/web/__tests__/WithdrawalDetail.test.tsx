@@ -99,4 +99,26 @@ describe("WithdrawalDetail", () => {
     renderWithQueryClient(<WithdrawalDetail withdrawalId="wd-1" />);
     await waitFor(() => expect(screen.getByText("104598917")).toBeInTheDocument());
   });
+
+  it("Phase 36: an EXECUTION_AMBIGUOUS withdrawal shows a calm 'funds still reserved' notice — no cancel/retry control, no failure banner", async () => {
+    mockedApi.fetchWithdrawal.mockResolvedValue(makeWithdrawal({ status: "EXECUTION_AMBIGUOUS", failureReason: "internal provider timeout detail" }));
+    renderWithQueryClient(<WithdrawalDetail withdrawalId="wd-1" />);
+    await waitFor(() => expect(screen.getByText(/your funds are safe and still reserved/i)).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /cancel withdrawal/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/internal provider timeout detail/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unable to complete/i)).not.toBeInTheDocument();
+  });
+
+  it("Phase 36: labels a recorded txHash as reference-only until the backend reports CREDITED", async () => {
+    mockedApi.fetchWithdrawal.mockResolvedValue(makeWithdrawal({ status: "CONFIRMING", txHash: "0xabc123def4567890abcdef" }));
+    const { unmount } = renderWithQueryClient(<WithdrawalDetail withdrawalId="wd-1" />);
+    await waitFor(() => expect(screen.getByText(/not yet confirmed as completed/i)).toBeInTheDocument());
+    unmount();
+
+    mockedApi.fetchWithdrawal.mockResolvedValue(makeWithdrawal({ status: "CREDITED", txHash: "0xabc123def4567890abcdef" }));
+    renderWithQueryClient(<WithdrawalDetail withdrawalId="wd-2" />);
+    await waitFor(() => expect(screen.getByText("Completed")).toBeInTheDocument());
+    expect(screen.queryByText(/not yet confirmed as completed/i)).not.toBeInTheDocument();
+  });
 });

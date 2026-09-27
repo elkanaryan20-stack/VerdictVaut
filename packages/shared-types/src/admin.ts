@@ -56,3 +56,46 @@ export const AuditLogEntrySchema = z.object({
 });
 export type AuditLogEntry = z.infer<typeof AuditLogEntrySchema>;
 export const AuditLogEntryListSchema = z.array(AuditLogEntrySchema);
+
+/**
+ * Phase 36 — GET /admin/jobs (Phase 35): persisted state of worker
+ * background jobs (scheduled reconciliation leases/outcomes and the
+ * withdrawal watcher's per-pass heartbeat). Read-only operator visibility.
+ */
+export const ScheduledJobStateSchema = z.object({
+  jobKey: z.string(),
+  lockedAt: z.string().nullable(),
+  lockedBy: z.string().nullable(),
+  lastStartedAt: z.string().nullable(),
+  lastSuccessAt: z.string().nullable(),
+  lastErrorAt: z.string().nullable(),
+  lastError: z.string().nullable(),
+  lastSummary: z.string().nullable(),
+  updatedAt: z.string(),
+});
+export type ScheduledJobState = z.infer<typeof ScheduledJobStateSchema>;
+export const ScheduledJobStateListSchema = z.array(ScheduledJobStateSchema);
+
+export const DISCREPANCY_STATUSES = ["OPEN", "ACKNOWLEDGED", "RESOLVED", "FALSE_POSITIVE"] as const;
+export const DiscrepancyStatusSchema = z.enum(DISCREPANCY_STATUSES);
+export type DiscrepancyStatus = z.infer<typeof DiscrepancyStatusSchema>;
+
+/**
+ * Phase 36 — the fields of GET /admin/reconciliation/discrepancies the
+ * operations view renders. expectedState/observedState (raw chain/ledger
+ * evidence JSON) are deliberately not part of this summary.
+ */
+export const ReconciliationDiscrepancySummarySchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  severity: z.string(),
+  status: DiscrepancyStatusSchema,
+  chainIdentity: z.string(),
+  assetNetworkId: z.string().nullable(),
+  marketId: z.string().nullable(),
+  internalEntityType: z.string().nullable(),
+  internalEntityId: z.string().nullable(),
+  createdAt: z.string(),
+});
+export type ReconciliationDiscrepancySummary = z.infer<typeof ReconciliationDiscrepancySummarySchema>;
+export const ReconciliationDiscrepancySummaryListSchema = z.array(ReconciliationDiscrepancySummarySchema);

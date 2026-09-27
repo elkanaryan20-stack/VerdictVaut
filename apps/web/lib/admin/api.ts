@@ -6,6 +6,10 @@ import {
   AdminWithdrawalSchema,
   AuditLogEntry,
   AuditLogEntryListSchema,
+  ReconciliationDiscrepancySummary,
+  ReconciliationDiscrepancySummaryListSchema,
+  ScheduledJobState,
+  ScheduledJobStateListSchema,
   StaleDeposit,
   StaleDepositListSchema,
   WithdrawalReconcileResult,
@@ -88,4 +92,24 @@ export async function rejectWithdrawal(withdrawalId: string, reason: string): Pr
 export async function reconcileWithdrawal(withdrawalId: string): Promise<WithdrawalReconcileResult> {
   const data = await apiFetch<unknown>(`/admin/withdrawals/${encodeURIComponent(withdrawalId)}/reconcile`, { method: "POST" });
   return parseOrThrow(WithdrawalReconcileResultSchema, data, "POST /admin/withdrawals/:id/reconcile");
+}
+
+// ── Phase 36: Phase 35 operational views (all read-only, ADMIN-readable) ──
+
+/** GET /admin/withdrawals/stale — non-terminal withdrawals whose row hasn't changed in `olderThanMs` (server default 1h). */
+export async function fetchStaleWithdrawals(): Promise<AdminWithdrawal[]> {
+  const data = await apiFetch<unknown>("/admin/withdrawals/stale");
+  return parseOrThrow(AdminWithdrawalListSchema, data, "GET /admin/withdrawals/stale");
+}
+
+/** GET /admin/jobs — worker background-job state (scheduled reconciliation, withdrawal-watcher heartbeat). */
+export async function fetchScheduledJobs(): Promise<ScheduledJobState[]> {
+  const data = await apiFetch<unknown>("/admin/jobs");
+  return parseOrThrow(ScheduledJobStateListSchema, data, "GET /admin/jobs");
+}
+
+/** GET /admin/reconciliation/discrepancies?status=OPEN — summary fields only (see ReconciliationDiscrepancySummarySchema). */
+export async function fetchOpenDiscrepancies(): Promise<ReconciliationDiscrepancySummary[]> {
+  const data = await apiFetch<unknown>("/admin/reconciliation/discrepancies?status=OPEN");
+  return parseOrThrow(ReconciliationDiscrepancySummaryListSchema, data, "GET /admin/reconciliation/discrepancies");
 }

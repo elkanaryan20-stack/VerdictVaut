@@ -30,7 +30,13 @@ export default function LoginPage() {
       await login(email, password);
       router.replace("/wallet");
     } catch (err) {
-      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+      if (err instanceof ApiError && err.status === 403) {
+        // Phase 36 — the backend only returns 403 here AFTER the password
+        // matched (AuthService.login), so saying "suspended" leaks nothing to
+        // someone without the password, and stops a suspended user retrying a
+        // "wrong password" that isn't wrong.
+        setError("This account is suspended. Please contact support.");
+      } else if (err instanceof ApiError && err.status === 401) {
         setError("Invalid email or password.");
       } else if (err instanceof ApiError && err.isRateLimited) {
         setError("Too many attempts. Please wait a moment and try again.");

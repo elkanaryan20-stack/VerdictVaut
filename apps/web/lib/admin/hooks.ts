@@ -7,7 +7,10 @@ import {
   fetchAdminWithdrawal,
   fetchAdminWithdrawals,
   fetchAuditLogs,
+  fetchOpenDiscrepancies,
+  fetchScheduledJobs,
   fetchStaleDeposits,
+  fetchStaleWithdrawals,
   ListAuditLogsOptions,
   reconcileWithdrawal,
   rejectWithdrawal,
@@ -150,4 +153,21 @@ export function useMarketsNeedingAttention() {
   }
 
   return { items, isLoading, isError, hasPartialError, refetch };
+}
+
+// Phase 36 — read-only operational views over Phase 35 endpoints. Polled
+// gently (60s) since they describe worker/reconciliation state that
+// changes on the order of minutes; no mutation lives here.
+const OPERATIONS_REFETCH_MS = 60_000;
+
+export function useStaleWithdrawals() {
+  return useQuery({ queryKey: ["admin", "withdrawals", "stale"], queryFn: fetchStaleWithdrawals, refetchInterval: OPERATIONS_REFETCH_MS });
+}
+
+export function useScheduledJobs() {
+  return useQuery({ queryKey: ["admin", "jobs"], queryFn: fetchScheduledJobs, refetchInterval: OPERATIONS_REFETCH_MS });
+}
+
+export function useOpenDiscrepancies() {
+  return useQuery({ queryKey: ["admin", "discrepancies", "OPEN"], queryFn: fetchOpenDiscrepancies, refetchInterval: OPERATIONS_REFETCH_MS });
 }
