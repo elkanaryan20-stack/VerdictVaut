@@ -187,8 +187,13 @@ here:
 3. New withdrawal **execution** (`ProductionCustodyExecutor`/
    `FireblocksCustodyAdapter.execute`) will fail per-request; nothing
    auto-retries a failed execution — an admin must investigate each
-   affected withdrawal via `GET /admin/withdrawals/:id` and, once the
-   provider recovers, retry through the normal approval flow.
+   affected withdrawal via `GET /admin/withdrawals/:id`. A failed
+   execution returns the withdrawal to `APPROVED` (reservation held).
+   *Correction, Phase 35:* there is no "retry execution" path —
+   `approve()` only accepts `RISK_REVIEW` — so once the provider
+   recovers, `POST /admin/withdrawals/:id/reject` releases the funds and
+   the user submits a new request. Never edit the row back to
+   `RISK_REVIEW` by hand to force a re-execution.
 4. If the provider's own status is unclear from its API responses
    (timeouts, ambiguous errors) — `WithdrawalExecutionResult`'s
    "ambiguous" outcome exists for exactly this; resolve each one via
@@ -276,3 +281,135 @@ staffed on-call rotation (none exists to name here).
    admin endpoints) — this repo already makes every financial-control
    action attributable and queryable; use that, don't reconstruct events
    from memory.
+
+---
+
+## Phase 35 additions — operational control plane
+
+Every procedure below is classified by who may act:
+
+- **AUTOMATED (safe)** — the system does it; no human action needed.
+- **HUMAN INVESTIGATION** — a SUPER_ADMIN acts through an audited endpoint.
+- **PROVIDER INVESTIGATION** — the answer lives with the custody/RPC provider.
+- **PROHIBITED** — could duplicate or lose funds; never do it.
+
+## 12. Scheduled reconciliation
+
+**Status: READY FOR IMPLEMENTATION** (lease/concurrency behavior VERIFIED
+against real Postgres — `test/integration/phase35-operations.integration-spec.ts`).
+
+- Enable in the **worker** process only: `RECONCILIATION_SCHEDULER_ENABLED=true`
+  (the API process refuses to boot with it set — `watcher-boundary.guard.ts`).
+- Runs, per active asset/network, the independent rescan (§5/§7) plus the
+  market collateral check-all. **Both are read-only with respect to money**
+  — they only create `ReconciliationRun`/`ReconciliationDiscrepancy` rows
+  and audit entries. Nothing here can credit, settle, release, or post.
+- Cadence: `RECONCILIATION_SCHEDULER_INTERVAL_MS` (default 1h),
+  `RECONCILIATION_SCHEDULER_TICK_INTERVAL_MS` (default 60s),
+  `RECONCILIATION_SCHEDULER_LEASE_STALE_AFTER_MS` (default 30m). These are
+  **operational parameters with conservative defaults, not a decided
+  production reconciliation policy** — each rescan makes real RPC calls,
+  so the right interval depends on the RPC plan and chain count chosen at
+  go-live.
+- Multi-replica safe: each job is leased in `scheduled_job_states`; across
+  any number of workers a job runs at most once per interval. A killed
+  worker's lease is reclaimed after the stale window — **AUTOMATED**.
+- Monitoring: `GET /admin/jobs` (`lastStartedAt`/`lastSuccessAt`/
+  `lastError` per job); metrics `operations.reconciliation_job.{started,completed,failed}`.
+  A job whose `lastSuccessAt` is older than ~2x the interval while the
+  scheduler is enabled means reconciliation is falling behind.
+- Deleting `scheduled_job_states` rows is harmless but pointless (it only
+  makes every job due at once). **PROHIBITED:** deleting
+  `reconciliation_discrepancies` rows — resolve them (§7).
+
+## 13. Stuck withdrawal
+
+**Status: READY FOR IMPLEMENTATION.** Find candidates with
+`GET /admin/withdrawals/stale?olderThanMs=<ms>` (default 1h) and the
+`withdrawal_chain_mismatch` / `withdrawal_tx_missing` discrepancies.
+
+| State | Normal exit | If stuck — who acts, with what evidence |
+|---|---|---|
+| `RISK_REVIEW` | SUPER_ADMIN approve/reject; user cancel | HUMAN: review and decide. |
+| `APPROVED` | reject (after a failed execution) | HUMAN: `reject` releases funds; user resubmits (§8). |
+| `BROADCASTING` | executor settles within one request | Only after a worker/process death mid-execute. HUMAN: `POST /admin/withdrawals/:id/declare-execution-ambiguous`, then §14. |
+| `PENDING_MANUAL_BROADCAST`, manual executor (no `custodyReference`) | admin records txHash | HUMAN: record the real txHash (`/broadcast`), or if it was never sent, `declare-execution-ambiguous` then §14. |
+| `PENDING_MANUAL_BROADCAST`, provider-held (`custodyReference` set) | watcher/webhook applies the provider outcome | PROVIDER INVESTIGATION. `declare-execution-ambiguous` is **refused** — the provider may still broadcast. Cancel/resolve at the provider; its outcome arrives automatically. |
+| `EXECUTION_AMBIGUOUS` | `resolve-ambiguous-execution` | HUMAN + PROVIDER: §14. |
+| `BROADCAST`/`CONFIRMING`, chain says **not_found** | watcher confirms | Mistyped hash, dropped or replaced tx. HUMAN: `declare-execution-ambiguous` (the server re-checks the chain live and refuses unless still not_found; the stale hash is cleared but kept in the audit row), then §14. |
+| `BROADCAST`/`CONFIRMING`, chain shows the tx but **destination/amount mismatch** | — | **Needs a product decision (R1, open).** Funds genuinely moved on-chain to the wrong place/amount; who bears the loss is a business/legal question. The withdrawal stays `CONFIRMING` with the reservation held — safe and conservative. Escalate Sev1 (§11). The endpoint above **refuses** this case by design. |
+| `BROADCAST`/`CONFIRMING`, chain says **failed** | watcher fails it (AUTOMATED) | Nothing to do; if the watcher is down, see §15. |
+
+**PROHIBITED** in every row: editing withdrawal status/txHash in SQL;
+releasing a reservation directly; "retrying" by resetting a row to
+`RISK_REVIEW`.
+
+## 14. Ambiguous custody execution
+
+**Status: READY FOR IMPLEMENTATION.**
+
+1. Establish what actually happened — **never infer it from the request**:
+   the provider dashboard / `checkStatus()` for a custody provider; the
+   operator's own wallet history for a manual broadcast; for EVM, whether
+   the sending nonce was consumed and by which tx; for BTC, whether the
+   inputs were spent and by which tx.
+2. A real transaction exists: `POST /admin/withdrawals/:id/resolve-ambiguous-execution`
+   with `{outcome: "CONFIRMED_BROADCAST", txHash}`. The withdrawal returns
+   to `BROADCAST`; the watcher credits it **only** if the chain shows that
+   hash paying the recorded destination/amount.
+3. Provably nothing was or can still be executed: `{outcome: "CONFIRMED_NOT_EXECUTED"}`,
+   then `reject` to release funds. For a dropped transaction, "provably"
+   means the signed transaction can no longer be mined (nonce/inputs
+   consumed elsewhere) — a merely-dropped signed tx can be rebroadcast by
+   anyone holding it. Two-person verification (§11) before releasing.
+4. **PROHIBITED:** resolving `CONFIRMED_NOT_EXECUTED` while a provider
+   request is still pending or a signed transaction is still mineable.
+
+## 15. Watcher outage / duplicate or replayed events
+
+**Status: READY FOR IMPLEMENTATION.**
+
+- Deposit watcher: `GET /admin/watchers` (`isScanStale`, `lastError`) — §6.
+- Withdrawal watcher: `GET /admin/jobs`, row `withdrawal-watcher`
+  (`lastStartedAt`/`lastSuccessAt`/`lastError`, written by the worker on
+  every pass). The API's own `GET /admin/watchers/withdrawals` and
+  `/health/ready` describe only the **API process**, which never runs this
+  watcher — do not read them as the worker's health.
+- During an outage nothing is credited or failed; withdrawals simply wait.
+  On recovery the watcher re-lists and catches up — **AUTOMATED**.
+- Duplicate/replayed provider webhooks and repeated polls are
+  **AUTOMATED**-safe: webhook events are de-duplicated by event identity,
+  and every watcher/webhook transition is a status-scoped CAS (a replay
+  matches zero rows). `POST /admin/providers/webhook-events/:id/reprocess`
+  re-applies only the stored payload.
+
+## 16. Reservation / ledger anomaly
+
+**Status: READY FOR IMPLEMENTATION.**
+
+- Detect: `npm run check:integrity -w apps/api` (reservedBalance vs ACTIVE
+  reservations, orphan reservations/ledger references — Phase 32), plus
+  the DB-level zero-sum posting trigger, which rejects an unbalanced
+  transaction outright.
+- Any failure is **Sev1** (§11). **HUMAN INVESTIGATION** only: identify
+  the referenced Order/Withdrawal and its audit trail before anything else.
+- **PROHIBITED:** hand-editing `ledger_accounts` balances,
+  `fund_reservations`, or posting ad-hoc `ledger_transactions`. There is
+  deliberately no admin "adjust balance" endpoint; a correction requires
+  an explicit, reviewed code/migration change with its own audit trail.
+
+## 17. Admin emergency handling
+
+**Status: READY FOR IMPLEMENTATION.**
+
+- Stop new exposure without touching funds: pause/close markets
+  (`POST /markets/:id/pause|close`); deactivate an asset/network
+  (`PATCH /admin/asset-networks/:id/active` — blocks new withdrawals on
+  it); disable a custody provider config
+  (`POST /admin/custody/providers/:id/disable` — execution then fails
+  closed).
+- Suspected compromised admin account: revoke its sessions and demote or
+  suspend it directly in the database (there is no role-management
+  endpoint). Every admin route re-reads role and ACTIVE status from the DB
+  on each request, so this takes effect immediately, not at token expiry.
+- Every one of these actions is audit-logged; none moves money.

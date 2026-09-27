@@ -88,3 +88,30 @@ describe("AdminController — authorization decorator audit (Phase 17)", () => {
     expect(Reflect.getMetadata(ROLES_KEY, prototype.listWatcherStatus)).toBeUndefined();
   });
 });
+
+describe("AdminController.listAuditLogs — compliance-signal redaction (Phase 35)", () => {
+  const entries = [
+    { id: "1", action: "withdrawal.request", after: { status: "RISK_REVIEW", complianceSignals: { addressRiskScreeningStatus: "HIGH" } } },
+    { id: "2", action: "market.close", after: { status: "CLOSED" } },
+    { id: "3", action: "user.login", after: null },
+  ];
+  function controllerWith(list: jest.Mock) {
+    const controller = Object.create(AdminController.prototype) as AdminController;
+    (controller as unknown as { auditLogService: { list: jest.Mock } }).auditLogService = { list };
+    return controller;
+  }
+
+  it("redacts complianceSignals for a plain ADMIN — the SUPER_ADMIN-only compliance-signals route cannot be bypassed through the audit listing", async () => {
+    const controller = controllerWith(jest.fn().mockResolvedValue(entries));
+    const result = (await controller.listAuditLogs({ id: "a", role: UserRole.ADMIN } as never)) as Array<{ after: Record<string, unknown> | null }>;
+    expect(result[0].after?.complianceSignals).toBe("[redacted — SUPER_ADMIN only]");
+    expect(result[0].after?.status).toBe("RISK_REVIEW");
+    expect(result[1]).toEqual(entries[1]);
+    expect(result[2]).toEqual(entries[2]);
+  });
+
+  it("returns entries untouched for a SUPER_ADMIN", async () => {
+    const controller = controllerWith(jest.fn().mockResolvedValue(entries));
+    expect(await controller.listAuditLogs({ id: "s", role: UserRole.SUPER_ADMIN } as never)).toEqual(entries);
+  });
+});

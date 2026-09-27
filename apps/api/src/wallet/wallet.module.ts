@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { LedgerModule } from "../ledger/ledger.module";
+import { ScheduledJobStateModule } from "../operations/scheduled-job-state.module";
 import { AssetsNetworksController } from "./assets-networks/assets-networks.controller";
 import { AssetsNetworksService } from "./assets-networks/assets-networks.service";
 import { DepositAddressService } from "./addresses/deposit-address.service";
@@ -44,7 +45,7 @@ import { DepositWatcherService } from "./watchers/deposit-watcher.service";
 import { WithdrawalWatcherService } from "./watchers/withdrawal-watcher.service";
 
 @Module({
-  imports: [LedgerModule],
+  imports: [LedgerModule, ScheduledJobStateModule],
   controllers: [AssetsNetworksController, BalancesController, DepositsController, WithdrawalsController, FireblocksWebhookController],
   providers: [
     AssetsNetworksService,

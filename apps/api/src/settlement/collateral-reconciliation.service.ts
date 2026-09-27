@@ -51,7 +51,8 @@ export class CollateralReconciliationService {
     private readonly metrics: MetricsService = new LoggingMetricsService(),
   ) {}
 
-  async checkMarket(marketId: string, initiatedByUserId: string) {
+  // initiatedByUserId is null for the Phase 35 scheduled run — recorded as a SYSTEM actor.
+  async checkMarket(marketId: string, initiatedByUserId: string | null) {
     const market = await this.prisma.market.findUnique({ where: { id: marketId } });
     if (!market) {
       throw new NotFoundException("Market not found");
@@ -103,7 +104,7 @@ export class CollateralReconciliationService {
     }
 
     await this.auditLog.record({
-      actorId: initiatedByUserId,
+      actorId: initiatedByUserId ?? undefined,
       action: "reconciliation.collateral_check_completed",
       resourceType: "Market",
       resourceId: marketId,
@@ -114,7 +115,7 @@ export class CollateralReconciliationService {
   }
 
   /** Bounded platform-wide sweep over every market that has ever minted collateral. */
-  async checkAllMarkets(initiatedByUserId: string) {
+  async checkAllMarkets(initiatedByUserId: string | null) {
     const accounts = await this.prisma.ledgerAccount.findMany({
       where: { ownerType: "MARKET", marketId: { not: null } },
       select: { marketId: true },
@@ -169,10 +170,18 @@ export class CollateralReconciliationService {
     },
   ) {
     const baseKey = `market:${marketId}:collateral_balance_mismatch`;
-    const existing = await this.prisma.reconciliationDiscrepancy.findUnique({ where: { idempotencyKey: baseKey } });
-    if (existing && (existing.status === "OPEN" || existing.status === "ACKNOWLEDGED")) {
-      return existing;
+    // Phase 35 — same fix as IndependentReconciliationService
+    // .createDiscrepancy: match any still-open row for this finding, not
+    // only the base key, or every run after a first resolution adds a
+    // new duplicate open row.
+    const stillOpen = await this.prisma.reconciliationDiscrepancy.findFirst({
+      where: { marketId, type: "collateral_balance_mismatch", status: { in: ["OPEN", "ACKNOWLEDGED"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (stillOpen) {
+      return stillOpen;
     }
+    const existing = await this.prisma.reconciliationDiscrepancy.findUnique({ where: { idempotencyKey: baseKey } });
 
     const idempotencyKey = existing ? `${baseKey}:${Date.now()}` : baseKey;
     try {

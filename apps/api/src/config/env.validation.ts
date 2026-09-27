@@ -57,6 +57,25 @@ class EnvironmentVariables {
   @IsOptional()
   ALLOW_WATCHERS_IN_API_PROCESS: string = "false";
 
+  // Phase 35 — see configuration.ts's reconciliationScheduler docblock.
+  @IsOptional()
+  RECONCILIATION_SCHEDULER_ENABLED: string = "false";
+
+  @IsInt()
+  @Min(60000)
+  @IsOptional()
+  RECONCILIATION_SCHEDULER_INTERVAL_MS: number = 3600000;
+
+  @IsInt()
+  @Min(1000)
+  @IsOptional()
+  RECONCILIATION_SCHEDULER_TICK_INTERVAL_MS: number = 60000;
+
+  @IsInt()
+  @Min(60000)
+  @IsOptional()
+  RECONCILIATION_SCHEDULER_LEASE_STALE_AFTER_MS: number = 1800000;
+
   @IsString()
   @IsOptional()
   WORKER_HEARTBEAT_FILE: string = "/tmp/verdictvaut-worker-heartbeat";

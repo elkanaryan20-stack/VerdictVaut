@@ -33,6 +33,19 @@ export interface AppConfig {
   // explicit escape hatch for a deliberate single-process deployment
   // (e.g. a small self-hosted install), never a silent default.
   allowWatchersInApiProcess: boolean;
+  // Phase 35 — periodic, read-only reconciliation (independent chain
+  // rescan per active asset/network + market collateral check), run in
+  // the worker process under a cross-instance lease (see
+  // ReconciliationSchedulerService). Off by default, same reasoning as
+  // the watchers above. intervalMs etc. are OPERATIONAL PARAMETERS with
+  // conservative defaults, not a decided production reconciliation
+  // policy — tune per environment (docs/operations-runbook.md §12).
+  reconciliationScheduler: {
+    enabled: boolean;
+    intervalMs: number;
+    tickIntervalMs: number;
+    leaseStaleAfterMs: number;
+  };
   worker: {
     heartbeatFile: string;
     heartbeatIntervalMs: number;
@@ -82,6 +95,12 @@ export default (): AppConfig => ({
     pollIntervalMs: parseInt(process.env.WITHDRAWAL_WATCHER_POLL_INTERVAL_MS ?? "30000", 10),
   },
   allowWatchersInApiProcess: process.env.ALLOW_WATCHERS_IN_API_PROCESS === "true",
+  reconciliationScheduler: {
+    enabled: process.env.RECONCILIATION_SCHEDULER_ENABLED === "true",
+    intervalMs: parseInt(process.env.RECONCILIATION_SCHEDULER_INTERVAL_MS ?? "3600000", 10),
+    tickIntervalMs: parseInt(process.env.RECONCILIATION_SCHEDULER_TICK_INTERVAL_MS ?? "60000", 10),
+    leaseStaleAfterMs: parseInt(process.env.RECONCILIATION_SCHEDULER_LEASE_STALE_AFTER_MS ?? "1800000", 10),
+  },
   worker: {
     heartbeatFile: process.env.WORKER_HEARTBEAT_FILE ?? "/tmp/verdictvaut-worker-heartbeat",
     heartbeatIntervalMs: parseInt(process.env.WORKER_HEARTBEAT_INTERVAL_MS ?? "15000", 10),

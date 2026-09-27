@@ -1,9 +1,10 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { WithdrawalStatus } from "@prisma/client";
 import { AppConfig } from "../../config/configuration";
 import { PrismaService } from "../../prisma/prisma.service";
 import { LoggingMetricsService, MetricsService } from "../../observability/metrics.service";
+import { ScheduledJobStateService } from "../../operations/scheduled-job-state.service";
 import { ConfirmationPolicyService } from "../confirmation/confirmation-policy.service";
 import { CustodyProviderFactory } from "../custody/custody-provider.factory";
 import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
@@ -15,6 +16,8 @@ import { WithdrawalsService } from "../withdrawals/withdrawals.service";
 // this bound is the only thing standing between a stuck poll and an
 // indefinitely-hung shutdown.
 const GRACEFUL_SHUTDOWN_MAX_WAIT_MS = 30_000;
+
+export const WITHDRAWAL_WATCHER_JOB_KEY = "withdrawal-watcher";
 
 export interface WithdrawalWatcherStatus {
   enabled: boolean;
@@ -109,6 +112,9 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     // Same optional-with-a-real-default pattern as DepositWatcherService
     // — see its constructor's own comment.
     private readonly metrics: MetricsService = new LoggingMetricsService(),
+    // Phase 35 — optional so existing callers/tests are unaffected; always
+    // injected in the real app. See pollOnce's heartbeat below.
+    @Optional() private readonly jobState?: ScheduledJobStateService,
   ) {}
 
   onModuleInit(): void {
@@ -203,7 +209,9 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
 
       this.lastPollSuccessAt = new Date();
       this.consecutiveFailures = 0;
+      await this.recordHeartbeat({ ok: true, summary: `checked=${broadcasted.length} pendingProvider=${pendingProvider.length}` });
     } catch (error) {
+      await this.recordHeartbeat({ ok: false, error: (error as Error).message });
       // A failure here means the pass itself couldn't even enumerate
       // withdrawals to check (e.g. the database is unreachable) — each
       // individual withdrawal's own check failure is already caught
@@ -216,6 +224,21 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     } finally {
       this.polling = false;
     }
+  }
+
+  /**
+   * Phase 35 — getStatus() above is in-memory and per-process, so the API
+   * process (which never runs this watcher) could only ever report it as
+   * "disabled". Persisting each pass's outcome to ScheduledJobState makes
+   * "has the worker's withdrawal watcher run recently?" answerable from
+   * GET /admin/jobs. Best-effort: a heartbeat write failure must never
+   * fail the pass itself (an unreachable DB already fails the pass).
+   */
+  private async recordHeartbeat(outcome: { ok: true; summary: string } | { ok: false; error: string }): Promise<void> {
+    if (!this.jobState || !this.lastPollStartedAt) return;
+    await this.jobState.recordPass(WITHDRAWAL_WATCHER_JOB_KEY, this.lastPollStartedAt, outcome).catch((error) => {
+      this.logger.warn(`Could not persist withdrawal watcher heartbeat: ${(error as Error).message}`);
+    });
   }
 
   private async checkOne(withdrawalId: string, assetNetworkId: string, txHash: string): Promise<void> {

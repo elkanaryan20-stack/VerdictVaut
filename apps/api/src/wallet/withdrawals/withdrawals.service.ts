@@ -8,7 +8,7 @@ import { createIdempotent } from "../../prisma/idempotent-create.util";
 import { PrismaService } from "../../prisma/prisma.service";
 import { SerializableTransactionRunner } from "../../prisma/serializable-transaction-runner";
 import { CustodyProviderFactory } from "../custody/custody-provider.factory";
-import { ChainTransactionStatus } from "../custody/custody-provider.interface";
+import { findChainMismatch, ObservedChainTransaction } from "./withdrawal-chain-match.util";
 import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
 import { LoggingMetricsService, MetricsService } from "../../observability/metrics.service";
 import {
@@ -36,81 +36,21 @@ const RESERVATION_STILL_HELD_STATUSES = new Set<WithdrawalStatus>([
   WithdrawalStatus.EXECUTION_AMBIGUOUS,
 ]);
 
+/** Every status that is not terminal — see listStale(). */
+const NON_TERMINAL_STATUSES: WithdrawalStatus[] = [
+  WithdrawalStatus.REQUESTED,
+  WithdrawalStatus.RISK_REVIEW,
+  WithdrawalStatus.APPROVED,
+  WithdrawalStatus.BROADCASTING,
+  WithdrawalStatus.PENDING_MANUAL_BROADCAST,
+  WithdrawalStatus.EXECUTION_AMBIGUOUS,
+  WithdrawalStatus.BROADCAST,
+  WithdrawalStatus.CONFIRMING,
+  WithdrawalStatus.CONFIRMED,
+];
+
 /** Statuses where the reservation has already been released back to the user — see reconcile(). */
 const RESERVATION_RELEASED_STATUSES = new Set<WithdrawalStatus>([WithdrawalStatus.REJECTED, WithdrawalStatus.FAILED]);
-
-// Pure floating/rounding slack, not a real discrepancy allowance — mirrors ReconciliationService's own RECONCILIATION_TOLERANCE.
-const WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE = new Prisma.Decimal("0.000000000000000001");
-
-/** The subset of ChainTransactionStatus the destination/amount mismatch check needs — see findChainMismatch. */
-type ObservedChainTransaction = Pick<ChainTransactionStatus, "amount" | "destinationAddress" | "outputs">;
-
-/**
- * EVM hex addresses are case-insensitive (EIP-55 checksum casing is a
- * display convention, not a distinct address) — compared lowercased.
- * XRP base58 addresses ARE case-sensitive; compared exactly. Detecting
- * "looks like an EVM address" by its 0x prefix avoids needing to thread
- * the network family into reconcile() just for this comparison.
- */
-function destinationsMatch(observed: string, recorded: string): boolean {
-  if (observed.startsWith("0x") && recorded.startsWith("0x")) {
-    return observed.toLowerCase() === recorded.toLowerCase();
-  }
-  // Phase 34 — bech32/bech32m (BIP-173) addresses are case-insensitive
-  // too (a user may legitimately submit the all-uppercase QR form, while
-  // Esplora always reports lowercase); Base58 legacy/P2SH addresses are
-  // not, and still fall through to the exact comparison below.
-  if (BECH32_BITCOIN_PREFIX.test(observed) && BECH32_BITCOIN_PREFIX.test(recorded)) {
-    return observed.toLowerCase() === recorded.toLowerCase();
-  }
-  return observed === recorded;
-}
-
-const BECH32_BITCOIN_PREFIX = /^(bc1|tb1|bcrt1)/i;
-
-/**
- * Requirement #12/#13 ("verify destination/amount where practical") — the
- * one comparison shared by reconcile() (manual, SUPER_ADMIN-triggered) and
- * recordConfirmation() (automatic, watcher-triggered, Phase 33). Only
- * called once the chain already shows real activity (confirmed/pending) —
- * a genuine mismatch means the broadcast transaction that actually exists
- * on-chain paid a different address or amount than this withdrawal
- * recorded, e.g. from an admin's manually-typed txHash
- * (recordManualBroadcast/resolveAmbiguousExecution never verify their
- * input on-chain by design) or a provider-side error.
- */
-function findChainMismatch(withdrawal: Withdrawal, chainStatus: ObservedChainTransaction): string | null {
-  if (chainStatus.destinationAddress && !destinationsMatch(chainStatus.destinationAddress, withdrawal.destinationAddress)) {
-    // Requirement #12/#13: "verify destination where practical". Only
-    // checked when the provider actually reports one (EVM/XRP today —
-    // see ChainTransactionStatus's own docblock for why Bitcoin/Solana
-    // don't) — a genuine mismatch here would mean the broadcast paid a
-    // DIFFERENT address than the one this withdrawal recorded.
-    return "The broadcast transaction's on-chain destination does not match this withdrawal's recorded destination address.";
-  }
-  // The amount actually delivered on-chain should equal amount - fee (see
-  // request()'s own accounting docblock) — never `amount` alone.
-  const expectedNet = withdrawal.amount.minus(withdrawal.fee);
-  let observed = new Prisma.Decimal(chainStatus.amount);
-  if (chainStatus.outputs) {
-    // Phase 34 — Bitcoin: `amount` is the sum of EVERY output, which for
-    // a real UTXO-wallet withdrawal includes the change output back to
-    // the platform's own wallet — comparing it against expectedNet made
-    // every change-bearing BTC withdrawal permanently uncreditable. Only
-    // what was actually paid to this withdrawal's recorded destination
-    // counts, which also gives Bitcoin the destination check it
-    // previously had none of.
-    const paid = chainStatus.outputs.filter((o) => destinationsMatch(o.address, withdrawal.destinationAddress));
-    if (paid.length === 0) {
-      return "The broadcast transaction has no output paying this withdrawal's recorded destination address.";
-    }
-    observed = paid.reduce((sum, o) => sum.plus(o.amount), new Prisma.Decimal(0));
-  }
-  if (observed.minus(expectedNet).abs().greaterThan(WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE)) {
-    return `The broadcast transaction's on-chain amount (${observed.toString()}) does not match the expected net amount (${expectedNet.toString()}).`;
-  }
-  return null;
-}
 
 /**
  * Explicit withdrawal state machine:
@@ -648,6 +588,102 @@ export class WithdrawalsService {
   }
 
   /**
+   * Phase 35 (R1) — the ONE recovery entry point for a withdrawal that is
+   * holding funds in a state nothing will ever move it out of on its own.
+   * It deliberately does NOT release, fail, or credit anything: it only
+   * moves the withdrawal into EXECUTION_AMBIGUOUS (reservation still
+   * held), from where the pre-existing, evidence-based
+   * resolveAmbiguousExecution() decides the outcome — CONFIRMED_BROADCAST
+   * with the real txHash (re-verified by the confirmation watcher before
+   * any credit), or CONFIRMED_NOT_EXECUTED (back to APPROVED, then
+   * reject() releases). "Declare ambiguous" is always financially safe:
+   * it is exactly the state the system itself uses for "we do not know
+   * whether funds left".
+   *
+   * Qualifying states and the evidence each requires (checked here, never
+   * supplied by the caller):
+   *   - BROADCASTING: the execution lease never settled (worker crash,
+   *     process kill mid-execute). No txHash exists; nothing to look up.
+   *   - PENDING_MANUAL_BROADCAST with NO custodyReference (manual
+   *     executor): nothing was ever submitted to a provider, so only the
+   *     admin knows whether they broadcast it. REFUSED when a custody
+   *     provider holds the request (custodyReference set) — that provider
+   *     may still broadcast, and its outcome arrives via the watcher/
+   *     webhook; resolve it with the provider, not by declaration.
+   *   - BROADCAST / CONFIRMING: ONLY when a live chain lookup of the
+   *     recorded txHash returns "not_found" (a mistyped hash, a dropped
+   *     or replaced transaction). The stale txHash is cleared (kept in
+   *     the audit record) so a corrected hash can be supplied through
+   *     resolveAmbiguousExecution. REFUSED if the chain shows the
+   *     transaction (confirmed/pending — a real on-chain transfer exists;
+   *     a destination/amount MISMATCH there needs a product decision on
+   *     who bears the loss, not a generic recovery), or "failed" (the
+   *     watcher already fails it from that evidence).
+   */
+  async declareExecutionAmbiguous(withdrawalId: string, actorId: string, reason: string) {
+    await this.assertSuperAdmin(actorId);
+    const current = await this.getOrThrow(withdrawalId);
+
+    let evidence: Record<string, unknown>;
+    switch (current.status) {
+      case WithdrawalStatus.BROADCASTING:
+        evidence = { basis: "execution lease never settled; no txHash was recorded" };
+        break;
+      case WithdrawalStatus.PENDING_MANUAL_BROADCAST:
+        if (current.custodyReference) {
+          throw new ConflictException(
+            `Withdrawal ${withdrawalId} is held by a custody provider (reference ${current.custodyReference}), which may still broadcast it — ` +
+              "resolve it with the provider (its outcome is applied via the watcher/webhook), not by declaring it ambiguous.",
+          );
+        }
+        evidence = { basis: "manual-broadcast withdrawal; no provider submission exists" };
+        break;
+      case WithdrawalStatus.BROADCAST:
+      case WithdrawalStatus.CONFIRMING: {
+        const provider = await this.custodyProviderFactory.resolve(current.assetNetworkId);
+        const chain = await provider.getTransactionStatus(current.txHash!, current.assetNetworkId);
+        if (chain.status !== "not_found") {
+          throw new ConflictException(
+            chain.status === "failed"
+              ? `The recorded txHash is FAILED on-chain — the withdrawal watcher fails the withdrawal from that evidence; no declaration is needed.`
+              : `The recorded txHash exists on-chain (${chain.status}) — funds may have moved. Use POST /admin/withdrawals/:id/reconcile; a destination/amount mismatch requires a product decision, not this recovery path.`,
+          );
+        }
+        evidence = { basis: "recorded txHash not found on-chain at declaration time", txHash: current.txHash, chainStatus: chain.status };
+        break;
+      }
+      default:
+        throw new ConflictException(`Withdrawal ${withdrawalId} is in status ${current.status}, which is not a stuck execution state this recovery applies to.`);
+    }
+
+    const updated = await this.txRunner.run(async (tx) => {
+      // CAS on status AND txHash: the evidence above was gathered for
+      // exactly this state — if anything moved it meanwhile (watcher
+      // credited it, another admin acted), this declaration is void.
+      const result = await tx.withdrawal.updateMany({
+        where: { id: withdrawalId, status: current.status, txHash: current.txHash },
+        data: { status: WithdrawalStatus.EXECUTION_AMBIGUOUS, txHash: null, failureReason: `Declared execution-ambiguous by SUPER_ADMIN: ${reason}` },
+      });
+      if (result.count === 0) {
+        throw new ConflictException(`Withdrawal ${withdrawalId} changed state while the declaration was being evaluated — re-check and retry.`);
+      }
+      return tx.withdrawal.findUniqueOrThrow({ where: { id: withdrawalId } });
+    });
+
+    this.metrics.increment("wallet.withdrawal.execution_declared_ambiguous", { fromStatus: current.status });
+    await this.auditLog.record({
+      actorId,
+      action: "withdrawal.execution_declared_ambiguous",
+      resourceType: "Withdrawal",
+      resourceId: withdrawalId,
+      before: { status: current.status, txHash: current.txHash, custodyReference: current.custodyReference },
+      after: { status: updated.status, evidence } as Prisma.InputJsonValue,
+      reason,
+    });
+    return updated;
+  }
+
+  /**
    * Admin submits the tx hash after broadcasting a sandbox withdrawal
    * themselves with their own wallet tooling. This method RECORDS the
    * admin's claim — it never itself broadcasts anything, and it does not
@@ -881,13 +917,23 @@ export class WithdrawalsService {
             `Withdrawal ${withdrawalId} has enough on-chain confirmations to credit, but the observed transaction does not match its recorded destination/amount: ${mismatch} — refusing to credit; use POST /admin/withdrawals/:id/reconcile to investigate.`,
           );
           this.metrics.increment("wallet.withdrawal.confirmation_mismatch", { withdrawalId });
-          await this.auditLog.record({
-            actorType: "SYSTEM",
-            action: "withdrawal.confirmation_mismatch_refused",
-            resourceType: "Withdrawal",
-            resourceId: withdrawalId,
-            after: { status: current.status, mismatch },
-          });
+          // Phase 35 — one durable audit row per (withdrawal, txHash), not
+          // one per watcher poll (previously a new row every 30s for as
+          // long as the withdrawal stayed stuck). The log line and metric
+          // above still fire every poll, which is what alerting keys on;
+          // a corrected txHash gets its own row.
+          const mismatchAuditKey = `withdrawal-confirmation-mismatch:${withdrawalId}:${current.txHash}`;
+          const alreadyAudited = await this.prisma.auditLog.findFirst({ where: { idempotencyKey: mismatchAuditKey }, select: { id: true } });
+          if (!alreadyAudited) {
+            await this.auditLog.record({
+              actorType: "SYSTEM",
+              action: "withdrawal.confirmation_mismatch_refused",
+              resourceType: "Withdrawal",
+              resourceId: withdrawalId,
+              after: { status: current.status, txHash: current.txHash, mismatch },
+              idempotencyKey: mismatchAuditKey,
+            });
+          }
           return current;
         }
       }
@@ -1150,6 +1196,23 @@ export class WithdrawalsService {
       orderBy: { createdAt: "desc" },
       skip: (safePage - 1) * safePageSize,
       take: safePageSize,
+      include: { user: { select: { id: true, email: true } }, assetNetwork: { include: { asset: true, network: true } } },
+    });
+  }
+
+  /**
+   * Phase 35 — operator visibility for R1-class stuck states: every
+   * withdrawal still holding (or about to hold) funds whose row has not
+   * changed for `olderThanMs`. Read-only. The threshold is caller-chosen
+   * (the admin route defaults it the same way GET /admin/deposits/stale
+   * does) — an operational lens, not a policy that acts on anything.
+   */
+  async listStale(olderThanMs: number) {
+    const safeOlderThanMs = Number.isFinite(olderThanMs) && olderThanMs >= 0 ? olderThanMs : 60 * 60 * 1000;
+    return this.prisma.withdrawal.findMany({
+      where: { status: { in: NON_TERMINAL_STATUSES }, updatedAt: { lt: new Date(Date.now() - safeOlderThanMs) } },
+      orderBy: { updatedAt: "asc" },
+      take: MAX_PAGE_SIZE,
       include: { user: { select: { id: true, email: true } }, assetNetwork: { include: { asset: true, network: true } } },
     });
   }

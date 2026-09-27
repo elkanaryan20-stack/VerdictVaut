@@ -9,6 +9,7 @@ import { DepositChainAdapterFactory } from "../chain-adapters/deposit-chain-adap
 import { RawChainDeposit } from "../chain-adapters/deposit-chain-adapter.interface";
 import { loadWatchedAddresses } from "../chain-adapters/watched-addresses.util";
 import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
+import { findChainMismatch } from "../withdrawals/withdrawal-chain-match.util";
 
 const RECONCILIATION_TOLERANCE = new Prisma.Decimal("0.000000000000000001"); // 1 base unit at 18 decimals — rounding slack, not a real discrepancy allowance
 
@@ -78,14 +79,15 @@ export class IndependentReconciliationService {
     private readonly executorFactory?: WithdrawalExecutorFactory,
   ) {}
 
-  async runIndependentRescan(assetNetworkId: string, initiatedByUserId: string, fromPointer?: string) {
+  // initiatedByUserId is null for the Phase 35 scheduled run (ReconciliationSchedulerService) — recorded as a SYSTEM actor.
+  async runIndependentRescan(assetNetworkId: string, initiatedByUserId: string | null, fromPointer?: string) {
     const assetNetwork = await this.prisma.assetNetwork.findUnique({ where: { id: assetNetworkId } });
     if (!assetNetwork) {
       throw new NotFoundException("Asset/network pair not found");
     }
 
     await this.auditLog.record({
-      actorId: initiatedByUserId,
+      actorId: initiatedByUserId ?? undefined,
       action: "reconciliation.independent_rescan_started",
       resourceType: "AssetNetwork",
       resourceId: assetNetworkId,
@@ -150,7 +152,7 @@ export class IndependentReconciliationService {
     }
 
     await this.auditLog.record({
-      actorId: initiatedByUserId,
+      actorId: initiatedByUserId ?? undefined,
       action: "reconciliation.independent_rescan_completed",
       resourceType: "AssetNetwork",
       resourceId: assetNetworkId,
@@ -281,6 +283,30 @@ export class IndependentReconciliationService {
             expectedState: { internalStatus: withdrawal.status },
             observedState: { chainStatus: chainStatus.status },
           });
+        } else if (
+          (chainStatus.status === "confirmed" || chainStatus.status === "pending") &&
+          (withdrawal.status === WithdrawalStatus.BROADCAST || withdrawal.status === WithdrawalStatus.CONFIRMING) &&
+          findChainMismatch(withdrawal, chainStatus)
+        ) {
+          // Phase 35 — surfaces, as a first-class discrepancy, exactly the
+          // case WithdrawalsService.recordConfirmation refuses to credit
+          // (R1): real on-chain activity that doesn't match what was
+          // recorded. Without this, such a withdrawal sat in CONFIRMING
+          // visible only in logs/audit rows, never in the discrepancy
+          // queue operators actually work from.
+          findings.push({
+            type: "withdrawal_chain_mismatch",
+            severity: "CRITICAL",
+            chainIdentity: withdrawal.txHash!,
+            internalEntityType: "Withdrawal",
+            internalEntityId: withdrawal.id,
+            expectedState: {
+              internalStatus: withdrawal.status,
+              destinationAddress: withdrawal.destinationAddress,
+              expectedNetAmount: withdrawal.amount.minus(withdrawal.fee).toString(),
+            },
+            observedState: { chainStatus: chainStatus.status, mismatch: findChainMismatch(withdrawal, chainStatus) },
+          });
         } else if (chainStatus.status === "failed" && (withdrawal.status === "CONFIRMED" || withdrawal.status === "CREDITED")) {
           findings.push({
             type: "withdrawal_status_chain_mismatch",
@@ -397,10 +423,19 @@ export class IndependentReconciliationService {
     this.metrics.increment("wallet.reconciliation.discrepancy_found", { severity: input.severity, type: input.type });
 
     const baseKey = `${assetNetworkId}:${input.type}:${input.chainIdentity}`;
-    const existing = await this.prisma.reconciliationDiscrepancy.findUnique({ where: { idempotencyKey: baseKey } });
-    if (existing && (existing.status === "OPEN" || existing.status === "ACKNOWLEDGED")) {
-      return existing;
+    // Phase 35 — looked up by the finding's identity, not just the base
+    // key: once the base-key row was RESOLVED, the next occurrence is
+    // stored under a timestamp-suffixed key, and checking only the base
+    // key then created ANOTHER open row on every subsequent run — a
+    // duplicate-row flood once runs are scheduled periodically.
+    const stillOpen = await this.prisma.reconciliationDiscrepancy.findFirst({
+      where: { assetNetworkId, type: input.type, chainIdentity: input.chainIdentity, status: { in: ["OPEN", "ACKNOWLEDGED"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    if (stillOpen) {
+      return stillOpen;
     }
+    const existing = await this.prisma.reconciliationDiscrepancy.findUnique({ where: { idempotencyKey: baseKey } });
 
     const idempotencyKey = existing ? `${baseKey}:${Date.now()}` : baseKey;
     try {

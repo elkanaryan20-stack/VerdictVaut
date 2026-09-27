@@ -28,4 +28,11 @@ describe("assertWatchersNotAccidentallyEnabledInApiProcess", () => {
       assertWatchersNotAccidentallyEnabledInApiProcess({ CHAIN_WATCHER_ENABLED: "true", ALLOW_WATCHERS_IN_API_PROCESS: "1" }),
     ).toThrow();
   });
+
+  it("Phase 35: throws when RECONCILIATION_SCHEDULER_ENABLED=true in the API process without the explicit opt-in", () => {
+    expect(() => assertWatchersNotAccidentallyEnabledInApiProcess({ RECONCILIATION_SCHEDULER_ENABLED: "true" })).toThrow(/RECONCILIATION_SCHEDULER_ENABLED/);
+    expect(() =>
+      assertWatchersNotAccidentallyEnabledInApiProcess({ RECONCILIATION_SCHEDULER_ENABLED: "true", ALLOW_WATCHERS_IN_API_PROCESS: "true" }),
+    ).not.toThrow();
+  });
 });

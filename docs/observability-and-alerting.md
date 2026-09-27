@@ -102,3 +102,28 @@ it means operationally.
   unauthenticated endpoint would only widen what an unauthenticated
   caller can learn about internal configuration for no operational
   benefit.
+
+## Phase 35 additions
+
+**Correction to alert #1.** `GET /health/ready`'s `withdrawalWatcher` block
+(and `GET /admin/watchers/withdrawals`) report the in-memory state of the
+**process serving the request** — the API, which never runs the watcher
+(`watcher-boundary.guard.ts`). They therefore always read "disabled, 0
+failures" in a correctly split deployment. The worker's real withdrawal-
+watcher health is now persisted every pass to `scheduled_job_states` and
+readable via `GET /admin/jobs` (row `withdrawal-watcher`). Alert on the
+metrics in #1 (emitted by the worker) or on that row — not on the API's
+readiness field.
+
+| # | Condition | Signal | Suggested threshold |
+|---|---|---|---|
+| 8 | **Scheduled reconciliation failing / falling behind** | `operations.reconciliation_job.failed` (tag `jobKey`); `GET /admin/jobs` rows `independent-reconciliation:<assetNetworkId>` and `collateral-reconciliation` (`lastSuccessAt`, `lastError`) | Any `failed` for the same `jobKey` on two consecutive intervals; or `lastSuccessAt` older than ~2x `RECONCILIATION_SCHEDULER_INTERVAL_MS` while the scheduler is enabled. Threshold is an operational choice tied to that interval, not a fixed policy. |
+| 9 | **Withdrawal stuck on a refused confirmation (R1)** | `wallet.withdrawal.confirmation_mismatch` (fires every watcher poll while it persists); CRITICAL `withdrawal_chain_mismatch` discrepancy from scheduled reconciliation; one `withdrawal.confirmation_mismatch_refused` audit row per (withdrawal, txHash) | Any occurrence: page — real funds moved on-chain in a way that doesn't match the record. See `docs/operations-runbook.md` §13. |
+| 10 | **Stuck-withdrawal recovery used** | `wallet.withdrawal.execution_declared_ambiguous` (tag `fromStatus`) and its audit row | Every occurrence is a human recovery action: review it (two-person rule, runbook §11/§14). |
+| 11 | **Withdrawals not progressing** | `GET /admin/withdrawals/stale?olderThanMs=<ms>` non-empty | Operator-chosen `olderThanMs`; the default 1h mirrors `GET /admin/deposits/stale`. |
+
+Reservation leakage and ledger anomalies remain detected by
+`scripts/financial-integrity-checks.js` (Phase 32) — schedule it
+externally (cron/CI against a read replica) until a runtime metric exists;
+it is not run by the reconciliation scheduler, which only drives the
+chain/collateral reconciliation services.

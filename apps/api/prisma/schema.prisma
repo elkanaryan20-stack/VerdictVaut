@@ -1452,3 +1452,30 @@ model AuditLog {
   @@index([idempotencyKey])
   @@map("audit_logs")
 }
+
+// Phase 35 -- persisted state for periodic background jobs that run in
+// the worker process (scheduled reconciliation, the withdrawal watcher's
+// pass heartbeat). Two purposes:
+//   1. A cross-instance lease for jobs that must run at most once per
+//      interval no matter how many worker replicas are up -- the same
+//      CAS-acquired, staleness-reclaimable shape as
+//      BlockchainWatchCursor.lockedAt/lockedBy (Phase 10), plus a
+//      lastStartedAt "due" gate so a second replica never re-runs a job
+//      another replica just finished.
+//   2. Operator visibility: the API process can read when each job last
+//      ran/succeeded/failed, which the withdrawal watcher's in-memory,
+//      per-process status (Phase 16) could never show from the API.
+// Never holds financial state; deleting a row only resets scheduling.
+model ScheduledJobState {
+  jobKey        String    @id
+  lockedAt      DateTime?
+  lockedBy      String?
+  lastStartedAt DateTime?
+  lastSuccessAt DateTime?
+  lastErrorAt   DateTime?
+  lastError     String?
+  lastSummary   String?
+  updatedAt     DateTime  @updatedAt
+
+  @@map("scheduled_job_states")
+}

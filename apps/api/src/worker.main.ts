@@ -35,9 +35,10 @@ async function bootstrap() {
   const config = app.get(ConfigService<AppConfig, true>);
   const chainWatcher = config.get("chainWatcher", { infer: true });
   const withdrawalWatcher = config.get("withdrawalWatcher", { infer: true });
-  if (!chainWatcher.enabled && !withdrawalWatcher.enabled) {
+  const reconciliationScheduler = config.get("reconciliationScheduler", { infer: true });
+  if (!chainWatcher.enabled && !withdrawalWatcher.enabled && !reconciliationScheduler.enabled) {
     logger.warn(
-      "Worker process started but BOTH CHAIN_WATCHER_ENABLED and WITHDRAWAL_WATCHER_ENABLED are false — this process " +
+      "Worker process started but CHAIN_WATCHER_ENABLED, WITHDRAWAL_WATCHER_ENABLED and RECONCILIATION_SCHEDULER_ENABLED are all false — this process " +
         "is not doing anything. Set one or both to true, or this is likely a misconfigured deployment.",
       CONTEXT,
     );
@@ -76,7 +77,7 @@ async function bootstrap() {
   process.on("SIGINT", () => void shutdown("SIGINT"));
 
   logger.log(
-    `VerdictVaut background worker process started (no HTTP surface) — chainWatcher.enabled=${chainWatcher.enabled}, withdrawalWatcher.enabled=${withdrawalWatcher.enabled}`,
+    `VerdictVaut background worker process started (no HTTP surface) — chainWatcher.enabled=${chainWatcher.enabled}, withdrawalWatcher.enabled=${withdrawalWatcher.enabled}, reconciliationScheduler.enabled=${reconciliationScheduler.enabled}`,
     CONTEXT,
   );
 }

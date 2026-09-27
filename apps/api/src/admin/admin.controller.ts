@@ -23,10 +23,12 @@ import { PROVIDER_CAPABILITY_MATRIX } from "../wallet/provider-config/provider-c
 import { FireblocksWebhookService } from "../wallet/executors/fireblocks/fireblocks-webhook.service";
 import { UsersService } from "../users/users.service";
 import { AuditLogService } from "../audit/audit-log.service";
+import { ScheduledJobStateService } from "../operations/scheduled-job-state.service";
 import {
   CreateAssetNetworkDto,
   CreateComplianceProviderConfigDto,
   CreateCustodyProviderConfigDto,
+  DeclareExecutionAmbiguousDto,
   ProvisionAddressDto,
   RejectWithdrawalDto,
   ResolveAmbiguousExecutionDto,
@@ -75,6 +77,7 @@ export class AdminController {
     private readonly fireblocksWebhookService: FireblocksWebhookService,
     private readonly usersService: UsersService,
     private readonly auditLogService: AuditLogService,
+    private readonly scheduledJobStateService: ScheduledJobStateService,
   ) {}
 
   // ── User account lifecycle (Phase 18 remediation — SUPER_ADMIN only) ──
@@ -235,6 +238,15 @@ export class AdminController {
     return this.withdrawalsService.listAll(page ? parseInt(page, 10) : undefined, pageSize ? parseInt(pageSize, 10) : undefined);
   }
 
+  // Phase 35 — registered before "withdrawals/:id" (literal-vs-param
+  // ordering, same as deposits/stale). Read-only operational lens on
+  // withdrawals whose row hasn't changed in `olderThanMs` (default 1h,
+  // matching deposits/stale) — see WithdrawalsService.listStale.
+  @Get("withdrawals/stale")
+  listStaleWithdrawals(@Query("olderThanMs") olderThanMs?: string) {
+    return this.withdrawalsService.listStale(olderThanMs ? parseInt(olderThanMs, 10) : 60 * 60 * 1000);
+  }
+
   // Registered before "withdrawals/:id/approve" etc. is unnecessary —
   // those are POST, this is GET, so there's no literal-segment ordering
   // conflict — but kept adjacent to listWithdrawals for readability.
@@ -332,6 +344,19 @@ export class AdminController {
     return this.withdrawalsService.resolveAmbiguousExecution(id, admin.id, resolution, dto.notes);
   }
 
+  // Phase 35 (R1) — moves a stuck withdrawal into EXECUTION_AMBIGUOUS
+  // (reservation held) for evidence-based resolution via the route
+  // above; never releases, fails, or credits anything itself. The
+  // service enforces per-state evidence (including a live chain lookup
+  // for a broadcast withdrawal) and writes its own before/after audit
+  // row — see WithdrawalsService.declareExecutionAmbiguous.
+  @Post("withdrawals/:id/declare-execution-ambiguous")
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  declareExecutionAmbiguous(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string, @Body() dto: DeclareExecutionAmbiguousDto) {
+    return this.withdrawalsService.declareExecutionAmbiguous(id, admin.id, dto.reason);
+  }
+
   // ── Custody provider configuration (Phase 14A — SUPER_ADMIN only to
   // configure; provider-neutral, never a real Fireblocks/BitGo/etc.
   // integration — see CustodyProviderConfigService's own docblock) ─────
@@ -360,7 +385,7 @@ export class AdminController {
   @Throttle(ADMIN_MUTATION_THROTTLE)
   async enableCustodyProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
     const updated = await this.custodyProviderConfigService.setCustodyProviderEnabled(id, true);
-    await this.auditLogService.record({ actorId: admin.id, action: "custody_provider_config.enable", resourceType: "CustodyProviderConfig", resourceId: id });
+    await this.auditLogService.record({ actorId: admin.id, action: "custody_provider_config.enable", resourceType: "CustodyProviderConfig", resourceId: id, after: { isEnabled: true } });
     return updated;
   }
 
@@ -369,7 +394,7 @@ export class AdminController {
   @Throttle(ADMIN_MUTATION_THROTTLE)
   async disableCustodyProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
     const updated = await this.custodyProviderConfigService.setCustodyProviderEnabled(id, false);
-    await this.auditLogService.record({ actorId: admin.id, action: "custody_provider_config.disable", resourceType: "CustodyProviderConfig", resourceId: id });
+    await this.auditLogService.record({ actorId: admin.id, action: "custody_provider_config.disable", resourceType: "CustodyProviderConfig", resourceId: id, after: { isEnabled: false } });
     return updated;
   }
 
@@ -421,7 +446,7 @@ export class AdminController {
   @Throttle(ADMIN_MUTATION_THROTTLE)
   async enableComplianceProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
     const updated = await this.complianceProviderConfigService.setComplianceProviderEnabled(id, true);
-    await this.auditLogService.record({ actorId: admin.id, action: "compliance_provider_config.enable", resourceType: "ComplianceProviderConfig", resourceId: id });
+    await this.auditLogService.record({ actorId: admin.id, action: "compliance_provider_config.enable", resourceType: "ComplianceProviderConfig", resourceId: id, after: { isEnabled: true } });
     return updated;
   }
 
@@ -430,7 +455,7 @@ export class AdminController {
   @Throttle(ADMIN_MUTATION_THROTTLE)
   async disableComplianceProviderConfig(@CurrentUser() admin: AuthenticatedUser, @Param("id") id: string) {
     const updated = await this.complianceProviderConfigService.setComplianceProviderEnabled(id, false);
-    await this.auditLogService.record({ actorId: admin.id, action: "compliance_provider_config.disable", resourceType: "ComplianceProviderConfig", resourceId: id });
+    await this.auditLogService.record({ actorId: admin.id, action: "compliance_provider_config.disable", resourceType: "ComplianceProviderConfig", resourceId: id, after: { isEnabled: false } });
     return updated;
   }
 
@@ -602,9 +627,34 @@ export class AdminController {
     return this.withdrawalWatcherService.getStatus();
   }
 
+  // Phase 35 — persisted state of worker background jobs (scheduled
+  // reconciliation leases/outcomes, the withdrawal watcher's pass
+  // heartbeat). Read-only; the API process never runs these jobs, so this
+  // is the only way to see from here whether the worker is doing them.
+  @Get("jobs")
+  listScheduledJobs() {
+    return this.scheduledJobStateService.list();
+  }
+
   // ── Audit log ────────────────────────────────────────────────────────
+  // Phase 35 — compliance signals (per-category KYC/sanctions/address-
+  // risk findings) are deliberately SUPER_ADMIN-only via
+  // GET withdrawals/:id/compliance-signals, but the same data sits on the
+  // "withdrawal.request"/"withdrawal.compliance_blocked" audit rows this
+  // ADMIN-readable listing returns. Redacted here for a plain ADMIN so
+  // the listing is not a way around that restriction.
   @Get("audit-logs")
-  listAuditLogs(@Query("resourceType") resourceType?: string, @Query("actorId") actorId?: string) {
-    return this.auditLogService.list({ resourceType, actorId });
+  async listAuditLogs(@CurrentUser() admin: AuthenticatedUser, @Query("resourceType") resourceType?: string, @Query("actorId") actorId?: string) {
+    const entries = await this.auditLogService.list({ resourceType, actorId });
+    if (admin.role === UserRole.SUPER_ADMIN) {
+      return entries;
+    }
+    return entries.map((entry) => {
+      const after = entry.after as Record<string, unknown> | null;
+      if (!after || typeof after !== "object" || !("complianceSignals" in after)) {
+        return entry;
+      }
+      return { ...entry, after: { ...after, complianceSignals: "[redacted — SUPER_ADMIN only]" } };
+    });
   }
 }

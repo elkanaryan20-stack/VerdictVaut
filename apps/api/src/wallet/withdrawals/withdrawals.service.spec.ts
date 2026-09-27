@@ -24,6 +24,7 @@ describe("WithdrawalsService", () => {
   let service: WithdrawalsService;
   let prisma: {
     $executeRawUnsafe: jest.Mock;
+    auditLog: { findFirst: jest.Mock };
     user: { findUniqueOrThrow: jest.Mock; findUnique: jest.Mock };
     asset: { findUnique: jest.Mock };
     network: { findUnique: jest.Mock };
@@ -87,6 +88,7 @@ describe("WithdrawalsService", () => {
     lastRow = undefined;
     prisma = {
       $executeRawUnsafe: jest.fn().mockResolvedValue(undefined),
+      auditLog: { findFirst: jest.fn().mockResolvedValue(null) },
       user: {
         findUniqueOrThrow: jest.fn().mockResolvedValue({ id: "user-1", status: "ACTIVE" }),
         findUnique: jest.fn().mockResolvedValue({ id: "admin-1", role: "SUPER_ADMIN" }),

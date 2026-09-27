@@ -13,6 +13,7 @@ import { TradingModule } from "./trading/trading.module";
 import { LedgerModule } from "./ledger/ledger.module";
 import { WalletModule } from "./wallet/wallet.module";
 import { AdminModule } from "./admin/admin.module";
+import { OperationsModule } from "./operations/operations.module";
 import { HealthModule } from "./health/health.module";
 import { ObservabilityModule } from "./observability/observability.module";
 
@@ -36,6 +37,7 @@ import { ObservabilityModule } from "./observability/observability.module";
     LedgerModule,
     WalletModule,
     AdminModule,
+    OperationsModule,
     HealthModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],

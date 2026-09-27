@@ -54,6 +54,15 @@ export class RejectWithdrawalDto {
   reason!: string;
 }
 
+// Phase 35 — R1 recovery entry point. Only a reason is accepted: the
+// evidence rules (which states qualify, the live chain lookup for a
+// broadcast one) are enforced server-side, never supplied by the caller.
+export class DeclareExecutionAmbiguousDto {
+  @IsString()
+  @MinLength(3)
+  reason!: string;
+}
+
 export class StartIndependentRescanDto {
   // Explicit rescan window start, chain-adapter-specific format (e.g. an
   // EVM block number as a string). Omit to use the chain adapter's own

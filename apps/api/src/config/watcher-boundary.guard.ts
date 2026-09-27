@@ -16,12 +16,15 @@
 export function assertWatchersNotAccidentallyEnabledInApiProcess(env: NodeJS.ProcessEnv = process.env): void {
   const chainWatcherEnabled = env.CHAIN_WATCHER_ENABLED === "true";
   const withdrawalWatcherEnabled = env.WITHDRAWAL_WATCHER_ENABLED === "true";
+  // Phase 35 — the reconciliation scheduler is worker work too.
+  const reconciliationSchedulerEnabled = env.RECONCILIATION_SCHEDULER_ENABLED === "true";
   const allowed = env.ALLOW_WATCHERS_IN_API_PROCESS === "true";
 
-  if (!allowed && (chainWatcherEnabled || withdrawalWatcherEnabled)) {
+  if (!allowed && (chainWatcherEnabled || withdrawalWatcherEnabled || reconciliationSchedulerEnabled)) {
     const enabledFlags = [
       chainWatcherEnabled ? "CHAIN_WATCHER_ENABLED" : null,
       withdrawalWatcherEnabled ? "WITHDRAWAL_WATCHER_ENABLED" : null,
+      reconciliationSchedulerEnabled ? "RECONCILIATION_SCHEDULER_ENABLED" : null,
     ].filter(Boolean);
     throw new Error(
       `The HTTP API process refuses to start with ${enabledFlags.join(" and ")}=true: background blockchain workers ` +
