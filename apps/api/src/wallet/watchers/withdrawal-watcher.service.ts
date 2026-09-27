@@ -255,6 +255,7 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
     await this.withdrawalsService.recordConfirmation(withdrawalId, status.confirmations, requiredConfirmations, {
       amount: status.amount,
       destinationAddress: status.destinationAddress,
+      outputs: status.outputs,
     });
   }
 

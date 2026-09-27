@@ -4,14 +4,16 @@ import { fetchJson } from "../../chain-adapters/chain-http.util";
 import { rawUnitsToDecimalString } from "../../chain-adapters/decimal-units.util";
 import { ChainRpcConfigService } from "../../chain-adapters/rpc-config.service";
 import { PrismaService } from "../../../prisma/prisma.service";
-import { ChainBalance, ChainTransactionStatus, CustodyProvider } from "../custody-provider.interface";
+import { ChainBalance, ChainTransactionOutput, ChainTransactionStatus, CustodyProvider } from "../custody-provider.interface";
 
 interface EsploraAddressStats {
   chain_stats: { funded_txo_sum: number; spent_txo_sum: number };
 }
 
 interface EsploraTxLite {
-  vout: { value: number }[];
+  // Esplora omits scriptpubkey_address for outputs with no standard
+  // address encoding (e.g. OP_RETURN).
+  vout: { value: number; scriptpubkey_address?: string }[];
   status: { confirmed: boolean; block_height?: number };
 }
 
@@ -44,9 +46,15 @@ export class BitcoinCustodyProvider implements CustodyProvider {
     }
     const tx = (await response.json()) as EsploraTxLite;
     const totalOut = tx.vout.reduce((sum, o) => sum + o.value, 0);
+    // Phase 34 — see ChainTransactionStatus.outputs: totalOut includes the
+    // change output, so a withdrawal's amount can only be verified against
+    // what was paid to its own destination.
+    const outputs: ChainTransactionOutput[] = tx.vout
+      .filter((o) => o.scriptpubkey_address)
+      .map((o) => ({ address: o.scriptpubkey_address!, amount: rawUnitsToDecimalString(BigInt(o.value), network.assetDecimals) }));
 
     if (!tx.status.confirmed) {
-      return { txHash, assetNetworkId, confirmations: 0, amount: rawUnitsToDecimalString(BigInt(totalOut), network.assetDecimals), status: "pending" };
+      return { txHash, assetNetworkId, confirmations: 0, amount: rawUnitsToDecimalString(BigInt(totalOut), network.assetDecimals), status: "pending", outputs };
     }
     const tipHeight = await fetchJson<number>(`${baseUrl}/blocks/tip/height`);
     const confirmations = Math.max(tipHeight - (tx.status.block_height ?? tipHeight) + 1, 0);
@@ -56,6 +64,7 @@ export class BitcoinCustodyProvider implements CustodyProvider {
       confirmations,
       amount: rawUnitsToDecimalString(BigInt(totalOut), network.assetDecimals),
       status: "confirmed",
+      outputs,
     };
   }
 }

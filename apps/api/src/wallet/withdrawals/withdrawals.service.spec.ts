@@ -70,7 +70,7 @@ describe("WithdrawalsService", () => {
     }
   }
 
-  const asset = { id: "asset-1", symbol: "USDC" };
+  const asset = { id: "asset-1", symbol: "USDC", decimals: 6 };
   const network = { id: "network-1", code: "ethereum-sepolia", family: "EVM" };
   const assetNetwork = { id: "an-1", assetId: "asset-1", networkId: "network-1", isActive: true, withdrawalMinAmount: new Prisma.Decimal(0), memoRequired: false };
 
@@ -559,6 +559,155 @@ describe("WithdrawalsService", () => {
       });
 
       expect(ledger.postTransaction).toHaveBeenCalled();
+    });
+  });
+
+  describe("Phase 34 — withdrawal/custody boundary certification", () => {
+    const approvedWithdrawal = {
+      id: "wd-1",
+      userId: "user-1",
+      assetNetworkId: "an-1",
+      status: "APPROVED",
+      destinationAddress: "0x000000000000000000000000000000000000dEaD",
+      destinationTag: null,
+      amount: new Prisma.Decimal(100),
+      fee: new Prisma.Decimal(0),
+    };
+
+    it("releases the execution lease back to APPROVED when executor RESOLUTION fails closed (e.g. production with no custody config) — never strands the withdrawal in BROADCASTING", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue(approvedWithdrawal);
+      executorFactory.resolve.mockRejectedValue(new Error("No PRODUCTION_CUSTODY WithdrawalExecutionConfig is set"));
+
+      await expect(service.approve("wd-1", "admin-1")).rejects.toThrow("No PRODUCTION_CUSTODY");
+
+      expect(prisma.withdrawal.updateMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ status: { in: ["BROADCASTING"] } }),
+          data: expect.objectContaining({ status: "APPROVED" }),
+        }),
+      );
+      expect(lastRow?.status).toBe("APPROVED");
+    });
+
+    it("hands the executor the NET amount (amount - fee) — the same figure recordConfirmation later requires on-chain", async () => {
+      prisma.withdrawal.findUnique.mockResolvedValue({ ...approvedWithdrawal, amount: new Prisma.Decimal(100), fee: new Prisma.Decimal("1.5") });
+      const execute = jest.fn().mockResolvedValue({ status: "awaiting_manual_broadcast" });
+      executorFactory.resolve.mockResolvedValue({ execute });
+
+      await service.approve("wd-1", "admin-1");
+
+      expect(execute).toHaveBeenCalledWith(expect.objectContaining({ amount: "98.5", idempotencyKey: "wd-1" }));
+    });
+
+    it("rejects an amount with more decimal places than the asset supports, before compliance or any reservation", async () => {
+      await expect(service.request("user-1", dto({ amount: "1.0000001" }))).rejects.toThrow(BadRequestException);
+      expect(complianceGate.assess).not.toHaveBeenCalled();
+      expect(reservations.reserve).not.toHaveBeenCalled();
+    });
+
+    it("rejects an amount finer than the Decimal(36, 18) column itself (would otherwise be silently rounded, possibly to zero)", async () => {
+      prisma.asset.findUnique.mockResolvedValue({ ...asset, decimals: 18 });
+      await expect(service.request("user-1", dto({ amount: "0.0000000000000000001" }))).rejects.toThrow(BadRequestException);
+      expect(reservations.reserve).not.toHaveBeenCalled();
+    });
+
+    it("accepts an amount at exactly the asset's precision", async () => {
+      await service.request("user-1", dto({ amount: "1.000001" }));
+      expect(reservations.reserve).toHaveBeenCalledWith(prisma, expect.objectContaining({ amount: new Prisma.Decimal("1.000001") }));
+    });
+
+    it("rejects a malformed XRPL destination tag, and accepts a valid UInt32 one", async () => {
+      const xrpl = { id: "network-x", code: "xrpl-testnet", family: "XRPL" };
+      prisma.network.findUnique.mockResolvedValue(xrpl);
+      prisma.assetNetwork.findUnique.mockResolvedValue({ ...assetNetwork, memoRequired: true });
+      // Valid classic address (the XRPL genesis account).
+      const destinationAddress = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+      for (const bad of ["abc", "-1", "4294967296", " 123", "1.5"]) {
+        await expect(service.request("user-1", dto({ destinationAddress, destinationTag: bad }))).rejects.toThrow(BadRequestException);
+      }
+      expect(reservations.reserve).not.toHaveBeenCalled();
+
+      await service.request("user-1", dto({ destinationAddress, destinationTag: "4294967295" }));
+      expect(reservations.reserve).toHaveBeenCalled();
+    });
+
+    it("leaves a durable audit record when compliance BLOCKS a request (no Withdrawal row exists to carry it)", async () => {
+      complianceGate.assess.mockResolvedValue({ decision: "BLOCKED", reason: "high-risk destination", signals: { addressRiskScreeningStatus: "HIGH" } });
+
+      await expect(service.request("user-1", dto())).rejects.toThrow(ForbiddenException);
+
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorId: "user-1",
+          action: "withdrawal.compliance_blocked",
+          reason: "high-risk destination",
+          after: expect.objectContaining({ complianceDecision: "BLOCKED", destinationAddress: "0x000000000000000000000000000000000000dEaD" }),
+        }),
+      );
+      expect(prisma.withdrawal.create).not.toHaveBeenCalled();
+    });
+
+    describe("recordConfirmation — Bitcoin multi-output transactions", () => {
+      const btcDestination = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+      beforeEach(() => {
+        prisma.withdrawal.findUnique.mockResolvedValue({
+          id: "wd-1",
+          status: "CONFIRMING",
+          amount: new Prisma.Decimal("0.5"),
+          fee: new Prisma.Decimal(0),
+          destinationAddress: btcDestination,
+        });
+      });
+
+      it("credits a withdrawal whose transaction also pays a change output — only the output to the recorded destination is compared", async () => {
+        await service.recordConfirmation("wd-1", 6, 6, {
+          amount: "1.7", // 0.5 to the destination + 1.2 change
+          outputs: [
+            { address: btcDestination, amount: "0.5" },
+            { address: "bc1qchangeaddressxxxxxxxxxxxxxxxxxxxxxxxxx", amount: "1.2" },
+          ],
+        });
+
+        expect(ledger.postTransaction).toHaveBeenCalled();
+      });
+
+      it("matches a bech32 destination case-insensitively (uppercase QR form recorded, lowercase observed)", async () => {
+        prisma.withdrawal.findUnique.mockResolvedValue({
+          id: "wd-1",
+          status: "CONFIRMING",
+          amount: new Prisma.Decimal("0.5"),
+          fee: new Prisma.Decimal(0),
+          destinationAddress: btcDestination.toUpperCase(),
+        });
+
+        await service.recordConfirmation("wd-1", 6, 6, { amount: "0.5", outputs: [{ address: btcDestination, amount: "0.5" }] });
+
+        expect(ledger.postTransaction).toHaveBeenCalled();
+      });
+
+      it("refuses to credit when no output pays the recorded destination", async () => {
+        await service.recordConfirmation("wd-1", 6, 6, {
+          amount: "0.5",
+          outputs: [{ address: "bc1qsomeoneelsexxxxxxxxxxxxxxxxxxxxxxxxxxx", amount: "0.5" }],
+        });
+
+        expect(ledger.postTransaction).not.toHaveBeenCalled();
+        expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+        expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "withdrawal.confirmation_mismatch_refused" }));
+      });
+
+      it("refuses to credit when the output to the recorded destination carries the wrong amount", async () => {
+        await service.recordConfirmation("wd-1", 6, 6, {
+          amount: "1.7",
+          outputs: [
+            { address: btcDestination, amount: "0.4" },
+            { address: "bc1qchangeaddressxxxxxxxxxxxxxxxxxxxxxxxxx", amount: "1.3" },
+          ],
+        });
+
+        expect(ledger.postTransaction).not.toHaveBeenCalled();
+      });
     });
   });
 

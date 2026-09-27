@@ -109,7 +109,7 @@ export function WithdrawFlow() {
         networkCode: selectedAssetNetwork.network.code,
         amount,
         destinationAddress,
-        destinationTag: selectedAssetNetwork.memoRequired ? destinationTag : undefined,
+        destinationTag: selectedAssetNetwork.memoRequired ? destinationTag.trim() : undefined,
         clientWithdrawalId,
       },
       { onSuccess: () => setConfirmOpen(false) },

@@ -83,6 +83,25 @@ function assertValidEvmAddress(address: string): void {
   // real decision on adding a Keccak-256 dependency.
 }
 
+// XRPL DestinationTag is an unsigned 32-bit integer.
+const XRPL_MAX_DESTINATION_TAG = 4294967295n;
+
+/**
+ * Phase 34 — format validation for a supplied destination tag/memo.
+ * Only XRPL's is checked: its DestinationTag is a well-defined UInt32, and
+ * anything else ("abc", "-1", "4294967296", " 123") could never be
+ * broadcast as recorded, so it could only strand the withdrawal or be
+ * silently re-typed by whoever broadcasts it. Other families' memo
+ * formats are not defined by this platform yet and are left untouched
+ * rather than guessed at.
+ */
+export function assertValidDestinationTag(family: NetworkFamily, tag: string): void {
+  if (family !== "XRPL") return;
+  if (!/^\d{1,10}$/.test(tag) || BigInt(tag) > XRPL_MAX_DESTINATION_TAG) {
+    throw new BadRequestException("XRPL destination tag must be a whole number between 0 and 4294967295");
+  }
+}
+
 export function assertValidDestinationAddress(family: NetworkFamily, address: string): void {
   if (!address) {
     throw new BadRequestException(`Destination address does not look like a valid ${family} address`);

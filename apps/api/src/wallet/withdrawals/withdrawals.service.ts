@@ -8,13 +8,14 @@ import { createIdempotent } from "../../prisma/idempotent-create.util";
 import { PrismaService } from "../../prisma/prisma.service";
 import { SerializableTransactionRunner } from "../../prisma/serializable-transaction-runner";
 import { CustodyProviderFactory } from "../custody/custody-provider.factory";
+import { ChainTransactionStatus } from "../custody/custody-provider.interface";
 import { WithdrawalExecutorFactory } from "../executors/withdrawal-executor.factory";
 import { LoggingMetricsService, MetricsService } from "../../observability/metrics.service";
 import {
   WITHDRAWAL_COMPLIANCE_GATE,
   WithdrawalComplianceGate,
 } from "./compliance/withdrawal-compliance-gate.interface";
-import { assertValidDestinationAddress } from "./destination-address.validator";
+import { assertValidDestinationAddress, assertValidDestinationTag } from "./destination-address.validator";
 import { RequestWithdrawalDto } from "./dto/request-withdrawal.dto";
 import { WITHDRAWAL_FEE_CALCULATOR, WithdrawalFeeCalculator } from "./fees/withdrawal-fee-calculator.interface";
 
@@ -41,6 +42,9 @@ const RESERVATION_RELEASED_STATUSES = new Set<WithdrawalStatus>([WithdrawalStatu
 // Pure floating/rounding slack, not a real discrepancy allowance — mirrors ReconciliationService's own RECONCILIATION_TOLERANCE.
 const WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE = new Prisma.Decimal("0.000000000000000001");
 
+/** The subset of ChainTransactionStatus the destination/amount mismatch check needs — see findChainMismatch. */
+type ObservedChainTransaction = Pick<ChainTransactionStatus, "amount" | "destinationAddress" | "outputs">;
+
 /**
  * EVM hex addresses are case-insensitive (EIP-55 checksum casing is a
  * display convention, not a distinct address) — compared lowercased.
@@ -52,8 +56,17 @@ function destinationsMatch(observed: string, recorded: string): boolean {
   if (observed.startsWith("0x") && recorded.startsWith("0x")) {
     return observed.toLowerCase() === recorded.toLowerCase();
   }
+  // Phase 34 — bech32/bech32m (BIP-173) addresses are case-insensitive
+  // too (a user may legitimately submit the all-uppercase QR form, while
+  // Esplora always reports lowercase); Base58 legacy/P2SH addresses are
+  // not, and still fall through to the exact comparison below.
+  if (BECH32_BITCOIN_PREFIX.test(observed) && BECH32_BITCOIN_PREFIX.test(recorded)) {
+    return observed.toLowerCase() === recorded.toLowerCase();
+  }
   return observed === recorded;
 }
+
+const BECH32_BITCOIN_PREFIX = /^(bc1|tb1|bcrt1)/i;
 
 /**
  * Requirement #12/#13 ("verify destination/amount where practical") — the
@@ -66,7 +79,7 @@ function destinationsMatch(observed: string, recorded: string): boolean {
  * (recordManualBroadcast/resolveAmbiguousExecution never verify their
  * input on-chain by design) or a provider-side error.
  */
-function findChainMismatch(withdrawal: Withdrawal, chainStatus: { amount: string; destinationAddress?: string }): string | null {
+function findChainMismatch(withdrawal: Withdrawal, chainStatus: ObservedChainTransaction): string | null {
   if (chainStatus.destinationAddress && !destinationsMatch(chainStatus.destinationAddress, withdrawal.destinationAddress)) {
     // Requirement #12/#13: "verify destination where practical". Only
     // checked when the provider actually reports one (EVM/XRP today —
@@ -78,9 +91,23 @@ function findChainMismatch(withdrawal: Withdrawal, chainStatus: { amount: string
   // The amount actually delivered on-chain should equal amount - fee (see
   // request()'s own accounting docblock) — never `amount` alone.
   const expectedNet = withdrawal.amount.minus(withdrawal.fee);
-  const observed = new Prisma.Decimal(chainStatus.amount);
+  let observed = new Prisma.Decimal(chainStatus.amount);
+  if (chainStatus.outputs) {
+    // Phase 34 — Bitcoin: `amount` is the sum of EVERY output, which for
+    // a real UTXO-wallet withdrawal includes the change output back to
+    // the platform's own wallet — comparing it against expectedNet made
+    // every change-bearing BTC withdrawal permanently uncreditable. Only
+    // what was actually paid to this withdrawal's recorded destination
+    // counts, which also gives Bitcoin the destination check it
+    // previously had none of.
+    const paid = chainStatus.outputs.filter((o) => destinationsMatch(o.address, withdrawal.destinationAddress));
+    if (paid.length === 0) {
+      return "The broadcast transaction has no output paying this withdrawal's recorded destination address.";
+    }
+    observed = paid.reduce((sum, o) => sum.plus(o.amount), new Prisma.Decimal(0));
+  }
   if (observed.minus(expectedNet).abs().greaterThan(WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE)) {
-    return `The broadcast transaction's on-chain amount (${chainStatus.amount}) does not match the expected net amount (${expectedNet.toString()}).`;
+    return `The broadcast transaction's on-chain amount (${observed.toString()}) does not match the expected net amount (${expectedNet.toString()}).`;
   }
   return null;
 }
@@ -166,12 +193,26 @@ export class WithdrawalsService {
     if (amount.lessThanOrEqualTo(assetNetwork.withdrawalMinAmount)) {
       throw new BadRequestException(`Amount must be greater than the minimum withdrawal of ${assetNetwork.withdrawalMinAmount}`);
     }
+    // Phase 34 — an amount finer than the asset's own smallest on-chain
+    // unit can never actually be paid out exactly: the broadcast
+    // necessarily sends a rounded amount, recordConfirmation's
+    // destination/amount check (Phase 33) then correctly refuses to
+    // credit it, and the withdrawal is stranded in CONFIRMING with its
+    // reservation held and no mutating recovery path. (Beyond 18 places
+    // it would also be silently rounded by the Decimal(36, 18) column
+    // itself.) Rejected here, before anything is reserved.
+    if (amount.decimalPlaces() > asset.decimals) {
+      throw new BadRequestException(`${asset.symbol} amounts support at most ${asset.decimals} decimal places`);
+    }
 
     if (assetNetwork.memoRequired && !dto.destinationTag) {
       throw new BadRequestException(`${dto.networkCode} requires a destination tag/memo`);
     }
 
     assertValidDestinationAddress(network.family, dto.destinationAddress);
+    if (dto.destinationTag) {
+      assertValidDestinationTag(network.family, dto.destinationTag);
+    }
 
     // Deducted FROM `amount` (never added on top) — see
     // WithdrawalFeeCalculator's docblock. Pure computation, no DB
@@ -204,6 +245,26 @@ export class WithdrawalsService {
       destinationAddress: dto.destinationAddress,
     });
     if (compliance.decision === WithdrawalComplianceDecision.BLOCKED) {
+      // Phase 34 — a BLOCKED request creates no Withdrawal row, so
+      // without this entry a compliance hit left no durable trace at all:
+      // a SUPER_ADMIN reviewing a later, re-submitted request to the same
+      // destination (e.g. one that came back DEFERRED because the
+      // provider errored on the retry) could never see the earlier block.
+      await this.auditLog.record({
+        actorId: userId,
+        actorType: "USER",
+        action: "withdrawal.compliance_blocked",
+        resourceType: "Withdrawal",
+        after: {
+          assetSymbol: asset.symbol,
+          networkCode: network.code,
+          amount: amount.toString(),
+          destinationAddress: dto.destinationAddress,
+          complianceDecision: compliance.decision,
+          complianceSignals: compliance.signals as Prisma.InputJsonValue | undefined,
+        },
+        reason: compliance.reason,
+      });
       throw new ForbiddenException(compliance.reason ?? "This withdrawal was blocked by compliance policy.");
     }
 
@@ -440,16 +501,32 @@ export class WithdrawalsService {
     // exclusive ownership of this transition; a concurrent approve() call
     // would have failed the CAS and never reached here, and reject() is
     // now locked out until this settles (see docblock above).
-    const withdrawal = await this.getOrThrow(withdrawalId);
-    const executor = await this.executorFactory.resolve(withdrawal.assetNetworkId);
+    let withdrawal: Withdrawal;
     let result;
     try {
+      // Phase 34 — executor RESOLUTION is inside this try too, not just
+      // execute(): resolve() throws, by design, for every fail-closed
+      // misconfiguration (production with no PRODUCTION_CUSTODY config, a
+      // provider config disabled mid-incident, an environment mismatch,
+      // an unsupported asset/network). Previously that throw escaped
+      // after the APPROVED -> BROADCASTING lease was already taken,
+      // stranding the withdrawal in BROADCASTING — which reject() cannot
+      // touch — with its reservation held and no recovery path short of a
+      // manual DB edit. No executor has been called at that point, so
+      // releasing the lease is unambiguously safe.
+      withdrawal = await this.getOrThrow(withdrawalId);
+      const executor = await this.executorFactory.resolve(withdrawal.assetNetworkId);
       result = await executor.execute({
         withdrawalId: withdrawal.id,
         assetNetworkId: withdrawal.assetNetworkId,
         destinationAddress: withdrawal.destinationAddress,
         destinationTag: withdrawal.destinationTag,
-        amount: withdrawal.amount.toString(),
+        // Phase 34 — the NET amount (amount - fee): the fee is deducted
+        // from what is sent, never added on top (see request()), and
+        // net is exactly what findChainMismatch() later requires the
+        // chain to show before crediting. Identical to `amount` while
+        // ZeroWithdrawalFeeCalculator is in use.
+        amount: withdrawal.amount.minus(withdrawal.fee).toString(),
         idempotencyKey: withdrawal.id,
       });
     } catch (err) {
@@ -770,7 +847,7 @@ export class WithdrawalsService {
     withdrawalId: string,
     confirmations: number,
     requiredConfirmations: number,
-    observedChain?: { amount: string; destinationAddress?: string },
+    observedChain?: ObservedChainTransaction,
   ) {
     if (confirmations < requiredConfirmations) {
       return this.txRunner.run(async (tx) => {

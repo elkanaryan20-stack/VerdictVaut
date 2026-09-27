@@ -1,15 +1,19 @@
-import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, InternalServerErrorException, NotFoundException } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
 import { InsufficientBalanceError } from "../../src/ledger/ledger.errors";
 import { CustodyProvider } from "../../src/wallet/custody/custody-provider.interface";
 import { AuditLogService } from "../../src/audit/audit-log.service";
 import { DeferredComplianceGate } from "../../src/wallet/withdrawals/compliance/deferred-compliance-gate";
+import { ManualBroadcastExecutor } from "../../src/wallet/executors/manual-broadcast.executor";
+import { ProductionCustodyExecutor } from "../../src/wallet/executors/production-custody.executor";
+import { WithdrawalExecutorFactory } from "../../src/wallet/executors/withdrawal-executor.factory";
 import { ZeroWithdrawalFeeCalculator } from "../../src/wallet/withdrawals/fees/zero-withdrawal-fee.calculator";
 import {
   auditLog,
   createTestSuperAdmin,
   createTestUser,
   executorFactory,
+  fireblocksCustodyAdapter,
   fundUserForTest,
   getUserAccount,
   ledger,
@@ -532,6 +536,88 @@ describe("Withdrawal state machine (real Postgres)", () => {
 
       const report = await reconcilingService.reconcile(withdrawal.id, admin.id);
       expect(report.discrepancy).toBe(false);
+    });
+  });
+
+  describe("Phase 34 — withdrawal/custody boundary certification", () => {
+    it("a fail-closed executor RESOLUTION (production, no PRODUCTION_CUSTODY config) releases the execution lease — reject() still reachable, reservation released exactly once", async () => {
+      const user = await createTestUser();
+      const admin = await createTestSuperAdmin();
+      await fundUserForTest(user.id, "USDC", "1000");
+      const withdrawal = await requestWithdrawal(user.id, "300");
+
+      // The REAL factory, as a production process would run it — no config
+      // stubbing: this asset/network simply has no PRODUCTION_CUSTODY row.
+      const productionFactory = new WithdrawalExecutorFactory(
+        prisma,
+        { get: () => "production" } as never,
+        new ManualBroadcastExecutor(),
+        new ProductionCustodyExecutor(),
+        fireblocksCustodyAdapter,
+      );
+      const productionService = new WithdrawalsService(
+        prisma,
+        ledger,
+        reservations,
+        productionFactory,
+        { resolve: async () => ({}) } as never,
+        txRunner,
+        auditLog,
+        new ZeroWithdrawalFeeCalculator(),
+        new DeferredComplianceGate(),
+      );
+
+      await expect(productionService.approve(withdrawal.id, admin.id)).rejects.toThrow(InternalServerErrorException);
+
+      const afterFailedApprove = await prisma.withdrawal.findUniqueOrThrow({ where: { id: withdrawal.id } });
+      expect(afterFailedApprove.status).toBe("APPROVED"); // never stranded in BROADCASTING
+      expect((await getUserAccount(user.id, "USDC"))?.reservedBalance.toString()).toBe("300");
+
+      const rejected = await productionService.reject(withdrawal.id, "no production custody configured", admin.id);
+      expect(rejected.status).toBe("REJECTED");
+      const account = await getUserAccount(user.id, "USDC");
+      expect(account?.reservedBalance.toString()).toBe("0");
+      expect(account?.cachedBalance.toString()).toBe("1000");
+    });
+
+    it("rejects an amount finer than the asset's on-chain precision (USDC: 6 places) before reserving anything", async () => {
+      const user = await createTestUser();
+      await fundUserForTest(user.id, "USDC", "1000");
+
+      await expect(requestWithdrawal(user.id, "1.0000001")).rejects.toThrow(BadRequestException);
+      expect((await getUserAccount(user.id, "USDC"))?.reservedBalance.toString()).toBe("0");
+
+      const exact = await requestWithdrawal(user.id, "1.000001");
+      expect(exact.amount.toString()).toBe("1.000001");
+    });
+
+    it("records a durable audit entry for a compliance-BLOCKED request", async () => {
+      const user = await createTestUser();
+      await fundUserForTest(user.id, "USDC", "1000");
+      const blockedService = new WithdrawalsService(
+        prisma,
+        ledger,
+        reservations,
+        executorFactory,
+        { resolve: async () => ({}) } as never,
+        txRunner,
+        auditLog,
+        new ZeroWithdrawalFeeCalculator(),
+        { assess: async () => ({ decision: "BLOCKED" as const, reason: "sanctioned destination" }) } as never,
+      );
+
+      await expect(
+        blockedService.request(user.id, {
+          assetSymbol: "USDC",
+          networkCode: "ethereum-sepolia",
+          amount: "100",
+          destinationAddress: "0x000000000000000000000000000000000000dEaD",
+        } as never),
+      ).rejects.toThrow(ForbiddenException);
+
+      const entries = await prisma.auditLog.findMany({ where: { actorId: user.id, action: "withdrawal.compliance_blocked" } });
+      expect(entries).toHaveLength(1);
+      expect(entries[0].reason).toBe("sanctioned destination");
     });
   });
 });

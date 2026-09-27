@@ -40,6 +40,20 @@ export interface ChainTransactionStatus {
    * oversight.
    */
   destinationAddress?: string;
+  /**
+   * Phase 34 — per-output breakdown, for chains whose transactions pay
+   * several outputs (Bitcoin: the recipient plus, almost always, a change
+   * output back to the sender). `amount` above stays the sum of every
+   * output; this is what lets a caller verify how much was actually paid
+   * to ONE specific address. Outputs with no decodable address (e.g.
+   * OP_RETURN) are omitted. Undefined for single-recipient chains.
+   */
+  outputs?: ChainTransactionOutput[];
+}
+
+export interface ChainTransactionOutput {
+  address: string;
+  amount: string;
 }
 
 export interface CustodyProvider {
