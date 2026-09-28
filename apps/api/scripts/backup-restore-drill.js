@@ -267,6 +267,17 @@ async function main() {
     },
   });
 
+  // Phase 39 — two more table categories whose loss would matter after a
+  // restore: the audit trail (forensics) and worker job state (Phase 35
+  // leases/heartbeats — a restore that dropped it would make every
+  // scheduled job due at once, harmless but worth proving restored).
+  const auditRow = await primaryPrisma.auditLog.create({
+    data: { actorType: "SYSTEM", action: "backup_drill.sample", resourceType: "Withdrawal", resourceId: withdrawal.id, after: { marker } },
+  });
+  const jobStateRow = await primaryPrisma.scheduledJobState.create({
+    data: { jobKey: `drill-job:${marker}`, lastStartedAt: new Date(), lastSuccessAt: new Date(), lastSummary: "drill" },
+  });
+
   const migrationCountBefore = await primaryPrisma.$queryRawUnsafe('SELECT count(*)::int AS count FROM "_prisma_migrations" WHERE finished_at IS NOT NULL');
   await primaryPrisma.$disconnect();
 
@@ -332,6 +343,12 @@ async function main() {
 
     const restoredDiscrepancy = await restoredPrisma.reconciliationDiscrepancy.findUnique({ where: { id: discrepancy.id } });
     check("restored ReconciliationDiscrepancy recovered with matching chainIdentity", restoredDiscrepancy?.chainIdentity === `drill:${marker}`);
+
+    const restoredAudit = await restoredPrisma.auditLog.findUnique({ where: { id: auditRow.id } });
+    check("restored AuditLog row recovered with matching action and target", restoredAudit?.action === "backup_drill.sample" && restoredAudit?.resourceId === withdrawal.id);
+
+    const restoredJob = await restoredPrisma.scheduledJobState.findUnique({ where: { jobKey: jobStateRow.jobKey } });
+    check("restored ScheduledJobState recovered with its lastSuccessAt", restoredJob?.lastSuccessAt?.getTime() === jobStateRow.lastSuccessAt.getTime());
 
     const migrationCountAfter = await restoredPrisma.$queryRawUnsafe(
       'SELECT count(*)::int AS count FROM "_prisma_migrations" WHERE finished_at IS NOT NULL',

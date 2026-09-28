@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { MarketStatus } from "@prisma/client";
 import { AuditLogService } from "../audit/audit-log.service";
+import { isUniqueConstraintViolation } from "../prisma/idempotent-create.util";
 import { PrismaService } from "../prisma/prisma.service";
 import { SerializableTransactionRunner } from "../prisma/serializable-transaction-runner";
 import { OrdersService } from "../trading/orders.service";
@@ -56,6 +57,39 @@ export class MarketsService {
 
   async listCategories() {
     return this.prisma.marketCategory.findMany({ orderBy: { name: "asc" } });
+  }
+
+  /**
+   * Phase 39 — found by the clean-bootstrap release-candidate simulation:
+   * create() requires an existing category, but nothing outside tests ever
+   * created one (no seed, no endpoint), so a freshly deployed platform could
+   * not create a single market without direct database access. Platform
+   * reference data like asset/network configuration: SUPER_ADMIN-only at
+   * the route, audited here. No category names are predefined — that
+   * taxonomy is the operator's choice, not something code should invent.
+   */
+  async createCategory(dto: { slug: string; name: string }, adminId: string) {
+    const existing = await this.prisma.marketCategory.findUnique({ where: { slug: dto.slug } });
+    if (existing) {
+      throw new ConflictException(`Category '${dto.slug}' already exists`);
+    }
+    let category;
+    try {
+      category = await this.prisma.marketCategory.create({ data: { slug: dto.slug, name: dto.name } });
+    } catch (error) {
+      if (isUniqueConstraintViolation(error, "slug")) {
+        throw new ConflictException(`Category '${dto.slug}' already exists`);
+      }
+      throw error;
+    }
+    await this.auditLog.record({
+      actorId: adminId,
+      action: "market_category.create",
+      resourceType: "MarketCategory",
+      resourceId: category.id,
+      after: { slug: category.slug, name: category.name },
+    });
+    return category;
   }
 
   async create(dto: CreateMarketDto, createdById: string) {

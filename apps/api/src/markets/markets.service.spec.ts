@@ -8,7 +8,7 @@ import { MarketsService } from "./markets.service";
 describe("MarketsService", () => {
   let service: MarketsService;
   let prisma: {
-    marketCategory: { findUnique: jest.Mock };
+    marketCategory: { findUnique: jest.Mock; create: jest.Mock };
     market: { create: jest.Mock; findUnique: jest.Mock; updateMany: jest.Mock; findUniqueOrThrow: jest.Mock; findMany: jest.Mock };
   };
   let txRunner: { run: jest.Mock };
@@ -17,7 +17,7 @@ describe("MarketsService", () => {
 
   beforeEach(() => {
     prisma = {
-      marketCategory: { findUnique: jest.fn() },
+      marketCategory: { findUnique: jest.fn(), create: jest.fn() },
       market: {
         create: jest.fn(),
         findUnique: jest.fn(),
@@ -253,6 +253,27 @@ describe("MarketsService", () => {
       prisma.market.updateMany.mockResolvedValue({ count: 0 });
       await expect(service.cancel("market-1", "admin-1")).rejects.toThrow(ConflictException);
       expect(ordersService.expireRestingOrdersForMarket).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("createCategory (Phase 39 — clean-bootstrap gap)", () => {
+    it("creates the category and records who created it", async () => {
+      prisma.marketCategory.findUnique.mockResolvedValue(null);
+      prisma.marketCategory.create.mockResolvedValue({ id: "cat-1", slug: "politics", name: "Politics" });
+
+      const created = await service.createCategory({ slug: "politics", name: "Politics" }, "admin-1");
+
+      expect(created.id).toBe("cat-1");
+      expect(auditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({ actorId: "admin-1", action: "market_category.create", resourceId: "cat-1", after: { slug: "politics", name: "Politics" } }),
+      );
+    });
+
+    it("rejects a duplicate slug with 409 and writes nothing", async () => {
+      prisma.marketCategory.findUnique.mockResolvedValue({ id: "cat-1", slug: "politics" });
+      await expect(service.createCategory({ slug: "politics", name: "Politics" }, "admin-1")).rejects.toThrow(ConflictException);
+      expect(prisma.marketCategory.create).not.toHaveBeenCalled();
+      expect(auditLog.record).not.toHaveBeenCalled();
     });
   });
 });

@@ -7,6 +7,7 @@ import { Roles } from "../common/decorators/roles.decorator";
 import { RolesGuard } from "../common/guards/roles.guard";
 import { ADMIN_MUTATION_THROTTLE } from "../common/throttle-presets";
 import { SettlementService } from "../settlement/settlement.service";
+import { CreateMarketCategoryDto } from "./dto/create-market-category.dto";
 import { CreateMarketDto } from "./dto/create-market.dto";
 import { MarketsService } from "./markets.service";
 import { ResolveMarketDto } from "./resolution/dto/resolve-market.dto";
@@ -37,6 +38,17 @@ export class MarketsController {
   @Get("categories")
   categories() {
     return this.marketsService.listCategories();
+  }
+
+  // Phase 39 — the only way to create the reference data market creation
+  // requires (see MarketsService.createCategory). Registered before ":slug"
+  // routes; POST so there is no collision with GET ":slug" anyway.
+  @Post("categories")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN)
+  @Throttle(ADMIN_MUTATION_THROTTLE)
+  createCategory(@Body() dto: CreateMarketCategoryDto, @CurrentUser() user: AuthenticatedUser) {
+    return this.marketsService.createCategory(dto, user.id);
   }
 
   @Get(":slug")
