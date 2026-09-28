@@ -14,6 +14,7 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:integration": "jest --config jest-integration.config.js --runInBand --forceExit",
+    "perf": "jest --config jest-perf.config.js --runInBand --forceExit",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "node scripts/guard-destructive-migration.js && prisma migrate dev",
     "prisma:migrate:deploy": "prisma migrate deploy",

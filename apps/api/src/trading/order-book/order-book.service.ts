@@ -33,18 +33,24 @@ export class OrderBookService {
       throw new NotFoundException("Outcome does not belong to this market");
     }
 
-    const restingOrders = await this.prisma.order.findMany({
+    // Phase 38 — aggregated in SQL (one row per side+price level) instead of
+    // loading every resting order and summing in JS. Same result; measured
+    // p50 181ms at 4,000 resting orders before (test/perf/data-volume.perf-spec.ts),
+    // on a PUBLIC, unauthenticated endpoint whose response is only ever the levels.
+    const grouped = await this.prisma.order.groupBy({
+      by: ["side", "price"],
       where: {
         marketId,
         outcomeId,
         status: { in: [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED] },
         price: { not: null },
       },
-      select: { side: true, price: true, remainingQuantity: true },
+      _sum: { remainingQuantity: true },
     });
+    const restingLevels = grouped.map((g) => ({ side: g.side, price: g.price, remainingQuantity: g._sum.remainingQuantity ?? new Prisma.Decimal(0) }));
 
-    const bidLevels = aggregateLevels(restingOrders.filter((o) => o.side === OrderSide.BUY));
-    const askLevels = aggregateLevels(restingOrders.filter((o) => o.side === OrderSide.SELL));
+    const bidLevels = aggregateLevels(restingLevels.filter((o) => o.side === OrderSide.BUY));
+    const askLevels = aggregateLevels(restingLevels.filter((o) => o.side === OrderSide.SELL));
 
     return {
       marketId,
@@ -77,14 +83,27 @@ export class OrderBookService {
    * guessing at a cap now — tracked as a future performance task, not a
    * known defect.
    */
-  async getRestingCandidates(marketId: string, outcomeId: string, side: OrderSide): Promise<MatchCandidate[]> {
+  /**
+   * `crossingBound` (Phase 38, optional) restricts the load to orders that
+   * can actually cross — both matching engines sort by price-time priority
+   * and stop at the first non-crossing price, so rows beyond the bound are
+   * never used. Without it, every incoming order loaded the ENTIRE opposite
+   * side of the book (measured: p50 220ms at 4,000 resting orders), and
+   * that cost now sits inside the per-market execution queue.
+   */
+  async getRestingCandidates(
+    marketId: string,
+    outcomeId: string,
+    side: OrderSide,
+    crossingBound?: { gte?: Prisma.Decimal; lte?: Prisma.Decimal },
+  ): Promise<MatchCandidate[]> {
     const orders = await this.prisma.order.findMany({
       where: {
         marketId,
         outcomeId,
         side,
         status: { in: [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED] },
-        price: { not: null },
+        price: crossingBound ? { not: null, ...crossingBound } : { not: null },
       },
       select: { id: true, userId: true, side: true, price: true, remainingQuantity: true, sequence: true },
       orderBy: [{ price: side === OrderSide.SELL ? "asc" : "desc" }, { sequence: "asc" }],

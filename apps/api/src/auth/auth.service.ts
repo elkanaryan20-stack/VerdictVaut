@@ -10,7 +10,7 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
 import { AuditActorType, User, UserStatus } from "@prisma/client";
-import * as bcrypt from "bcryptjs";
+import { comparePassword, hashPassword } from "./password-hasher";
 import * as crypto from "crypto";
 import { AuditLogService } from "../audit/audit-log.service";
 import { AppConfig } from "../config/configuration";
@@ -98,7 +98,7 @@ export class AuthService {
       throw new ConflictException("Email is already registered");
     }
 
-    const passwordHash = await bcrypt.hash(dto.password, PASSWORD_SALT_ROUNDS);
+    const passwordHash = await hashPassword(dto.password, PASSWORD_SALT_ROUNDS);
     const rawVerificationToken = crypto.randomBytes(32).toString("hex");
     const user = await this.prisma.user.create({
       data: {
@@ -290,7 +290,7 @@ export class AuthService {
     // must not tell an attacker whether the account is currently
     // throttled or whether their guessed password happened to be right.
     // A locked account rejects the request regardless of the outcome.
-    const passwordValid = await bcrypt.compare(dto.password, user.passwordHash);
+    const passwordValid = await comparePassword(dto.password, user.passwordHash);
     const locked = isCurrentlyLocked(user.lockedUntil);
 
     if (locked) {
@@ -497,12 +497,12 @@ export class AuthService {
   async changePassword(userId: string, dto: ChangePasswordDto): Promise<void> {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
 
-    const currentPasswordValid = await bcrypt.compare(dto.currentPassword, user.passwordHash);
+    const currentPasswordValid = await comparePassword(dto.currentPassword, user.passwordHash);
     if (!currentPasswordValid) {
       throw new ForbiddenException("Current password is incorrect");
     }
 
-    const passwordHash = await bcrypt.hash(dto.newPassword, PASSWORD_SALT_ROUNDS);
+    const passwordHash = await hashPassword(dto.newPassword, PASSWORD_SALT_ROUNDS);
     await this.prisma.user.update({ where: { id: userId }, data: { passwordHash } });
     await this.prisma.refreshToken.updateMany({
       where: { userId, revokedAt: null },

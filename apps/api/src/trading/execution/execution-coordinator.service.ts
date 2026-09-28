@@ -9,6 +9,7 @@ import { COMPLETE_SET_MINT_ENGINE, CompleteSetMintEngine, MintInstruction } from
 import { FEE_CALCULATOR, FeeCalculator } from "../fees/fee-calculator.interface";
 import { ExecutionInstruction, MATCHING_ENGINE, MatchCandidate, MatchingEngine } from "../matching/matching-engine.interface";
 import { OrderBookService } from "../order-book/order-book.service";
+import { KeyedSerialQueue } from "./keyed-serial-queue";
 import { PositionReservationService } from "../positions/position-reservation.service";
 
 /**
@@ -42,6 +43,9 @@ import { PositionReservationService } from "../positions/position-reservation.se
 @Injectable()
 export class ExecutionCoordinator {
   private readonly logger = new Logger(ExecutionCoordinator.name);
+  // Phase 38 — one execution at a time per market in this process (see
+  // KeyedSerialQueue). Correctness never depends on it; contention does.
+  private readonly marketQueue = new KeyedSerialQueue();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -63,6 +67,11 @@ export class ExecutionCoordinator {
    * error) — callers do not need to pre-check.
    */
   async matchAndExecute(orderId: string): Promise<Fill[]> {
+    const { marketId } = await this.prisma.order.findUniqueOrThrow({ where: { id: orderId }, select: { marketId: true } });
+    return this.marketQueue.run(marketId, () => this.matchAndExecuteExclusive(orderId));
+  }
+
+  private async matchAndExecuteExclusive(orderId: string): Promise<Fill[]> {
     const incomingOrder = await this.prisma.order.findUniqueOrThrow({ where: { id: orderId } });
     if (incomingOrder.status !== OrderStatus.OPEN && incomingOrder.status !== OrderStatus.PARTIALLY_FILLED) {
       return [];
@@ -79,10 +88,13 @@ export class ExecutionCoordinator {
     }
 
     const oppositeSide = incomingOrder.side === "BUY" ? "SELL" : "BUY";
+    // Phase 38 — only prices that can cross (see getRestingCandidates): an
+    // incoming BUY at p can only take SELLs priced <= p, a SELL only BUYs >= p.
     const restingCandidates = await this.orderBook.getRestingCandidates(
       incomingOrder.marketId,
       incomingOrder.outcomeId,
       oppositeSide,
+      incomingOrder.side === "BUY" ? { lte: incomingOrder.price } : { gte: incomingOrder.price },
     );
 
     const incomingCandidate: MatchCandidate = {
@@ -146,7 +158,11 @@ export class ExecutionCoordinator {
       return [];
     }
 
-    const restingComplementary = await this.orderBook.getRestingCandidates(marketId, complementaryOutcome.id, "BUY");
+    // Phase 38 — a complete set only mints when the two prices sum to >= 1
+    // (CompleteSetMintEngine), so only complementary bids >= 1 - p can pair.
+    const restingComplementary = await this.orderBook.getRestingCandidates(marketId, complementaryOutcome.id, "BUY", {
+      gte: new Prisma.Decimal(1).minus(current.price),
+    });
     const incomingCandidate: MatchCandidate = {
       orderId: current.id,
       userId: current.userId,

@@ -562,6 +562,12 @@ model Fill {
   @@index([sellOrderId])
   @@index([makerOrderId])
   @@index([takerOrderId])
+  // Phase 38 — per-user fill history (FillsService.listMine: buyer OR seller,
+  // newest first). Without these every "my fills" page + count was a full
+  // scan of the platform-wide fills table (EXPLAIN: 200k rows scanned to
+  // return 20). Postgres combines the two with a BitmapOr.
+  @@index([buyerUserId, executedAt])
+  @@index([sellerUserId, executedAt])
   @@map("fills")
 }
 
@@ -1450,6 +1456,7 @@ model AuditLog {
   @@index([resourceType, resourceId])
   @@index([actorId, createdAt])
   @@index([idempotencyKey])
+// Phase 38 — AuditLogService.list orders by createdAt DESC (LIMIT 200); an  // ever-growing table otherwise needs a full scan + sort per admin page load.  @@index([createdAt])
   @@map("audit_logs")
 }
 

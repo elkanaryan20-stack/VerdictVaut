@@ -1,6 +1,7 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
 import { StaleSnapshotConflictError } from "./idempotent-create.util";
+import { LoggingMetricsService, MetricsService } from "../observability/metrics.service";
 import { PrismaService } from "./prisma.service";
 
 const SERIALIZATION_FAILURE_SQLSTATE = "40001";
@@ -24,6 +25,29 @@ function isSerializationFailure(error: unknown): boolean {
       error.code === "P2034" ||
       (error.meta as { code?: string } | undefined)?.code === SERIALIZATION_FAILURE_SQLSTATE
     );
+  }
+  return false;
+}
+
+const DEADLOCK_SQLSTATE = "40P01";
+
+/**
+ * Phase 38 — a detected deadlock (40P01) aborts the victim transaction
+ * in full, exactly like a serialization failure: nothing it did is kept,
+ * so re-running the whole callback is equally safe. Measured under a
+ * hot-market load (test/perf/trading.perf-spec.ts), deadlocks between
+ * executions locking the same ledger accounts in opposite orders reached
+ * the caller un-retried — ~2% of orders were funded but left unmatched
+ * (MatchingAttemptFailedException) — because Prisma surfaces 40P01 as a
+ * PrismaClientUnknownRequestError carrying only the message, which the
+ * check above never recognized.
+ */
+function isDeadlock(error: unknown): boolean {
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    return (error.meta as { code?: string } | undefined)?.code === DEADLOCK_SQLSTATE;
+  }
+  if (error instanceof Prisma.PrismaClientUnknownRequestError) {
+    return error.message.includes(DEADLOCK_SQLSTATE) || /deadlock detected/i.test(error.message);
   }
   return false;
 }
@@ -65,7 +89,12 @@ function backoffDelay(attempt: number): number {
 export class SerializableTransactionRunner {
   private readonly logger = new Logger(SerializableTransactionRunner.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Phase 38 — optional so the many direct `new SerializableTransactionRunner(prisma)`
+    // call sites (tests, scripts) are unaffected; injected in the real app.
+    @Optional() private readonly metrics: MetricsService = new LoggingMetricsService(),
+  ) {}
 
   async run<T>(
     fn: (tx: Prisma.TransactionClient) => Promise<T>,
@@ -81,13 +110,21 @@ export class SerializableTransactionRunner {
           timeout: 10000,
         });
       } catch (error) {
-        if (isSerializationFailure(error) && attempt < maxAttempts) {
+        const deadlock = isDeadlock(error);
+        const retryable = deadlock || isSerializationFailure(error);
+        if (retryable && attempt < maxAttempts) {
           const delay = backoffDelay(attempt);
+          this.metrics.increment("db.transaction.retry", { reason: deadlock ? "deadlock" : "serialization" });
           this.logger.warn(
-            `Serialization failure on attempt ${attempt}/${maxAttempts} — retrying in ${delay.toFixed(0)}ms.`,
+            `${deadlock ? "Deadlock" : "Serialization failure"} on attempt ${attempt}/${maxAttempts} — retrying in ${delay.toFixed(0)}ms.`,
           );
           await sleep(delay);
           continue;
+        }
+        if (retryable) {
+          // Phase 38 — out of attempts under sustained contention: surfaced
+          // as its own signal (the caller only sees the final error).
+          this.metrics.increment("db.transaction.retries_exhausted", { reason: deadlock ? "deadlock" : "serialization" });
         }
         throw error;
       }
