@@ -57,6 +57,12 @@ class EnvironmentVariables {
   @IsOptional()
   ALLOW_WATCHERS_IN_API_PROCESS: string = "false";
 
+  // Phase 37 — see config/trust-proxy.ts. 1 behind the ALB; 0 when exposed directly.
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  TRUST_PROXY_HOPS: number = 0;
+
   // Phase 35 — see configuration.ts's reconciliationScheduler docblock.
   @IsOptional()
   RECONCILIATION_SCHEDULER_ENABLED: string = "false";
@@ -161,6 +167,16 @@ export function validateEnv(config: Record<string, unknown>) {
         .map((e) => `  - ${e.property}: ${Object.values(e.constraints ?? {}).join(", ")}`)
         .join("\n")}`,
     );
+  }
+
+  // Phase 37 — access and refresh tokens carry identical claims
+  // ({sub, email, role}); the ONLY thing stopping a refresh token from
+  // being accepted as an access token by JwtStrategy is that it is signed
+  // with a different key. With equal secrets, a 7-day refresh token —
+  // including one already revoked in the database, which JwtStrategy never
+  // consults — would work as a bearer credential against every API route.
+  if (validated.JWT_ACCESS_SECRET === validated.JWT_REFRESH_SECRET) {
+    throw new Error("Invalid environment configuration:\n  - JWT_REFRESH_SECRET must differ from JWT_ACCESS_SECRET");
   }
 
   if (validated.APP_ENVIRONMENT === "production") {

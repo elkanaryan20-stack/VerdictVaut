@@ -33,6 +33,8 @@ export interface AppConfig {
   // explicit escape hatch for a deliberate single-process deployment
   // (e.g. a small self-hosted install), never a silent default.
   allowWatchersInApiProcess: boolean;
+  // Phase 37 — reverse-proxy hops in front of the API (config/trust-proxy.ts).
+  trustProxyHops: number;
   // Phase 35 — periodic, read-only reconciliation (independent chain
   // rescan per active asset/network + market collateral check), run in
   // the worker process under a cross-instance lease (see
@@ -95,6 +97,7 @@ export default (): AppConfig => ({
     pollIntervalMs: parseInt(process.env.WITHDRAWAL_WATCHER_POLL_INTERVAL_MS ?? "30000", 10),
   },
   allowWatchersInApiProcess: process.env.ALLOW_WATCHERS_IN_API_PROCESS === "true",
+  trustProxyHops: parseInt(process.env.TRUST_PROXY_HOPS ?? "0", 10),
   reconciliationScheduler: {
     enabled: process.env.RECONCILIATION_SCHEDULER_ENABLED === "true",
     intervalMs: parseInt(process.env.RECONCILIATION_SCHEDULER_INTERVAL_MS ?? "3600000", 10),

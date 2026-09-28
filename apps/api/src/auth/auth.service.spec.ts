@@ -358,15 +358,43 @@ describe("AuthService", () => {
         revokedAt: null,
       });
       prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", role: "USER", status: "ACTIVE" });
-      prisma.refreshToken.update.mockResolvedValue({});
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
       prisma.refreshToken.create.mockResolvedValue({});
 
       await service.refresh("valid.jwt.token");
 
-      expect(prisma.refreshToken.update).toHaveBeenCalledWith({
-        where: { id: "stored-token-1" },
+      // Phase 37 — a compare-and-swap on revokedAt: null, not a blind update.
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { id: "stored-token-1", revokedAt: null },
         data: { revokedAt: expect.any(Date) },
       });
+      expect(prisma.refreshToken.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("Phase 37: a caller that LOSES the rotation race to a concurrent presentation of the same token gets 401 and mints nothing", async () => {
+      jwt.verifyAsync.mockResolvedValue({ sub: "user-1" });
+      prisma.refreshToken.findFirst.mockResolvedValue({ id: "stored-token-1", expiresAt: new Date(Date.now() + 1_000_000), revokedAt: null });
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", role: "USER", status: "ACTIVE" });
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 0 }); // another request already rotated it
+
+      await expect(service.refresh("valid.jwt.token")).rejects.toThrow(UnauthorizedException);
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+      expect(jwt.signAsync).not.toHaveBeenCalled();
+    });
+
+    it("Phase 37: every issued token carries a unique jwtid, so two tokens minted in the same second never collide", async () => {
+      jwt.verifyAsync.mockResolvedValue({ sub: "user-1" });
+      prisma.refreshToken.findFirst.mockResolvedValue({ id: "stored-token-1", expiresAt: new Date(Date.now() + 1_000_000), revokedAt: null });
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", role: "USER", status: "ACTIVE" });
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      prisma.refreshToken.create.mockResolvedValue({});
+
+      await service.refresh("valid.jwt.token");
+
+      const jwtids = jwt.signAsync.mock.calls.map(([, options]) => (options as { jwtid?: string }).jwtid);
+      expect(jwtids).toHaveLength(2);
+      expect(jwtids.every((id) => typeof id === "string" && id.length > 0)).toBe(true);
+      expect(new Set(jwtids).size).toBe(2);
     });
   });
 

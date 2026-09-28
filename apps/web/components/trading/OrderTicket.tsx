@@ -14,6 +14,7 @@ import { Button } from "../ui/Button";
 import { Card, CardBody, CardHeader, CardTitle } from "../ui/Card";
 import { TextField } from "../ui/TextField";
 import { OrderStatusBadge } from "./OrderStatusBadge";
+import { decimalPlaces } from "../../lib/wallet/decimal";
 
 const DECIMAL_STRING = /^\d+(\.\d+)?$/;
 
@@ -29,6 +30,9 @@ function validatePrice(value: string): string | null {
   const basic = validatePositiveDecimal(value, "Price");
   if (basic) return basic;
   if (Number(value) >= 1) return "Price must be less than 1.";
+  // Phase 37 — mirrors OrdersService: prices are stored with 6 decimals, and a
+  // finer price is rejected server-side (it used to be silently rounded).
+  if (decimalPlaces(value) > 6) return "Price supports at most 6 decimal places.";
   return null;
 }
 

@@ -15,6 +15,19 @@ import { MatchingAttemptFailedException } from "./trading.errors";
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
 
+// Phase 37 — the scales of the columns these values are stored in
+// (Order.price Decimal(18, 6); Order.quantity/filled/remaining and every
+// ledger/reservation amount Decimal(36, 18)). Validation below runs on
+// the exact submitted value, but Postgres ROUNDS anything finer on write:
+// a BUY at 0.4999996 was stored at 0.500000 while its funds were reserved
+// at 0.4999996 × quantity, so crossing it needed more than was reserved,
+// the consume failed closed, and every crossing SELL on that outcome
+// failed to match — any user could freeze a book for near-zero cost.
+// Rejecting over-precise input keeps the validated value and the stored
+// value identical. Not a pricing policy: it is the storage precision.
+const ORDER_PRICE_MAX_DECIMALS = 6;
+const ORDER_QUANTITY_MAX_DECIMALS = 18;
+
 /**
  * Client-safe projection of an Order row. Deliberately omits `sequence`:
  * it's a raw `bigint` (Prisma's native representation, not a Decimal),
@@ -176,6 +189,9 @@ export class OrdersService {
     if (quantity.lessThanOrEqualTo(0)) {
       throw new BadRequestException("quantity must be greater than zero");
     }
+    if (quantity.decimalPlaces() > ORDER_QUANTITY_MAX_DECIMALS) {
+      throw new BadRequestException(`quantity supports at most ${ORDER_QUANTITY_MAX_DECIMALS} decimal places`);
+    }
 
     if (!dto.price) {
       throw new BadRequestException("price is required for LIMIT orders");
@@ -183,6 +199,9 @@ export class OrdersService {
     const price = new Prisma.Decimal(dto.price);
     if (price.lessThanOrEqualTo(0) || price.greaterThanOrEqualTo(1)) {
       throw new BadRequestException("price must be a probability strictly between 0 and 1");
+    }
+    if (price.decimalPlaces() > ORDER_PRICE_MAX_DECIMALS) {
+      throw new BadRequestException(`price supports at most ${ORDER_PRICE_MAX_DECIMALS} decimal places`);
     }
 
     const clientOrderId = dto.clientOrderId ?? crypto.randomUUID();

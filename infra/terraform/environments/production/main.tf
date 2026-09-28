@@ -188,6 +188,7 @@ module "api_service" {
     PORT                       = "4000"
     APP_ENVIRONMENT            = "production"
     CORS_ALLOWED_ORIGINS       = var.cors_allowed_origins
+    TRUST_PROXY_HOPS           = "1" # Phase 37 — exactly one ALB in front of the API; per-client throttles depend on it (apps/api/src/config/trust-proxy.ts)
     CHAIN_WATCHER_ENABLED      = "false" # the worker service runs watchers — watcher-boundary.guard.ts enforces this at the code level too
     WITHDRAWAL_WATCHER_ENABLED = "false"
     EMAIL_PROVIDER             = "postmark"

@@ -196,4 +196,14 @@ describe("OrderTicket", () => {
     const secondId = mockedTradingApi.placeOrder.mock.calls[1][0].clientOrderId;
     expect(secondId).not.toBe(firstId);
   });
+
+  it("Phase 37: rejects a price with more than 6 decimals locally (the backend now rejects it instead of silently rounding)", async () => {
+    mockedTradingApi.placeOrder.mockClear();
+    renderWithQueryClient(<OrderTicket market={market} outcome={outcome} position={null} />);
+    const { user, submit } = await fillAndGetSubmit("0.4999996", "10");
+    await user.click(submit());
+
+    expect(await screen.findByText(/at most 6 decimal places/i)).toBeInTheDocument();
+    expect(mockedTradingApi.placeOrder).not.toHaveBeenCalled();
+  });
 });

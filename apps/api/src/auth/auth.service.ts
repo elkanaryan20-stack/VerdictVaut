@@ -437,10 +437,33 @@ export class AuthService {
     }
 
     // Rotate: revoke the presented token, issue a fresh pair.
-    await this.prisma.refreshToken.update({
-      where: { id: stored.id },
+    // Phase 37 — a compare-and-swap, not a plain update: two concurrent
+    // presentations of the SAME token both passed the revokedAt check
+    // above, and the previous unconditional update let BOTH go on to mint
+    // a fresh pair — one refresh token forking into two independent
+    // session chains, which also silently defeated the reuse detection
+    // above (an attacker racing the legitimate client got a live session
+    // with no alarm). Exactly one caller now wins the rotation.
+    const rotated = await this.prisma.refreshToken.updateMany({
+      where: { id: stored.id, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    if (rotated.count === 0) {
+      // Lost a concurrent rotation of the same token. Rejected, and
+      // audited, but deliberately NOT escalated to the revoke-everything
+      // reuse response: a simultaneous presentation is also what two
+      // honest browser tabs refreshing at once look like. Only a LATER
+      // replay of an already-rotated token (the branch above) is treated
+      // as theft. Whether to escalate this case too is a policy choice.
+      await this.auditLog.record({
+        actorId: payload.sub,
+        actorType: AuditActorType.USER,
+        action: "user.refresh_token_concurrent_rotation_rejected",
+        resourceType: "User",
+        resourceId: payload.sub,
+      });
+      throw new UnauthorizedException("Refresh token is no longer valid");
+    }
 
     return this.issueTokenPair(user);
   }
@@ -540,14 +563,24 @@ export class AuthService {
     const jwtConfig = this.config.get("jwt", { infer: true });
     const payload = { sub: user.id, email: user.email, role: user.role };
 
+    // Phase 37 — a random jti on every token. Without it a JWT is a pure
+    // function of (payload, iat-in-seconds), so two refresh tokens minted
+    // for the same user within the same second — two logins, or a refresh
+    // rotation inside the second its predecessor was issued — were
+    // byte-identical and hashed to the same RefreshToken.tokenHash. The
+    // lookup in refresh() could then land on the revoked twin and fire
+    // reuse detection (revoking every session), and revoking one session
+    // could not be told apart from the other.
     const accessToken = await this.jwt.signAsync(payload, {
       secret: jwtConfig.accessSecret,
       expiresIn: jwtConfig.accessTtl,
+      jwtid: crypto.randomUUID(),
     });
 
     const refreshToken = await this.jwt.signAsync(payload, {
       secret: jwtConfig.refreshSecret,
       expiresIn: jwtConfig.refreshTtl,
+      jwtid: crypto.randomUUID(),
     });
 
     const expiresAt = new Date(Date.now() + parseTtlToMs(jwtConfig.refreshTtl));

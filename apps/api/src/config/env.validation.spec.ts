@@ -26,6 +26,16 @@ describe("validateEnv", () => {
     expect(() => validateEnv(baseConfig({ JWT_ACCESS_SECRET: "too-short" }))).toThrow(/JWT_ACCESS_SECRET/);
   });
 
+  it("Phase 37: refuses identical access and refresh secrets (a refresh token would otherwise pass as an access token)", () => {
+    const same = "s".repeat(40);
+    expect(() => validateEnv(baseConfig({ JWT_ACCESS_SECRET: same, JWT_REFRESH_SECRET: same }))).toThrow(/must differ/);
+  });
+
+  it("Phase 37: TRUST_PROXY_HOPS defaults to 0 and rejects a negative value", () => {
+    expect(validateEnv(baseConfig()).TRUST_PROXY_HOPS).toBe(0);
+    expect(() => validateEnv(baseConfig({ TRUST_PROXY_HOPS: "-1" }))).toThrow(/TRUST_PROXY_HOPS/);
+  });
+
   describe("production", () => {
     it("still refuses to boot even with valid DB TLS configured — custody remains a separate, unresolved blocker", () => {
       expect(() =>

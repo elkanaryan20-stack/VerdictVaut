@@ -6,6 +6,7 @@ import helmet from "helmet";
 import { AppModule } from "./app.module";
 import { AllExceptionsFilter } from "./common/filters/http-exception.filter";
 import { AppConfig } from "./config/configuration";
+import { configureTrustProxy } from "./config/trust-proxy";
 import { assertWatchersNotAccidentallyEnabledInApiProcess } from "./config/watcher-boundary.guard";
 import { JsonLoggerService } from "./observability/json-logger.service";
 import { requestIdMiddleware } from "./observability/request-id.middleware";
@@ -72,6 +73,10 @@ async function bootstrap() {
   const port = config.get("port", { infer: true });
   const nodeEnv = config.get("nodeEnv", { infer: true });
   const corsAllowedOrigins = config.get("corsAllowedOrigins", { infer: true });
+
+  // Phase 37 — must match the real proxy topology (1 behind the ALB); see
+  // config/trust-proxy.ts for why every throttle depends on it.
+  configureTrustProxy(app.getHttpAdapter().getInstance(), config.get("trustProxyHops", { infer: true }));
 
   // Wide-open CORS only in local development; everywhere else this fails
   // closed to an explicit allowlist (empty by default — set
