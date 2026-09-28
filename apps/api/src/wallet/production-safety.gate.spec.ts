@@ -13,8 +13,13 @@ function makePrisma(overrides: {
   kycCount?: number;
   kytCount?: number;
   custodyConfigs?: Array<{ assetNetworkId: string; custodyProviderConfig: { isEnabled: boolean; environment: string } | null }>;
+  // Phase 40 — active asset/networks whose network environment does NOT match (what the query asks for).
+  mismatchedActiveNetworks?: Array<{ asset: { symbol: string }; network: { code: string } }>;
 } = {}) {
   return {
+    assetNetwork: {
+      findMany: jest.fn().mockResolvedValue(overrides.mismatchedActiveNetworks ?? []),
+    },
     complianceProviderConfig: {
       count: jest.fn().mockImplementation(async ({ where }: { where: { category: string } }) => {
         if (where.category === "KYC") return overrides.kycCount ?? 1;
@@ -80,5 +85,28 @@ describe("ProductionSafetyGate", () => {
       const gate = new ProductionSafetyGate(makeConfig("production"), prisma, realCompliantGate);
       await expect(gate.onApplicationBootstrap()).resolves.not.toThrow();
     });
+  });
+});
+
+describe("ProductionSafetyGate — active network environment (Phase 40)", () => {
+  it("refuses to start SANDBOX with an active PRODUCTION (mainnet) asset/network — even though sandbox skips every other check", async () => {
+    const prisma = makePrisma({ mismatchedActiveNetworks: [{ asset: { symbol: "BTC" }, network: { code: "bitcoin-mainnet" } }] });
+    const gate = new ProductionSafetyGate(makeConfig("sandbox"), prisma, new DeferredComplianceGate());
+    await expect(gate.onApplicationBootstrap()).rejects.toThrow(/BTC\/bitcoin-mainnet/);
+  });
+
+  it("refuses to start PRODUCTION with an active SANDBOX (testnet) asset/network, before any other check", async () => {
+    const prisma = makePrisma({ mismatchedActiveNetworks: [{ asset: { symbol: "USDC" }, network: { code: "ethereum-sepolia" } }] });
+    const gate = new ProductionSafetyGate(makeConfig("production"), prisma, realCompliantGate);
+    await expect(gate.onApplicationBootstrap()).rejects.toThrow(/USDC\/ethereum-sepolia/);
+  });
+
+  it("asks for active networks of the OTHER environment (production process → non-PRODUCTION networks)", async () => {
+    const prisma = makePrisma();
+    const gate = new ProductionSafetyGate(makeConfig("production"), prisma, realCompliantGate);
+    await gate.onApplicationBootstrap();
+    expect((prisma as unknown as { assetNetwork: { findMany: jest.Mock } }).assetNetwork.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { isActive: true, network: { environment: { not: "PRODUCTION" } } } }),
+    );
   });
 });

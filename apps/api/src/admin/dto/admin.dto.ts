@@ -1,4 +1,6 @@
-import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsPositive, IsString, MinLength, ValidateIf } from "class-validator";
+import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsPositive, IsString, Matches, Min, MinLength, ValidateIf } from "class-validator";
+
+const DECIMAL_STRING = /^\d+(\.\d+)?$/;
 
 export class CreateAssetNetworkDto {
   @IsString()
@@ -18,12 +20,24 @@ export class CreateAssetNetworkDto {
   @IsBoolean()
   memoRequired?: boolean;
 
+  // Phase 40 — this property had NO validation decorator, so the global
+  // ValidationPipe (whitelist + forbidNonWhitelisted) rejected it as
+  // "should not exist" on every request — while the service requires it.
+  // POST /admin/asset-networks was therefore unusable, leaving a fresh
+  // production deployment (whose seed-free database has no mainnet
+  // asset/networks) with no API path to enable any asset at all.
+  @IsInt()
+  @Min(1)
   minConfirmations!: number;
 
   @IsOptional()
+  @IsString()
+  @Matches(DECIMAL_STRING, { message: "depositMinAmount must be a non-negative decimal string" })
   depositMinAmount?: string;
 
   @IsOptional()
+  @IsString()
+  @Matches(DECIMAL_STRING, { message: "withdrawalMinAmount must be a non-negative decimal string" })
   withdrawalMinAmount?: string;
 }
 

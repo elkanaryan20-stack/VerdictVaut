@@ -1,13 +1,34 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
+import { NetworkEnvironment } from "@prisma/client";
+import { AppConfig } from "../../config/configuration";
 import { PrismaService } from "../../prisma/prisma.service";
 import { ChainRpcConfigService } from "../chain-adapters/rpc-config.service";
+import { requiredProviderConfigEnvironment } from "../provider-config/provider-environment.util";
 
 @Injectable()
 export class AssetsNetworksService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly rpcConfig: ChainRpcConfigService,
+    private readonly config: ConfigService<AppConfig, true>,
   ) {}
+
+  /**
+   * Phase 40 — the runtime counterpart to ProductionSafetyGate.assertActiveNetworksMatchEnvironment:
+   * an asset/network may only be ACTIVE on a network of this process's own environment
+   * (production ⇄ PRODUCTION networks, anything else ⇄ SANDBOX networks), so the
+   * mismatch the boot gate refuses cannot be created by an admin after boot either.
+   */
+  private assertNetworkMatchesEnvironment(network: { code: string; environment: NetworkEnvironment }): void {
+    const appEnvironment = this.config.get("appEnvironment", { infer: true });
+    const required = requiredProviderConfigEnvironment(appEnvironment);
+    if (network.environment !== required) {
+      throw new BadRequestException(
+        `Network ${network.code} is a ${network.environment} network; this ${appEnvironment} deployment may only enable ${required} networks.`,
+      );
+    }
+  }
 
   async listAssets() {
     return this.prisma.asset.findMany({ orderBy: { symbol: "asc" } });
@@ -46,6 +67,9 @@ export class AssetsNetworksService {
     // Backed by asset_networks_active_token_requires_contract_check at
     // the DB level too (Phase 14A) — this check stays for the clearer,
     // immediate error message a direct API caller sees.
+    if (isActive) {
+      this.assertNetworkMatchesEnvironment(assetNetwork.network);
+    }
     if (isActive && !assetNetwork.isNative && !assetNetwork.contractAddress) {
       throw new BadRequestException("Cannot activate a non-native asset/network with no contractAddress configured");
     }
@@ -84,6 +108,8 @@ export class AssetsNetworksService {
     if (!params.isNative && !params.contractAddress) {
       throw new BadRequestException("A non-native asset/network requires a contractAddress");
     }
+    // Created rows are active by default (schema), so the same rule applies here.
+    this.assertNetworkMatchesEnvironment(network);
 
     return this.prisma.assetNetwork.create({
       data: {

@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { ComplianceProviderCategory, NetworkEnvironment, WithdrawalExecutorType } from "@prisma/client";
 import { AppConfig } from "../config/configuration";
 import { PrismaService } from "../prisma/prisma.service";
+import { requiredProviderConfigEnvironment } from "./provider-config/provider-environment.util";
 import { DeferredComplianceGate } from "./withdrawals/compliance/deferred-compliance-gate";
 import { WITHDRAWAL_COMPLIANCE_GATE, WithdrawalComplianceGate } from "./withdrawals/compliance/withdrawal-compliance-gate.interface";
 
@@ -34,6 +35,10 @@ export class ProductionSafetyGate implements OnApplicationBootstrap {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
+    // Phase 40 — runs in EVERY environment, before the production-only
+    // checks below. See assertActiveNetworksMatchEnvironment.
+    await this.assertActiveNetworksMatchEnvironment();
+
     if (this.config.get("appEnvironment", { infer: true }) !== "production") return;
 
     // Deliberately narrow: this checks WHICH CLASS is bound, not whether
@@ -86,6 +91,38 @@ export class ProductionSafetyGate implements OnApplicationBootstrap {
         `APP_ENVIRONMENT=production refuses to finish starting: ${badCustodyConfigs.length} WithdrawalExecutionConfig row(s) select ` +
           `PRODUCTION_CUSTODY but link to a missing, disabled, or non-production custody provider config ` +
           `(asset/network id(s): ${badCustodyConfigs.map((c) => c.assetNetworkId).join(", ")}).`,
+      );
+    }
+  }
+
+  /**
+   * Phase 40 (cutover audit) — an ACTIVE asset/network must belong to a
+   * network of the environment this process runs as, in both directions,
+   * using the same single mapping every provider-config check already
+   * uses (requiredProviderConfigEnvironment):
+   *   - production + an active SANDBOX (testnet) network: testnet deposits
+   *     would be credited as real balances, and withdrawals requested
+   *     against valueless testnet assets.
+   *   - sandbox (anything not literally "production") + an active
+   *     PRODUCTION (mainnet) network: real value would move through a
+   *     process that skipped every production boot blocker — manual
+   *     broadcast, DEFERRED compliance — a fail-open path around them all.
+   * Nothing previously coupled NetworkEnvironment to APP_ENVIRONMENT; the
+   * seed (testnet-only) is not run by any deploy workflow, but nothing
+   * stopped it, or an admin activation, from creating the mismatch.
+   */
+  private async assertActiveNetworksMatchEnvironment(): Promise<void> {
+    const appEnvironment = this.config.get("appEnvironment", { infer: true });
+    const required = requiredProviderConfigEnvironment(appEnvironment);
+    const mismatched = await this.prisma.assetNetwork.findMany({
+      where: { isActive: true, network: { environment: { not: required } } },
+      include: { asset: true, network: true },
+    });
+    if (mismatched.length > 0) {
+      throw new Error(
+        `APP_ENVIRONMENT=${appEnvironment} refuses to finish starting: ${mismatched.length} active asset/network(s) belong to a ` +
+          `${required === NetworkEnvironment.PRODUCTION ? "SANDBOX" : "PRODUCTION"} network, but this process requires ${required} networks only ` +
+          `(${mismatched.map((an) => `${an.asset.symbol}/${an.network.code}`).join(", ")}). Deactivate them before starting.`,
       );
     }
   }

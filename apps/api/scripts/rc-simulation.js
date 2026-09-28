@@ -400,6 +400,16 @@ async function simulate(runIndex) {
       const prov = await root.call("POST", "/admin/wallet-addresses", { assetNetworkId: usdcSepolia.id, address, environment: "SANDBOX" });
       if (prov.status >= 300) check("deposits", `provision pool address ${address}`, false, JSON.stringify(prov.body));
     }
+    const mainnetAsset = await root.call("POST", "/admin/asset-networks", { assetSymbol: "BTC", networkCode: "bitcoin-mainnet", isNative: true, minConfirmations: 3 });
+    check("config", "a sandbox deployment refuses to enable a mainnet (PRODUCTION) asset/network", mainnetAsset.status === 400 && /may only enable SANDBOX/.test(JSON.stringify(mainnetAsset.body)), JSON.stringify(mainnetAsset.body));
+    const newTestnetAsset = await root.call("POST", "/admin/asset-networks", { assetSymbol: "ETH", networkCode: "base-sepolia", isNative: true, minConfirmations: 12 });
+    const opsNewAsset = await ops.call("POST", "/admin/asset-networks", { assetSymbol: "SOL", networkCode: "base-sepolia", isNative: true, minConfirmations: 12 });
+    check(
+      "config",
+      "SUPER_ADMIN can configure a new asset/network over the API (previously impossible: DTO rejected every request); ADMIN 403",
+      (newTestnetAsset.status === 201 || newTestnetAsset.status === 200) && newTestnetAsset.body?.minConfirmations === 12 && opsNewAsset.status === 403,
+      `${newTestnetAsset.status} ${JSON.stringify(newTestnetAsset.body).slice(0, 160)} / ${opsNewAsset.status}`,
+    );
     const opsProvision = await ops.call("POST", "/admin/wallet-addresses", { assetNetworkId: usdcSepolia.id, address: "0x5555555555555555555555555555555555555555", environment: "SANDBOX" });
     check("authz", "ADMIN cannot provision deposit addresses (SUPER_ADMIN only)", opsProvision.status === 403);
 

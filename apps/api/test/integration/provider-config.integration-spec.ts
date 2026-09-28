@@ -235,13 +235,22 @@ describe("Provider configuration (real Postgres)", () => {
     // integration test instead confirms the real Prisma queries
     // themselves correctly detect a genuine gap against the real schema
     // — the thing a mocked unit test alone can't prove.
-    it("refuses production when no enabled KYC ComplianceProviderConfig exists for PRODUCTION, using real queries against the real schema", async () => {
+    it("refuses production against real configuration state, using real queries against the real schema", async () => {
       const gate = makeSafetyGate("production", realCompliantGate);
       const kycCount = await prisma.complianceProviderConfig.count({
         where: { category: "KYC", environment: "PRODUCTION", isEnabled: true },
       });
       expect(kycCount).toBe(0); // nothing in this test creates one
-      await expect(gate.onApplicationBootstrap()).rejects.toThrow(/KYC ComplianceProviderConfig/);
+      // Phase 40 — this shared database is seeded with ACTIVE testnet
+      // (SANDBOX) asset/networks, so the first real gap the gate now finds
+      // is exactly that: a production process must never run with them.
+      // (The KYC/KYT/custody refusals behind it keep their isolated,
+      // fully-controlled coverage in production-safety.gate.spec.ts.)
+      await expect(gate.onApplicationBootstrap()).rejects.toThrow(/belong to a SANDBOX network.*USDC\/ethereum-sepolia/);
+    });
+
+    it("Phase 40: a SANDBOX process against the same real state starts cleanly (no mainnet asset/network is active)", async () => {
+      await expect(makeSafetyGate("sandbox", realCompliantGate).onApplicationBootstrap()).resolves.not.toThrow();
     });
   });
 });

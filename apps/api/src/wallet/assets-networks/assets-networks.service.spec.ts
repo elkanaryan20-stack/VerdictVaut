@@ -19,14 +19,14 @@ describe("AssetsNetworksService — non-native contractAddress validation", () =
   beforeEach(() => {
     prisma = {
       asset: { findUnique: jest.fn().mockResolvedValue({ id: "asset-1", symbol: "USDC" }) },
-      network: { findUnique: jest.fn().mockResolvedValue({ id: "network-1", code: "ethereum-sepolia" }) },
+      network: { findUnique: jest.fn().mockResolvedValue({ id: "network-1", code: "ethereum-sepolia", environment: "SANDBOX" }) },
       assetNetwork: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
     };
     // A real ChainRpcConfigService, not a mock — it's pure/deterministic
     // (no network I/O; it only resolves a URL string), and
     // "ethereum-sepolia" already resolves via its own sandbox defaults,
     // so this exercises the genuine reachability check.
-    service = new AssetsNetworksService(prisma as never, new ChainRpcConfigService());
+    service = new AssetsNetworksService(prisma as never, new ChainRpcConfigService(), { get: () => "sandbox" } as never);
   });
 
   it("createAssetNetwork rejects a non-native asset/network with no contractAddress", async () => {
@@ -59,7 +59,7 @@ describe("AssetsNetworksService — non-native contractAddress validation", () =
       id: "an-1",
       isNative: false,
       contractAddress: null,
-      network: { code: "ethereum-sepolia" },
+      network: { code: "ethereum-sepolia", environment: "SANDBOX" },
     });
     await expect(service.setAssetNetworkActive("an-1", true)).rejects.toThrow(BadRequestException);
     expect(prisma.assetNetwork.update).not.toHaveBeenCalled();
@@ -70,7 +70,7 @@ describe("AssetsNetworksService — non-native contractAddress validation", () =
       id: "an-1",
       isNative: false,
       contractAddress: null,
-      network: { code: "ethereum-sepolia" },
+      network: { code: "ethereum-sepolia", environment: "SANDBOX" },
     });
     prisma.assetNetwork.update.mockResolvedValue({ id: "an-1", isActive: false });
     await service.setAssetNetworkActive("an-1", false);
@@ -88,7 +88,7 @@ describe("AssetsNetworksService — non-native contractAddress validation", () =
         id: "an-1",
         isNative: true,
         contractAddress: null,
-        network: { code: "some-unconfigured-network" },
+        network: { code: "some-unconfigured-network", environment: "SANDBOX" },
       });
       await expect(service.setAssetNetworkActive("an-1", true)).rejects.toThrow(BadRequestException);
       expect(prisma.assetNetwork.update).not.toHaveBeenCalled();
@@ -99,7 +99,7 @@ describe("AssetsNetworksService — non-native contractAddress validation", () =
         id: "an-1",
         isNative: true,
         contractAddress: null,
-        network: { code: "ethereum-sepolia" },
+        network: { code: "ethereum-sepolia", environment: "SANDBOX" },
       });
       prisma.assetNetwork.update.mockResolvedValue({ id: "an-1", isActive: true });
       await service.setAssetNetworkActive("an-1", true);
@@ -111,8 +111,37 @@ describe("AssetsNetworksService — non-native contractAddress validation", () =
         id: "an-1",
         isNative: true,
         contractAddress: null,
-        network: { code: "some-unconfigured-network" },
+        network: { code: "some-unconfigured-network", environment: "SANDBOX" },
       });
+      prisma.assetNetwork.update.mockResolvedValue({ id: "an-1", isActive: false });
+      await service.setAssetNetworkActive("an-1", false);
+      expect(prisma.assetNetwork.update).toHaveBeenCalledWith({ where: { id: "an-1" }, data: { isActive: false } });
+    });
+  });
+
+  describe("network environment must match APP_ENVIRONMENT (Phase 40)", () => {
+    const productionService = () => new AssetsNetworksService(prisma as never, new ChainRpcConfigService(), { get: () => "production" } as never);
+
+    it("a sandbox deployment refuses to activate an asset on a PRODUCTION (mainnet) network", async () => {
+      prisma.assetNetwork.findUnique.mockResolvedValue({ id: "an-1", isNative: true, contractAddress: null, network: { code: "ethereum-mainnet", environment: "PRODUCTION" } });
+      await expect(service.setAssetNetworkActive("an-1", true)).rejects.toThrow(/may only enable SANDBOX networks/);
+      expect(prisma.assetNetwork.update).not.toHaveBeenCalled();
+    });
+
+    it("a production deployment refuses to activate an asset on a SANDBOX (testnet) network", async () => {
+      prisma.assetNetwork.findUnique.mockResolvedValue({ id: "an-1", isNative: true, contractAddress: null, network: { code: "ethereum-sepolia", environment: "SANDBOX" } });
+      await expect(productionService().setAssetNetworkActive("an-1", true)).rejects.toThrow(/may only enable PRODUCTION networks/);
+      expect(prisma.assetNetwork.update).not.toHaveBeenCalled();
+    });
+
+    it("creation (active by default) is held to the same rule", async () => {
+      prisma.network.findUnique.mockResolvedValue({ id: "network-9", code: "bitcoin-mainnet", environment: "PRODUCTION" });
+      await expect(service.createAssetNetwork({ assetSymbol: "BTC", networkCode: "bitcoin-mainnet", isNative: true, minConfirmations: 3 })).rejects.toThrow(BadRequestException);
+      expect(prisma.assetNetwork.create).not.toHaveBeenCalled();
+    });
+
+    it("deactivating a mismatched asset/network is always allowed (the way out of the unsafe state)", async () => {
+      prisma.assetNetwork.findUnique.mockResolvedValue({ id: "an-1", isNative: true, contractAddress: null, network: { code: "ethereum-mainnet", environment: "PRODUCTION" } });
       prisma.assetNetwork.update.mockResolvedValue({ id: "an-1", isActive: false });
       await service.setAssetNetworkActive("an-1", false);
       expect(prisma.assetNetwork.update).toHaveBeenCalledWith({ where: { id: "an-1" }, data: { isActive: false } });
