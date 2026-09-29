@@ -49,6 +49,13 @@ export interface ChainTransactionStatus {
    * OP_RETURN) are omitted. Undefined for single-recipient chains.
    */
   outputs?: ChainTransactionOutput[];
+  /**
+   * Phase 41 — the destination tag the transaction actually carried, for
+   * chains that have one (XRPL `DestinationTag`): a string when present,
+   * `null` when the transaction carried none. Left `undefined` by chains
+   * with no such concept, so callers can tell "not applicable" from "none".
+   */
+  destinationTag?: string | null;
 }
 
 export interface ChainTransactionOutput {

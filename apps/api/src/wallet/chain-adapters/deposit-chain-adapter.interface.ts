@@ -51,6 +51,14 @@ export interface ScanForDepositsParams {
   addresses: WatchedAddress[];
   /** Opaque cursor from BlockchainWatchCursor.lastScannedPointer, or null on first scan. Adapter-defined format. */
   cursor: string | null;
+  /**
+   * Phase 41 — the ConfirmationPolicy requirement for this asset/network.
+   * A cursor-based adapter that scans each block only once (EVM) must not
+   * advance its cursor past a block younger than this, or a deposit
+   * observed below the requirement would stay PENDING forever. Adapters
+   * that re-derive a recent window on every poll may ignore it.
+   */
+  requiredConfirmations?: number;
 }
 
 export interface ScanForDepositsResult {

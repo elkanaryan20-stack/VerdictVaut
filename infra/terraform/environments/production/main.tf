@@ -240,13 +240,23 @@ module "worker_service" {
     WITHDRAWAL_WATCHER_ENABLED   = "true"
     WORKER_HEARTBEAT_FILE        = "/tmp/verdictvaut-worker-heartbeat"
     WORKER_HEARTBEAT_INTERVAL_MS = "15000"
+
+    # Phase 41 — scheduled independent + collateral reconciliation, worker
+    # only (the API refuses it — watcher-boundary.guard.ts). Read-only:
+    # records discrepancies, never moves funds. Off by default in code.
+    RECONCILIATION_SCHEDULER_ENABLED     = "true"
+    RECONCILIATION_SCHEDULER_INTERVAL_MS = "3600000"
   }
 
   # No Fireblocks/Elliptic secret is wired here — production custody is
   # structurally blocked at the application level regardless
   # (ProductionCustodyExecutor throws unconditionally); wiring a
   # nonexistent production credential here would be pure fiction.
+  # Phase 41 — the worker boots AppModule, whose validateEnv requires both
+  # JWT secrets; the same existing secrets the API uses (no new secrets).
   secret_arns = {
-    DATABASE_URL = module.database.database_url_secret_arn
+    DATABASE_URL       = module.database.database_url_secret_arn
+    JWT_ACCESS_SECRET  = module.secrets.secret_arns["jwt-access-secret"]
+    JWT_REFRESH_SECRET = module.secrets.secret_arns["jwt-refresh-secret"]
   }
 }

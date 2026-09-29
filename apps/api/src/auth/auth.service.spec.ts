@@ -398,6 +398,68 @@ describe("AuthService", () => {
     });
   });
 
+  describe("security metrics (Phase 41)", () => {
+    let metrics: { increment: jest.Mock; timing: jest.Mock };
+    let instrumented: AuthService;
+
+    beforeEach(() => {
+      metrics = { increment: jest.fn(), timing: jest.fn() };
+      instrumented = new AuthService(
+        prisma as unknown as PrismaService,
+        jwt as never,
+        config as never,
+        auditLog as unknown as AuditLogService,
+        undefined,
+        metrics as never,
+      );
+    });
+
+    it("counts an unknown-account login failure without putting the email in the tags", async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      await expect(instrumented.login({ email: "nobody@example.com", password: "x" })).rejects.toThrow(UnauthorizedException);
+      expect(metrics.increment).toHaveBeenCalledWith("auth.login_failed", { reason: "unknown_account" });
+      expect(JSON.stringify(metrics.increment.mock.calls)).not.toContain("nobody@example.com");
+    });
+
+    it("counts every wrong-password attempt, not only the ones that apply a lock", async () => {
+      const passwordHash = await bcrypt.hash("correct-password", 4);
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", passwordHash, status: "ACTIVE", failedLoginAttempts: 0, lockedUntil: null });
+      prisma.user.update.mockResolvedValue({ failedLoginAttempts: 1 });
+
+      await expect(instrumented.login({ email: "a@example.com", password: "wrong" })).rejects.toThrow(UnauthorizedException);
+      expect(metrics.increment).toHaveBeenCalledWith("auth.login_failed", { reason: "invalid_password" });
+      expect(metrics.increment).not.toHaveBeenCalledWith("auth.account_locked", expect.anything());
+    });
+
+    it("counts an attempt against a locked account", async () => {
+      const passwordHash = await bcrypt.hash("correct-password", 4);
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", passwordHash, status: "ACTIVE", failedLoginAttempts: 8, lockedUntil: new Date(Date.now() + 60_000) });
+
+      await expect(instrumented.login({ email: "a@example.com", password: "correct-password" })).rejects.toThrow(UnauthorizedException);
+      expect(metrics.increment).toHaveBeenCalledWith("auth.login_failed", { reason: "locked" });
+    });
+
+    it("counts refresh-token reuse (the theft signal)", async () => {
+      jwt.verifyAsync.mockResolvedValue({ sub: "user-1" });
+      prisma.refreshToken.findFirst.mockResolvedValue({ id: "t-1", expiresAt: new Date(Date.now() + 1_000_000), revokedAt: new Date() });
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+
+      await expect(instrumented.refresh("replayed")).rejects.toThrow(UnauthorizedException);
+      expect(metrics.increment).toHaveBeenCalledWith("auth.refresh_token_reuse_detected");
+    });
+
+    it("counts a lost concurrent rotation separately from reuse", async () => {
+      jwt.verifyAsync.mockResolvedValue({ sub: "user-1" });
+      prisma.refreshToken.findFirst.mockResolvedValue({ id: "t-1", expiresAt: new Date(Date.now() + 1_000_000), revokedAt: null });
+      prisma.user.findUnique.mockResolvedValue({ id: "user-1", email: "a@example.com", role: "USER", status: "ACTIVE" });
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(instrumented.refresh("valid")).rejects.toThrow(UnauthorizedException);
+      expect(metrics.increment).toHaveBeenCalledWith("auth.refresh_token_concurrent_rotation_rejected");
+      expect(metrics.increment).not.toHaveBeenCalledWith("auth.refresh_token_reuse_detected");
+    });
+  });
+
   describe("logout", () => {
     it("revokes only the specific refresh token for this user, never any other of their sessions or another user's token", async () => {
       prisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });

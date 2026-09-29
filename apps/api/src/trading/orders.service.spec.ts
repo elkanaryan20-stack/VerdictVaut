@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
 import { ReservationService } from "../ledger/reservation.service";
 import { PrismaService } from "../prisma/prisma.service";
@@ -215,15 +215,22 @@ describe("OrdersService", () => {
     expect(txRunner.run).toHaveBeenCalledTimes(1);
   });
 
+  const existingOrder = (clientOrderId: string) => ({
+    id: "existing-order-1",
+    userId: "user-1",
+    status: "OPEN",
+    clientOrderId,
+    marketId: "market-1",
+    outcomeId: "outcome-1",
+    side: "BUY",
+    price: new Prisma.Decimal("0.25"),
+    quantity: new Prisma.Decimal("10"),
+  });
+
   it("is idempotent: a duplicate clientOrderId returns the existing order without re-reserving", async () => {
     const clientOrderId = "retry-key-1";
     prisma.order.create.mockRejectedValueOnce(makeIdempotencyConflict());
-    prisma.order.findUniqueOrThrow.mockResolvedValue({
-      id: "existing-order-1",
-      userId: "user-1",
-      status: "OPEN",
-      clientOrderId,
-    });
+    prisma.order.findUniqueOrThrow.mockResolvedValue(existingOrder(clientOrderId));
 
     const result = await service.create("user-1", buy({ clientOrderId }));
 
@@ -231,6 +238,20 @@ describe("OrdersService", () => {
     expect(reservations.reserve).not.toHaveBeenCalled();
     expect(riskValidator.validate).toHaveBeenCalledTimes(1); // attempted once, inside the failed create path
     expect(executionCoordinator.matchAndExecute).toHaveBeenCalledWith("existing-order-1");
+  });
+
+  it.each([
+    ["price", { price: "0.3" }],
+    ["quantity", { quantity: "11" }],
+    ["side", { side: "SELL" }],
+  ])("rejects (409) a clientOrderId reused with a different %s — never silently returns the other order (Phase 41)", async (_field, change) => {
+    const clientOrderId = "retry-key-1";
+    prisma.order.create.mockRejectedValueOnce(makeIdempotencyConflict());
+    prisma.order.findUniqueOrThrow.mockResolvedValue(existingOrder(clientOrderId));
+
+    await expect(service.create("user-1", buy({ clientOrderId, ...change }))).rejects.toThrow(ConflictException);
+    expect(reservations.reserve).not.toHaveBeenCalled();
+    expect(executionCoordinator.matchAndExecute).not.toHaveBeenCalled();
   });
 
   it("attempts to match the order against the resting book after funding", async () => {

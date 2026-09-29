@@ -87,5 +87,26 @@ describe("EvmDepositAdapter.scanForDeposits (native)", () => {
 
       expect(result.nextCursor).toBe("108"); // 120 - 12, never "120"
     });
+
+    it("holds the cursor back further when the confirmation requirement exceeds the reorg margin (Phase 41)", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(blockNumberToHex(150))) // tip
+        .mockResolvedValue(jsonResponse({ number: blockNumberToHex(999), transactions: [] }));
+
+      const result = await adapter.scanForDeposits({ network, addresses: [watched], cursor: "99", requiredConfirmations: 32 });
+
+      // Highest scanned block 119 has 150 - 119 + 1 = 32 confirmations — exactly final, never younger.
+      expect(result.nextCursor).toBe("119");
+    });
+
+    it("keeps the reorg margin when the confirmation requirement is smaller", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(blockNumberToHex(120)))
+        .mockResolvedValue(jsonResponse({ number: blockNumberToHex(999), transactions: [] }));
+
+      const result = await adapter.scanForDeposits({ network, addresses: [watched], cursor: "99", requiredConfirmations: 2 });
+
+      expect(result.nextCursor).toBe("108");
+    });
   });
 });

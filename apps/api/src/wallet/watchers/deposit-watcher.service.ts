@@ -162,13 +162,16 @@ export class DepositWatcherService implements OnModuleInit, OnModuleDestroy {
       const { adapter, network } = await this.adapterFactory.resolve(assetNetworkId);
       const cursorRow = await this.prisma.blockchainWatchCursor.findUnique({ where: { assetNetworkId } });
       currentCursor = cursorRow?.lastScannedPointer || null;
+      // Fetched before the scan (Phase 41) so a cursor-based adapter (EVM)
+      // never advances past blocks that are not yet final enough to credit.
+      const requiredConfirmations = await this.confirmationPolicy.getRequiredConfirmations(assetNetworkId);
       const { deposits, nextCursor } = await adapter.scanForDeposits({
         network,
         addresses,
         cursor: currentCursor,
+        requiredConfirmations,
       });
 
-      const requiredConfirmations = await this.confirmationPolicy.getRequiredConfirmations(assetNetworkId);
       const byWalletAddressId = new Map(addresses.map((a) => [a.walletAddressId, a]));
 
       for (const raw of deposits) {

@@ -283,6 +283,11 @@ export class AuthService {
         reason: "invalid_credentials",
         after: { email: dto.email },
       });
+      // Phase 41 — a per-attempt counter (auth.account_locked fires only once
+      // per applied lock), so credential stuffing across MANY accounts, which
+      // never locks any single one, is still visible. Tags stay low-cardinality:
+      // never the email or user id.
+      this.metrics.increment("auth.login_failed", { reason: "unknown_account" });
       throw new UnauthorizedException("Invalid email or password");
     }
 
@@ -308,6 +313,7 @@ export class AuthService {
         reason: "account_temporarily_locked",
         after: { lockedUntil: user.lockedUntil, passwordWasCorrect: passwordValid },
       });
+      this.metrics.increment("auth.login_failed", { reason: "locked" });
       throw new UnauthorizedException("Invalid email or password");
     }
 
@@ -345,6 +351,7 @@ export class AuthService {
         reason: "invalid_credentials",
         after: { failedLoginAttempts: updated.failedLoginAttempts, lockedUntil },
       });
+      this.metrics.increment("auth.login_failed", { reason: "invalid_password" });
       throw new UnauthorizedException("Invalid email or password");
     }
 
@@ -424,6 +431,8 @@ export class AuthService {
         reason: "an already-revoked (rotated-out) refresh token was presented again — every active session for this account has been revoked as a precaution",
         after: { sessionsRevoked: revoked.count },
       });
+      // Phase 41 — a likely token-theft signal; worth an alarm on any non-zero count.
+      this.metrics.increment("auth.refresh_token_reuse_detected");
       throw new UnauthorizedException("Refresh token is no longer valid");
     }
 
@@ -462,6 +471,7 @@ export class AuthService {
         resourceType: "User",
         resourceId: payload.sub,
       });
+      this.metrics.increment("auth.refresh_token_concurrent_rotation_rejected");
       throw new UnauthorizedException("Refresh token is no longer valid");
     }
 

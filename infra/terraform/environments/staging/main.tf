@@ -215,10 +215,20 @@ module "worker_service" {
     WITHDRAWAL_WATCHER_ENABLED   = "true"
     WORKER_HEARTBEAT_FILE        = "/tmp/verdictvaut-worker-heartbeat"
     WORKER_HEARTBEAT_INTERVAL_MS = "15000"
+
+    # Phase 41 — scheduled independent + collateral reconciliation, worker
+    # only (the API refuses it — watcher-boundary.guard.ts). Read-only:
+    # records discrepancies, never moves funds. Off by default in code.
+    RECONCILIATION_SCHEDULER_ENABLED     = "true"
+    RECONCILIATION_SCHEDULER_INTERVAL_MS = "3600000"
   }
 
+  # Phase 41 — the worker boots AppModule, whose validateEnv requires both
+  # JWT secrets; the same existing secrets the API uses (no new secrets).
   secret_arns = {
     DATABASE_URL                   = module.database.database_url_secret_arn
+    JWT_ACCESS_SECRET              = module.secrets.secret_arns["jwt-access-secret"]
+    JWT_REFRESH_SECRET             = module.secrets.secret_arns["jwt-refresh-secret"]
     FIREBLOCKS_SANDBOX_CREDENTIALS = module.secrets.secret_arns["fireblocks-sandbox-credentials"]
   }
 }

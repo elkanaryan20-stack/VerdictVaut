@@ -127,3 +127,20 @@ Reservation leakage and ledger anomalies remain detected by
 externally (cron/CI against a read replica) until a runtime metric exists;
 it is not run by the reconciliation scheduler, which only drives the
 chain/collateral reconciliation services.
+
+## Phase 41 additions
+
+New application metrics (emitted through `MetricsService`; **no CloudWatch
+metric filter or alarm has been provisioned or verified for them** — the
+Terraform in `infra/` has not been applied, see
+`docs/production-cutover-gates.md` 40N):
+
+| # | Condition | Signal | Suggested threshold |
+|---|---|---|---|
+| 12 | **Credential stuffing / brute force** | `auth.login_failed` (tag `reason`: `unknown_account`, `invalid_password`, `locked`) — one per failed attempt. Tags never carry the email or user id. Complements `auth.account_locked`, which fires once per applied lock and so misses an attack spread thinly across many accounts. | Operator-chosen rate against a measured baseline; a sudden rise in `unknown_account` is the stuffing signature. |
+| 13 | **Refresh-token theft signal** | `auth.refresh_token_reuse_detected` — a rotated-out refresh token was replayed; every session of that account was revoked. | Any occurrence: investigate (audit action `user.refresh_token_reuse_detected` names the account). |
+| 14 | **Concurrent refresh collisions** | `auth.refresh_token_concurrent_rotation_rejected` — the loser of two simultaneous rotations of one token (usually two browser tabs). Not escalated to mass revocation — see `docs/phase-41-decisions.md` A4. | Informational; a sustained high rate would argue for revisiting that decision. |
+
+Rate-limit (HTTP 429) and generic API error-rate counters are still not
+emitted in application code; they remain ALB/access-log derived, as §2
+of `docs/production-deployment-plan.md` states.

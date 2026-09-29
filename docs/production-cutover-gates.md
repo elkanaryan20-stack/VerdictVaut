@@ -69,3 +69,18 @@ is therefore BLOCKED, not NOT RUN by choice.
    (the testnet-only seed is never run there) had no API path to enable a
    mainnet asset. Fixed, plus a codebase-wide test that fails if any DTO
    property ever lacks a validation decorator again.
+
+## Phase 41 update
+
+No gate changed status: the environment still has no AWS CLI, credentials,
+Terraform, Docker or GitHub CLI, and nothing was provisioned or contacted.
+Code-side items closed locally (XRP tag verification at confirmation, EVM
+confirmation ceiling, idempotency-key 409, auth security metrics) and the
+remaining owner decisions are listed in `docs/phase-41-decisions.md`.
+
+IaC for **40U** (post-deploy reconciliation): the worker task definitions
+now set `RECONCILIATION_SCHEDULER_ENABLED=true` (hourly), which was
+previously unset, so the scheduler would have stayed off. The worker task
+definitions now also receive `JWT_ACCESS_SECRET`/`JWT_REFRESH_SECRET`, without
+which the worker failed env validation. Still open for production: the worker
+has no email configuration (`docs/phase-41-decisions.md` A9).

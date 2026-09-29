@@ -88,8 +88,13 @@ export class EvmDepositAdapter implements BlockchainDepositAdapter {
     const cursorBlock = params.cursor ? parseInt(params.cursor, 10) : currentBlock - INITIAL_BACKFILL_BLOCKS;
     const fromBlock = Math.max(cursorBlock + 1, 0);
     // Never scan (and therefore never advance the cursor) past this —
-    // see REORG_SAFETY_MARGIN_BLOCKS.
-    const scanCeiling = currentBlock - REORG_SAFETY_MARGIN_BLOCKS;
+    // see REORG_SAFETY_MARGIN_BLOCKS. Phase 41 — also never past a block
+    // younger than the configured confirmation requirement: a block at
+    // height h has currentBlock - h + 1 confirmations and is scanned exactly
+    // once, so scanning it earlier would record its deposits as PENDING
+    // with no later automatic re-check (only admin reprocess).
+    const requiredDepth = Math.max(REORG_SAFETY_MARGIN_BLOCKS, (params.requiredConfirmations ?? 0) - 1);
+    const scanCeiling = currentBlock - requiredDepth;
     const toBlock = Math.min(scanCeiling, fromBlock + maxRange - 1);
 
     if (fromBlock > toBlock) {

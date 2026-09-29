@@ -237,13 +237,35 @@ describe("WithdrawalsService", () => {
       await expect(service.request("user-1", dto({ amount: "100" }))).resolves.toBeDefined();
     });
 
+    const existingWithdrawal = {
+      id: "wd-existing",
+      status: "RISK_REVIEW",
+      assetNetworkId: "an-1",
+      destinationAddress: "0x000000000000000000000000000000000000dEaD",
+      destinationTag: null,
+      amount: new Prisma.Decimal(100),
+      fee: new Prisma.Decimal(0),
+    };
+
     it("is idempotent: a duplicate clientWithdrawalId returns the existing withdrawal without re-reserving", async () => {
       prisma.withdrawal.create.mockRejectedValue(makeIdempotencyConflict());
-      prisma.withdrawal.findUniqueOrThrow.mockResolvedValue({ id: "wd-existing", status: "RISK_REVIEW", amount: new Prisma.Decimal(100), fee: new Prisma.Decimal(0) });
+      prisma.withdrawal.findUniqueOrThrow.mockResolvedValue(existingWithdrawal);
 
       const result = await service.request("user-1", dto({ clientWithdrawalId: "fixed-key" }));
 
       expect(result.id).toBe("wd-existing");
+      expect(reservations.reserve).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["amount", { amount: "90" }],
+      ["destinationAddress", { destinationAddress: "0x000000000000000000000000000000000000bEEF" }],
+      ["destinationTag", { destinationTag: "7" }],
+    ])("rejects (409) a clientWithdrawalId reused with a different %s (Phase 41)", async (_field, change) => {
+      prisma.withdrawal.create.mockRejectedValue(makeIdempotencyConflict());
+      prisma.withdrawal.findUniqueOrThrow.mockResolvedValue(existingWithdrawal);
+
+      await expect(service.request("user-1", dto({ clientWithdrawalId: "fixed-key", ...change }))).rejects.toThrow(ConflictException);
       expect(reservations.reserve).not.toHaveBeenCalled();
     });
   });
@@ -707,6 +729,39 @@ describe("WithdrawalsService", () => {
             { address: "bc1qchangeaddressxxxxxxxxxxxxxxxxxxxxxxxxx", amount: "1.3" },
           ],
         });
+
+        expect(ledger.postTransaction).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("recordConfirmation — XRPL destination tag (Phase 41, R2)", () => {
+      beforeEach(() => {
+        prisma.withdrawal.findUnique.mockResolvedValue({
+          id: "wd-1",
+          status: "CONFIRMING",
+          amount: new Prisma.Decimal("10"),
+          fee: new Prisma.Decimal(0),
+          destinationAddress: "rExchangeHotWallet",
+          destinationTag: "12345",
+        });
+      });
+
+      it("credits when the validated payment carries the recorded tag", async () => {
+        await service.recordConfirmation("wd-1", 6, 1, { amount: "10", destinationAddress: "rExchangeHotWallet", destinationTag: "12345" });
+
+        expect(ledger.postTransaction).toHaveBeenCalled();
+      });
+
+      it("refuses to credit when the payment went to the right address with a different tag", async () => {
+        await service.recordConfirmation("wd-1", 6, 1, { amount: "10", destinationAddress: "rExchangeHotWallet", destinationTag: "54321" });
+
+        expect(ledger.postTransaction).not.toHaveBeenCalled();
+        expect(prisma.withdrawal.updateMany).not.toHaveBeenCalled();
+        expect(auditLog.record).toHaveBeenCalledWith(expect.objectContaining({ action: "withdrawal.confirmation_mismatch_refused" }));
+      });
+
+      it("refuses to credit when the payment omitted the tag", async () => {
+        await service.recordConfirmation("wd-1", 6, 1, { amount: "10", destinationAddress: "rExchangeHotWallet", destinationTag: null });
 
         expect(ledger.postTransaction).not.toHaveBeenCalled();
       });

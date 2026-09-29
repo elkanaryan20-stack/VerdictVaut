@@ -78,6 +78,28 @@ describe("XrpCustodyProvider.getTransactionStatus", () => {
     expect(status.status).toBe("confirmed");
     expect(status.destinationAddress).toBe("rDest");
     expect(status.confirmations).toBe(6);
+    expect(status.destinationTag).toBeNull(); // no DestinationTag on the tx → explicit null, never undefined
+  });
+
+  it("reports the transaction's DestinationTag as a string (Phase 41 — R2)", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        rippledResponse({
+          TransactionType: "Payment",
+          Destination: "rDest",
+          DestinationTag: 4294967295,
+          Amount: "1000000",
+          hash: "TXHASH1",
+          ledger_index: 100,
+          meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" },
+          validated: true,
+        }),
+      )
+      .mockResolvedValueOnce(rippledResponse({ info: { validated_ledger: { seq: 105 } } }));
+
+    const status = await provider.getTransactionStatus("TXHASH1", assetNetworkId);
+
+    expect(status.destinationTag).toBe("4294967295");
   });
 
   it("reports 'pending' (not yet validated) without checking TransactionResult", async () => {

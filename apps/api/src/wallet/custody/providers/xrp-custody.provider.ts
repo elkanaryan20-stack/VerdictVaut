@@ -52,11 +52,14 @@ export class XrpCustodyProvider implements CustodyProvider {
       throw new ServiceUnavailableException(`XRPL tx lookup error: ${tx.error}`);
     }
 
+    // Phase 41 — reported on every XRPL result (null = no tag) so a withdrawal
+    // confirmation can verify the tag it was sent with, not just the address.
+    const destinationTag = tx.DestinationTag != null ? String(tx.DestinationTag) : null;
     const amountRaw = tx.meta.delivered_amount ?? tx.Amount;
     const amount = typeof amountRaw === "string" ? rawUnitsToDecimalString(amountRaw, network.assetDecimals) : "0";
 
     if (!tx.validated) {
-      return { txHash, assetNetworkId, confirmations: 0, amount, status: "pending", destinationAddress: tx.Destination };
+      return { txHash, assetNetworkId, confirmations: 0, amount, status: "pending", destinationAddress: tx.Destination, destinationTag };
     }
 
     // A transaction landing in a validated (immutable) ledger is not the
@@ -68,13 +71,13 @@ export class XrpCustodyProvider implements CustodyProvider {
     // withdrawal-confirmation side, previously missing (requirement #12,
     // "verify transaction success").
     if (tx.meta.TransactionResult !== "tesSUCCESS") {
-      return { txHash, assetNetworkId, confirmations: 0, amount: "0", status: "failed", destinationAddress: tx.Destination };
+      return { txHash, assetNetworkId, confirmations: 0, amount: "0", status: "failed", destinationAddress: tx.Destination, destinationTag };
     }
 
     const info = await callRippled<XrplServerInfoResult>(url, "server_info", {});
     const currentLedger = info.status === "error" ? tx.ledger_index : info.info.validated_ledger?.seq ?? tx.ledger_index;
     const confirmations = Math.max(currentLedger - tx.ledger_index + 1, 0);
 
-    return { txHash, assetNetworkId, confirmations, amount, status: "confirmed", destinationAddress: tx.Destination };
+    return { txHash, assetNetworkId, confirmations, amount, status: "confirmed", destinationAddress: tx.Destination, destinationTag };
   }
 }

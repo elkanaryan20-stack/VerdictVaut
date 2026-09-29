@@ -273,6 +273,17 @@ export class WithdrawalsService {
       );
 
       if (alreadyExisted) {
+        // Phase 41 — a replay must be the SAME request (see OrdersService.create).
+        if (
+          created.assetNetworkId !== assetNetwork.id ||
+          created.destinationAddress !== dto.destinationAddress ||
+          (created.destinationTag ?? null) !== (dto.destinationTag ?? null) ||
+          !created.amount.equals(amount)
+        ) {
+          throw new ConflictException(
+            "clientWithdrawalId was already used for a different withdrawal; use a new clientWithdrawalId for a new withdrawal.",
+          );
+        }
         return created;
       }
 

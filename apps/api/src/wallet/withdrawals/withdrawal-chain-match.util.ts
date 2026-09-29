@@ -11,7 +11,7 @@ import { ChainTransactionStatus } from "../custody/custody-provider.interface";
 export const WITHDRAWAL_RECONCILE_AMOUNT_TOLERANCE = new Prisma.Decimal("0.000000000000000001");
 
 /** The subset of ChainTransactionStatus the destination/amount mismatch check needs — see findChainMismatch. */
-export type ObservedChainTransaction = Pick<ChainTransactionStatus, "amount" | "destinationAddress" | "outputs">;
+export type ObservedChainTransaction = Pick<ChainTransactionStatus, "amount" | "destinationAddress" | "outputs" | "destinationTag">;
 
 /**
  * EVM hex addresses are case-insensitive (EIP-55 checksum casing is a
@@ -55,6 +55,13 @@ export function findChainMismatch(withdrawal: Withdrawal, chainStatus: ObservedC
     // don't) — a genuine mismatch here would mean the broadcast paid a
     // DIFFERENT address than the one this withdrawal recorded.
     return "The broadcast transaction's on-chain destination does not match this withdrawal's recorded destination address.";
+  }
+  // Phase 41 (R2) — on XRPL an exchange/custodial destination address is
+  // shared by many customers and the tag selects the beneficiary: the right
+  // address with the wrong (or a missing) tag pays someone else. Only
+  // checked when the provider reports tags (`undefined` = not applicable).
+  if (chainStatus.destinationTag !== undefined && (withdrawal.destinationTag ?? null) !== chainStatus.destinationTag) {
+    return "The broadcast transaction's on-chain destination tag does not match this withdrawal's recorded destination tag.";
   }
   // The amount actually delivered on-chain should equal amount - fee (see
   // request()'s own accounting docblock) — never `amount` alone.

@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { MarketStatus, Order, OrderSide, OrderStatus, OrderType, Prisma, UserStatus } from "@prisma/client";
 import * as crypto from "crypto";
 import { FEE_CALCULATOR, FeeCalculator } from "./fees/fee-calculator.interface";
@@ -267,6 +267,18 @@ export class OrdersService {
       );
 
       if (alreadyExisted) {
+        // Phase 41 — a replay must be the SAME request. Reusing a key for a
+        // different order used to silently return the original, so the
+        // client believed an order it never got was placed.
+        if (
+          order.marketId !== market.id ||
+          order.outcomeId !== outcome.id ||
+          order.side !== dto.side ||
+          !(order.price?.equals(price) ?? false) ||
+          !order.quantity.equals(quantity)
+        ) {
+          throw new ConflictException("clientOrderId was already used for a different order; use a new clientOrderId for a new order.");
+        }
         return order;
       }
 

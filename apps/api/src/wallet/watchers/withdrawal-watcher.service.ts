@@ -279,6 +279,7 @@ export class WithdrawalWatcherService implements OnModuleInit, OnModuleDestroy {
       amount: status.amount,
       destinationAddress: status.destinationAddress,
       outputs: status.outputs,
+      destinationTag: status.destinationTag,
     });
   }
 

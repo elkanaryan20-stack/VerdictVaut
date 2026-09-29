@@ -146,5 +146,32 @@ describe("AssetsNetworksService — non-native contractAddress validation", () =
       await service.setAssetNetworkActive("an-1", false);
       expect(prisma.assetNetwork.update).toHaveBeenCalledWith({ where: { id: "an-1" }, data: { isActive: false } });
     });
+
+    // Phase 41 — the complete APP_ENVIRONMENT × NetworkEnvironment matrix.
+    // Only the literal "production" may enable mainnet; every other value,
+    // including staging and a typo, fails closed to SANDBOX-only.
+    it.each([
+      ["production", "PRODUCTION", true],
+      ["production", "SANDBOX", false],
+      ["sandbox", "SANDBOX", true],
+      ["sandbox", "PRODUCTION", false],
+      ["staging", "SANDBOX", true],
+      ["staging", "PRODUCTION", false],
+      ["prodution", "PRODUCTION", false],
+      ["", "PRODUCTION", false],
+    ])("APP_ENVIRONMENT=%j creating on a %s network → allowed=%s", async (appEnvironment, networkEnvironment, allowed) => {
+      const svc = new AssetsNetworksService(prisma as never, new ChainRpcConfigService(), { get: () => appEnvironment } as never);
+      prisma.network.findUnique.mockResolvedValue({ id: "network-x", code: "some-network", environment: networkEnvironment });
+      prisma.assetNetwork.create.mockResolvedValue({ id: "an-x" });
+
+      const attempt = svc.createAssetNetwork({ assetSymbol: "ETH", networkCode: "some-network", isNative: true, minConfirmations: 12 });
+
+      if (allowed) {
+        await expect(attempt).resolves.toEqual({ id: "an-x" });
+      } else {
+        await expect(attempt).rejects.toThrow(BadRequestException);
+        expect(prisma.assetNetwork.create).not.toHaveBeenCalled();
+      }
+    });
   });
 });

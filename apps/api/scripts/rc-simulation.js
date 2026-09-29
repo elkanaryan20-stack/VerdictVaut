@@ -494,6 +494,8 @@ async function simulate(runIndex) {
     const idem1 = await order(dave, "BUY", yes, "0.55", "2", { clientOrderId: `rc-${runIndex}-idem` });
     const idem2 = await order(dave, "BUY", yes, "0.55", "2", { clientOrderId: `rc-${runIndex}-idem` });
     check("trading", "clientOrderId idempotency: same order returned, funds reserved once", idem1.body.orderId === idem2.body.orderId);
+    const idemDifferent = await order(dave, "BUY", yes, "0.56", "2", { clientOrderId: `rc-${runIndex}-idem` });
+    check("trading", "Phase 41: clientOrderId reused for a DIFFERENT order → 409, never the other order", idemDifferent.status === 409, `${idemDifferent.status}`);
     const later = await order(alice, "BUY", yes, "0.55", "2");
     const fillFirst = await order(bob, "SELL", yes, "0.55", "2");
     const daveOrder = (await dave.call("GET", `/trading/orders/${idem1.body.orderId}`)).body;
@@ -544,8 +546,10 @@ async function simulate(runIndex) {
     const wd = (u, amount, extra = {}) => u.call("POST", "/wallet/withdrawals", { assetSymbol: "USDC", networkCode: "ethereum-sepolia", amount, destinationAddress: DEST, ...extra });
     const w1 = await wd(alice, "100", { clientWithdrawalId: `rc-${runIndex}-w1` });
     const w1dup = await wd(alice, "100", { clientWithdrawalId: `rc-${runIndex}-w1` });
+    const w1different = await wd(alice, "99", { clientWithdrawalId: `rc-${runIndex}-w1` });
     const aliceAfterReq = (await alice.call("GET", "/wallet/balances")).body.find((b) => b.symbol === "USDC");
     check("withdrawals", "request → RISK_REVIEW, compliance DEFERRED, funds reserved once (duplicate returns the same withdrawal)", w1.body.status === "RISK_REVIEW" && w1.body.complianceDecision === "DEFERRED" && w1dup.body.id === w1.body.id);
+    check("withdrawals", "Phase 41: clientWithdrawalId reused for a DIFFERENT amount → 409", w1different.status === 409, `${w1different.status}`);
     check("withdrawals", "owner response carries no compliance note / custody ref / admin id", w1.body.complianceNote === null && w1.body.custodyReference === null && w1.body.broadcastByAdminId === null);
     const opsApprove = await ops.call("POST", `/admin/withdrawals/${w1.body.id}/approve`);
     const approve = await root.call("POST", `/admin/withdrawals/${w1.body.id}/approve`);
